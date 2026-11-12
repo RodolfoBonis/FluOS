@@ -1,0 +1,22 @@
+[package]
+name = "colorls"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A fast Rust reimplementation of the colorls Ruby gem for FluOS userland."
+
+[[bin]]
+name = "colorls"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+unicode-width = "0.2"
+phf = "0.11"
+
+[build-dependencies]
+phf_codegen = "0.11"
+
+[dev-dependencies]
+tempfile = "3"
