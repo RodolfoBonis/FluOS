@@ -8,16 +8,23 @@ mod arch;
 mod boot;
 mod console;
 mod demo;
+mod elf;
 mod font;
+mod fs;
 mod ksyms;
 mod log;
 mod mm;
 mod panic;
 mod percpu;
+mod process;
+mod rng;
 mod scheduler;
 mod smp;
 mod sync;
+mod syscall;
 mod thread;
+mod usercopy;
+mod userspace;
 
 extern crate alloc;
 
@@ -41,7 +48,7 @@ extern "C" fn kmain() -> ! {
         info.usable_regions
     );
 
-    arch::x86_64::init_cpu();
+    let tss = arch::x86_64::init_cpu() as u64;
     let features = arch::x86_64::cpu::enable_protections();
     arch::x86_64::cpu::enable_sse();
     log::info!(
@@ -53,6 +60,7 @@ extern "C" fn kmain() -> ! {
     );
 
     mm::init(info.hhdm_offset);
+    ksyms::selftest();
 
     if let Some(fb) = boot::framebuffer() {
         console::init(&fb);
@@ -70,11 +78,20 @@ extern "C" fn kmain() -> ! {
     // SMP + scheduler bring-up and self-test.
     if let Some(apic_info) = arch::x86_64::acpi::parse() {
         arch::x86_64::apic::init(apic_info);
-        smp::init_bsp();
+        smp::init_bsp(tss);
+        arch::x86_64::user::init_syscall();
         smp::bringup();
         arch::x86_64::apic::start_timer();
         x86_64::instructions::interrupts::enable();
         smp::run_selftest();
+
+        // Userspace: root filesystem, RNG, and the ring-3 self-test.
+        fs::init(None);
+        // SAFETY: `_rdtsc` reads the timestamp counter for an RNG seed.
+        rng::seed(unsafe { core::arch::x86_64::_rdtsc() });
+        userspace::run_selftest();
+        userspace::run_syscall_bench();
+
         // Stop preempting the boot CPU so the rest of boot runs to completion.
         arch::x86_64::apic::stop_timer();
     } else {

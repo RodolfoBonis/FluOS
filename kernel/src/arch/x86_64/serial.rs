@@ -28,6 +28,16 @@ impl Serial {
         }
     }
 
+    /// Writes raw bytes, translating LF to CR+LF for terminals.
+    pub fn put_bytes(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if b == b'\n' {
+                self.write_byte(b'\r');
+            }
+            self.write_byte(b);
+        }
+    }
+
     fn write_byte(&mut self, byte: u8) {
         // SAFETY: polling the line status register, then writing THR.
         unsafe {
@@ -55,4 +65,9 @@ pub static COM1_PORT: Mutex<Serial> = Mutex::new(Serial::new(COM1));
 
 pub fn init() {
     COM1_PORT.lock().init();
+}
+
+/// Writes raw bytes to COM1 (used for mirroring user console output).
+pub fn write_bytes(bytes: &[u8]) {
+    COM1_PORT.lock().put_bytes(bytes);
 }

@@ -46,6 +46,23 @@ impl TimerQueue {
         self.heap.peek().map(|&Reverse((d, _))| d)
     }
 
+    /// Pops up to `out.len()` timers due at or before `now` (deadline order)
+    /// into `out`, returning how many. Allocation-free — safe in IRQ context.
+    pub fn expire_into(&mut self, now: u64, out: &mut [TimerId]) -> usize {
+        let mut count = 0;
+        while count < out.len() {
+            match self.heap.peek() {
+                Some(&Reverse((deadline, _))) if deadline <= now => {
+                    let Reverse((_, id)) = self.heap.pop().expect("peek just succeeded");
+                    out[count] = id;
+                    count += 1;
+                }
+                _ => break,
+            }
+        }
+        count
+    }
+
     /// Pops and returns every timer due at or before `now`, in deadline order.
     pub fn expire(&mut self, now: u64) -> Vec<TimerId> {
         let mut fired = Vec::new();
@@ -93,6 +110,22 @@ mod tests {
         assert_eq!(q.len(), 2);
         assert_eq!(q.next_deadline(), Some(50));
         assert_eq!(q.expire(1000), std::vec![1, 4]);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn expire_into_is_bounded_and_ordered() {
+        let mut q = TimerQueue::new();
+        for (d, id) in [(50, 1), (10, 2), (30, 3), (20, 4)] {
+            q.insert(d, id);
+        }
+        let mut buf = [0u64; 2];
+        // Only two slots: the two earliest due timers come out in order.
+        assert_eq!(q.expire_into(100, &mut buf), 2);
+        assert_eq!(buf, [2, 4]);
+        // The rest remain for the next call.
+        assert_eq!(q.expire_into(100, &mut buf), 2);
+        assert_eq!(buf, [3, 1]);
         assert!(q.is_empty());
     }
 

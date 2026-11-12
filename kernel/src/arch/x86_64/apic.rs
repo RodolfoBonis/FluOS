@@ -64,7 +64,17 @@ pub fn init(info: ApicInfo) {
     enable_lapic();
 
     let apic_id = (lapic_read(LAPIC_ID) >> 24) & 0xFF;
-    route_ioapic(&info, apic_id);
+    if info.ioapic_base == 0 {
+        crate::log::warning!("apic: no I/O APIC in MADT; device IRQs (keyboard) unavailable");
+    } else if info.keyboard_gsi < info.ioapic_gsi_base {
+        crate::log::warning!(
+            "apic: keyboard GSI {} below I/O APIC GSI base {}; not routing",
+            info.keyboard_gsi,
+            info.ioapic_gsi_base
+        );
+    } else {
+        route_ioapic(&info, apic_id);
+    }
     calibrate();
 
     crate::log::info!(
@@ -101,6 +111,13 @@ fn has_tsc_deadline() -> bool {
     leaf.ecx & (1 << 24) != 0
 }
 
+/// Whether the CPU advertises an invariant (constant-rate) TSC
+/// (CPUID 8000_0007h EDX bit 8) — required before trusting TSC-deadline timing.
+fn has_invariant_tsc() -> bool {
+    let leaf = __cpuid_count(0x8000_0007, 0);
+    leaf.edx & (1 << 8) != 0
+}
+
 /// Calibrates the scheduling timer against the PIT: measures TSC and LAPIC
 /// timer rates over a 50 ms window and derives per-slice counts.
 fn calibrate() {
@@ -119,7 +136,7 @@ fn calibrate() {
     let tsc_per_ms = tsc_elapsed / 50;
     let lapic_per_ms = lapic_elapsed / 50;
 
-    let use_deadline = has_tsc_deadline() && tsc_per_ms > 0;
+    let use_deadline = has_tsc_deadline() && has_invariant_tsc() && tsc_per_ms > 0;
     USE_TSC_DEADLINE.store(use_deadline, Ordering::Release);
     TSC_PER_SLICE.store(tsc_per_ms * SLICE_MS, Ordering::Release);
     // Fall back to a sane count if calibration produced nothing usable.
@@ -158,16 +175,33 @@ pub fn rearm_timer() {
 /// Stops this CPU's scheduling timer (used when leaving the scheduler).
 pub fn stop_timer() {
     lapic_write(LVT_TIMER, 1 << 16); // masked
-    if !USE_TSC_DEADLINE.load(Ordering::Relaxed) {
+    if USE_TSC_DEADLINE.load(Ordering::Relaxed) {
+        // SAFETY: writing 0 disarms the TSC deadline.
+        unsafe { Msr::new(IA32_TSC_DEADLINE).write(0) };
+    } else {
         lapic_write(TIMER_INIT_COUNT, 0);
     }
 }
 
 /// Sends a fixed-delivery IPI with `vector` to the CPU with `dest_apic_id`.
+///
+/// Interrupts are masked around the ICR_HIGH/ICR_LOW pair so a preemption can't
+/// interleave another IPI between the two writes, and we poll the delivery-
+/// status bit (ICR_LOW bit 12) before and after so sends don't race (H3).
 fn send_ipi(dest_apic_id: u32, vector: u8) {
-    lapic_write(LAPIC_ICR_HIGH, dest_apic_id << 24);
-    // Fixed delivery, physical dest, assert, edge.
-    lapic_write(LAPIC_ICR_LOW, u32::from(vector) | (1 << 14));
+    use x86_64::instructions::interrupts;
+    interrupts::without_interrupts(|| {
+        // Wait for any in-flight IPI to be accepted.
+        while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+        }
+        lapic_write(LAPIC_ICR_HIGH, dest_apic_id << 24);
+        lapic_write(LAPIC_ICR_LOW, u32::from(vector) | (1 << 14));
+        // Wait for this IPI to be accepted before returning.
+        while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+        }
+    });
 }
 
 /// Sends a reschedule IPI to a CPU by its LAPIC id.
@@ -178,6 +212,15 @@ pub fn send_reschedule(dest_apic_id: u32) {
 /// Sends a TLB-shootdown IPI to a CPU by its LAPIC id.
 pub fn send_tlb_shootdown(dest_apic_id: u32) {
     send_ipi(dest_apic_id, TLB_VECTOR);
+}
+
+/// Broadcasts an NMI to every other CPU (used to halt them during a panic).
+pub fn send_nmi_all_others() {
+    if LAPIC_VIRT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    // Shorthand "all excluding self" (0b11 << 18), delivery mode NMI (0b100 << 8).
+    lapic_write(LAPIC_ICR_LOW, (0b11 << 18) | (0b100 << 8));
 }
 
 fn lapic_read(offset: u64) -> u32 {

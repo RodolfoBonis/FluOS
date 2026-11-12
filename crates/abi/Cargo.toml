@@ -1,0 +1,6 @@
+[package]
+name = "abi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Typed Linux x86_64 syscall ABI: numbers, errno, and kernel structs"

@@ -8,6 +8,11 @@
 
 use crate::arch::x86_64::{QemuExitCode, halt_forever, qemu_exit};
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// Set once any CPU enters the panic path; other CPUs' NMI handlers halt on it,
+/// and a nested panic on this CPU stops rather than recursing.
+pub static PANICKING: AtomicBool = AtomicBool::new(false);
 
 /// Kernel virtual base (see `kernel/linker.ld`). Backtrace frames are reported
 /// relative to this so symbols can be looked up in the ELF.
@@ -60,6 +65,13 @@ pub fn backtrace() {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    // A nested panic (e.g. inside the backtrace) must not recurse.
+    if PANICKING.swap(true, Ordering::SeqCst) {
+        halt_forever();
+    }
+    // Stop the other CPUs so they don't scribble over the panic output or keep
+    // running on corrupted state.
+    crate::arch::x86_64::apic::send_nmi_all_others();
     crate::log::write_unlocked(format_args!("{info}"));
     backtrace();
     qemu_exit(QemuExitCode::Failure);

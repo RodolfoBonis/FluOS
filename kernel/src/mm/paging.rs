@@ -19,6 +19,16 @@ use x86_64::{PhysAddr, VirtAddr};
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+/// Translates a virtual address through the *currently active* page tables,
+/// returning its physical address if mapped. Used by the user-copy routines to
+/// reach user memory via the HHDM.
+pub fn translate_active(vaddr: u64) -> Option<u64> {
+    use x86_64::structures::paging::mapper::Translate;
+    let hhdm = phys::hhdm_offset();
+    let mapper = active_mapper(hhdm);
+    mapper.translate_addr(VirtAddr::new(vaddr)).map(|p| p.as_u64())
+}
+
 /// Physical address of the kernel PML4, published by [`init`] so APs can load
 /// the same tables.
 static KERNEL_PML4: AtomicU64 = AtomicU64::new(0);
@@ -181,6 +191,12 @@ where
         Err(MapToError::PageAlreadyMapped(_)) => {}
         Err(e) => panic!("page mapping failed: {e:?}"),
     }
+}
+
+/// Physical address of the kernel PML4 (for cloning its higher half into new
+/// user address spaces).
+pub fn kernel_pml4_phys() -> u64 {
+    KERNEL_PML4.load(Ordering::Acquire)
 }
 
 /// Loads the kernel page tables on the calling CPU (used by APs, which start on

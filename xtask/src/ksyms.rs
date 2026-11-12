@@ -1,52 +1,45 @@
 //! Kernel symbol-table extraction for symbolized panic backtraces.
 //!
-//! Reads the function symbols from a first-pass kernel ELF, demangles them, and
-//! writes a compact blob the kernel embeds on its second build pass. See
-//! `kernel/src/ksyms.rs` for the matching reader and the blob format.
+//! Reads function symbols (address, size, name) from a kernel ELF, demangles
+//! them, and produces the blob the kernel embeds. The blob format and the
+//! matching resolver live in the host-tested `ksyms` crate, so the two can
+//! never disagree.
 
 use anyhow::{Context, Result};
 use object::{Object, ObjectSymbol, SymbolKind};
 use std::fs;
 use std::path::Path;
 
-/// Extracts function symbols from `elf` and writes the symbol blob to `out`.
-/// Returns the number of symbols written.
-pub fn generate(elf: &Path, out: &Path) -> Result<usize> {
+/// Builds the symbol blob for `elf`, returning its bytes.
+pub fn extract(elf: &Path) -> Result<Vec<u8>> {
     let data = fs::read(elf).with_context(|| format!("reading {}", elf.display()))?;
     let obj = object::File::parse(&*data).context("parsing kernel ELF")?;
 
-    // Collect function symbols with a real address.
-    let mut syms: Vec<(u64, String)> = obj
+    let demangled: Vec<(u64, u32, String)> = obj
         .symbols()
         .filter(|s| s.kind() == SymbolKind::Text && s.address() != 0)
         .filter_map(|s| {
             let name = s.name().ok()?;
-            Some((s.address(), format!("{:#}", rustc_demangle::demangle(name))))
+            Some((s.address(), s.size() as u32, format!("{:#}", rustc_demangle::demangle(name))))
         })
         .collect();
 
-    syms.sort_by_key(|(addr, _)| *addr);
-    syms.dedup_by_key(|(addr, _)| *addr);
+    let triples: Vec<(u64, u32, &str)> =
+        demangled.iter().map(|(a, sz, n)| (*a, *sz, n.as_str())).collect();
+    Ok(ksyms::build(&triples))
+}
 
-    // Build the blob: magic, count, entries {addr:u64, name_off:u32}, strings.
-    let mut strings: Vec<u8> = Vec::new();
-    let mut entries: Vec<(u64, u32)> = Vec::with_capacity(syms.len());
-    for (addr, name) in &syms {
-        let off = strings.len() as u32;
-        strings.extend_from_slice(name.as_bytes());
-        strings.push(0);
-        entries.push((*addr, off));
-    }
-
-    let mut blob: Vec<u8> = Vec::new();
-    blob.extend_from_slice(b"KSY1");
-    blob.extend_from_slice(&(syms.len() as u32).to_le_bytes());
-    for (addr, off) in &entries {
-        blob.extend_from_slice(&addr.to_le_bytes());
-        blob.extend_from_slice(&off.to_le_bytes());
-    }
-    blob.extend_from_slice(&strings);
-
+/// Extracts the blob and writes it to `out`, returning the symbol count.
+pub fn generate(elf: &Path, out: &Path) -> Result<usize> {
+    let blob = extract(elf)?;
     fs::write(out, &blob).with_context(|| format!("writing {}", out.display()))?;
-    Ok(syms.len())
+    // Count = (len - header) / entry_size is implementation detail; recompute
+    // from the ELF for the log.
+    let data = fs::read(elf)?;
+    let obj = object::File::parse(&*data)?;
+    let count = obj
+        .symbols()
+        .filter(|s| s.kind() == SymbolKind::Text && s.address() != 0)
+        .count();
+    Ok(count)
 }

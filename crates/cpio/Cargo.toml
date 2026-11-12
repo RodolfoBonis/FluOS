@@ -1,0 +1,6 @@
+[package]
+name = "cpio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "no_std parser for the newc (SVR4) cpio format used by initramfs"

@@ -107,8 +107,18 @@ pub fn write(level: Level, args: fmt::Arguments) {
     let mut serial = crate::arch::x86_64::serial::COM1_PORT.lock();
     let mut ring = RING.lock();
     let console = *CONSOLE.lock();
+    // Timestamp (TSC) and CPU id help correlate SMP logs; the CPU id is omitted
+    // (`?`) before per-CPU state is up.
+    let tsc = unsafe { core::arch::x86_64::_rdtsc() };
     let mut tee = Tee { serial: &mut serial, ring: &mut ring, console };
-    let _ = writeln!(tee, "[{}] {}", level.tag(), args);
+    match crate::percpu::try_cpu_id() {
+        Some(cpu) => {
+            let _ = writeln!(tee, "[{tsc:>16} c{cpu} {}] {args}", level.tag());
+        }
+        None => {
+            let _ = writeln!(tee, "[{tsc:>16} c? {}] {args}", level.tag());
+        }
+    }
 }
 
 /// Logs even if the serial lock is held; only for the panic path, where the

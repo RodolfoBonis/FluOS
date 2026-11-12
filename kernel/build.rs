@@ -61,11 +61,34 @@ fn embed_symbol_env() {
     println!("cargo:rustc-env=FLUOS_KSYMS_FILE={file}");
 }
 
+/// Whether a generated atlas already exists and is newer than the font file.
+fn atlas_is_current(out: &std::path::Path, font_path: &str) -> bool {
+    let rs = out.join("font_atlas.rs");
+    let alpha = out.join("font_alpha.bin");
+    let index = out.join("font_index.bin");
+    if !(rs.exists() && alpha.exists() && index.exists()) {
+        return false;
+    }
+    let mtime = |p: &std::path::Path| fs::metadata(p).and_then(|m| m.modified()).ok();
+    match (mtime(&rs), mtime(std::path::Path::new(font_path))) {
+        (Some(atlas_t), Some(font_t)) => atlas_t >= font_t,
+        _ => false,
+    }
+}
+
 fn generate_font_atlas() {
     let font_path = env::var("FLUOS_FONT").unwrap_or_else(|_| DEFAULT_FONT.to_string());
     println!("cargo:rerun-if-env-changed=FLUOS_FONT");
     println!("cargo:rerun-if-env-changed=FLUOS_FONT_PX");
     println!("cargo:rerun-if-changed={font_path}");
+
+    // Skip rasterization if a current atlas already exists in OUT_DIR. The two
+    // kernel build passes (for the symbol table) share OUT_DIR, so this avoids
+    // rasterizing ~9600 glyphs a second time.
+    let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR set by cargo"));
+    if atlas_is_current(&out, &font_path) {
+        return;
+    }
 
     let ttf = fs::read(&font_path).unwrap_or_else(|e| {
         panic!(
@@ -117,8 +140,6 @@ fn generate_font_atlas() {
             alpha.extend_from_slice(&cell);
         }
     }
-
-    let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR set by cargo"));
 
     // Codepoints are already ascending (ranges are sorted and disjoint); store
     // them little-endian for a direct binary search at runtime.

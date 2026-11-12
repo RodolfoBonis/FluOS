@@ -29,7 +29,7 @@ const BENCH_ITERS: u64 = 3000;
 static SLEEP_WOKE: AtomicU32 = AtomicU32::new(0);
 
 /// Initialises the BSP's per-CPU state, bootstrap thread, and idle thread.
-pub fn init_bsp() {
+pub fn init_bsp(tss: u64) {
     let (bsp_id, bsp_lapic) = match boot::mp() {
         Some((cpus, bsp_lapic)) => {
             let idx = cpus.iter().position(|c| c.lapic_id == bsp_lapic).unwrap_or(0) as u32;
@@ -37,7 +37,7 @@ pub fn init_bsp() {
         }
         None => (0, 0),
     };
-    percpu::init(bsp_id, bsp_lapic);
+    percpu::init(bsp_id, bsp_lapic, tss);
     scheduler::adopt_current(0); // promote the boot context to a schedulable thread
     scheduler::create_idle();
 }
@@ -50,17 +50,22 @@ pub fn bringup() {
         return;
     };
 
-    percpu::set_cpu_count(cpus.len() as u32);
-    crate::log::info!("smp: bringing up {} CPUs", cpus.len());
+    let max = crate::percpu::MAX_CPUS;
+    let count = cpus.len().min(max);
+    if cpus.len() > max {
+        crate::log::warning!("smp: {} CPUs exceeds MAX_CPUS={}, clamping", cpus.len(), max);
+    }
+    percpu::set_cpu_count(count as u32);
+    crate::log::info!("smp: bringing up {} CPUs", count);
 
-    for (i, cpu) in cpus.iter().enumerate() {
+    for (i, cpu) in cpus.iter().enumerate().take(count) {
         if cpu.lapic_id == bsp_lapic {
             continue;
         }
         cpu.bootstrap(ap_entry, i as u64);
     }
 
-    let expected = cpus.len() as u32 - 1;
+    let expected = count as u32 - 1;
     let mut spins = 0u64;
     while APS_ONLINE.load(Ordering::Acquire) < expected {
         core::hint::spin_loop();
@@ -77,16 +82,20 @@ pub fn bringup() {
 unsafe extern "C" fn ap_entry(info: &limine::mp::MpInfo) -> ! {
     let cpu_id = info.extra_argument() as u32;
 
+    // Enable NX (EFER.NXE), SMEP/SMAP/WP, and SSE BEFORE adopting the kernel page
+    // tables: those tables set the NX bit, which faults as a reserved bit until
+    // NXE is on (M3).
+    cpu::enable_protections();
+    cpu::enable_sse();
     // Adopt the kernel page tables (APs start on the bootloader's tables, which
     // lack our device-MMIO mappings).
     crate::mm::paging::activate();
 
-    gdt::init_ap();
+    let tss = gdt::init_ap() as u64;
     idt::init();
-    cpu::enable_protections();
-    cpu::enable_sse();
 
-    percpu::init(cpu_id, info.lapic_id);
+    percpu::init(cpu_id, info.lapic_id, tss);
+    crate::arch::x86_64::user::init_syscall();
     apic::enable_lapic();
     scheduler::adopt_current_as_idle();
     apic::start_timer();
@@ -128,7 +137,7 @@ fn sleep_test() {
     SLEEP_WOKE.store(0, Ordering::Relaxed);
     let bsp = percpu::cpu_id();
     for _ in 0..SLEEPERS {
-        scheduler::spawn(sleeper, 0, 0, bsp);
+        scheduler::spawn(sleeper, 0, 0, bsp).expect("spawn sleeper");
     }
     let mut spins = 0u64;
     while SLEEP_WOKE.load(Ordering::Acquire) < SLEEPERS {
@@ -151,7 +160,7 @@ pub fn run_selftest() {
     let bsp = percpu::cpu_id();
     crate::log::info!("selftest: spawning {} threads on cpu {} across {} cpus", n, bsp, ncpu);
     for i in 0..n {
-        scheduler::spawn(worker, i as usize, 0, bsp);
+        scheduler::spawn(worker, i as usize, 0, bsp).expect("spawn worker");
     }
 
     // Wait for completion, yielding so workers (and the BSP's share) run.
@@ -231,8 +240,8 @@ fn bench_latency() {
     // SAFETY: `_rdtsc` reads the timestamp counter.
     let t0 = unsafe { _rdtsc() };
 
-    scheduler::spawn(bench, 0, 0, bsp);
-    scheduler::spawn(bench, 1, 0, bsp);
+    scheduler::spawn(bench, 0, 0, bsp).expect("spawn bench");
+    scheduler::spawn(bench, 1, 0, bsp).expect("spawn bench");
     while BENCH_DONE.load(Ordering::Acquire) < 2 {
         scheduler::yield_now();
     }

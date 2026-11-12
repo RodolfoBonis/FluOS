@@ -1,0 +1,10 @@
+[package]
+name = "vfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "no_std in-memory VFS (tmpfs) with path resolution and cpio unpacking"
+
+[dependencies]
+abi = { path = "../abi" }
+cpio = { path = "../cpio" }

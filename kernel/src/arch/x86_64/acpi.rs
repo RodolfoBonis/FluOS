@@ -62,6 +62,11 @@ pub fn parse() -> Option<ApicInfo> {
         (signature(virt) == *b"APIC").then_some(virt)
     })?;
 
+    // Validate the MADT's length and checksum before trusting its contents.
+    let length = unsafe { read_unaligned::<u32>(madt_virt + 4) } as usize;
+    if length < 44 || !checksum_ok(madt_virt, length) {
+        return None;
+    }
     Some(parse_madt(madt_virt))
 }
 
@@ -72,6 +77,17 @@ fn sdt_entries(sdt_virt: u64, ptr_size: u64) -> (u64, u64, u64) {
     let length: u32 = unsafe { read_unaligned(sdt_virt + 4) };
     let count = (u64::from(length).saturating_sub(36)) / ptr_size;
     (sdt_virt + 36, ptr_size, count)
+}
+
+/// Returns true if the one-byte sum of the `length` bytes at `virt` is zero,
+/// as every ACPI table's checksum field guarantees.
+fn checksum_ok(virt: u64, length: usize) -> bool {
+    let mut sum: u8 = 0;
+    for i in 0..length as u64 {
+        // SAFETY: `length` bytes from `virt` are within the mapped table.
+        sum = sum.wrapping_add(unsafe { read_unaligned::<u8>(virt + i) });
+    }
+    sum == 0
 }
 
 /// Reads the 4-byte signature of a table.

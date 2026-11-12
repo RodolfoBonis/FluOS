@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const USAGE: &str = "\
-usage: cargo xtask <command> [--release]
+usage: cargo xtask <command> [--release] [--smp N]
 
 commands:
   build   compile the kernel
@@ -37,13 +37,20 @@ impl Profile {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let profile = if args.iter().any(|a| a == "--release") { Profile::Release } else { Profile::Debug };
+    // `--smp N` selects the vCPU count (default 4) for `run`/`test`.
+    let smp = args
+        .iter()
+        .position(|a| a == "--smp")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(4);
 
     match args.first().map(String::as_str) {
         Some("build") => build_kernel(profile).map(drop),
         Some("image") => image::build(profile, "").map(drop),
-        Some("run") => qemu::run(&image::build(profile, "")?, qemu::Mode::Interactive),
+        Some("run") => qemu::run(&image::build(profile, "")?, qemu::Mode::Interactive, smp),
         // `qemu-exit` makes the kernel signal QEMU's debug-exit device once boot completes.
-        Some("test") => qemu::run(&image::build(profile, "qemu-exit")?, qemu::Mode::Test),
+        Some("test") => qemu::run(&image::build(profile, "qemu-exit")?, qemu::Mode::Test, smp),
         _ => {
             eprint!("{USAGE}");
             bail!("missing or unknown command")
@@ -69,7 +76,16 @@ pub fn build_kernel(profile: Profile) -> Result<PathBuf> {
     match ksyms::generate(&elf, &blob) {
         Ok(count) => {
             eprintln!("xtask: embedding {count} kernel symbols for backtraces");
-            compile_kernel(profile, Some(&blob))
+            let final_elf = compile_kernel(profile, Some(&blob))?;
+            // Fixed-point validation: regenerate the blob from the FINAL ELF and
+            // byte-compare. If the embedded (pass-1) blob differs, `.text`
+            // shifted between passes and the backtrace symbols would be wrong.
+            let blob1 = std::fs::read(&blob)?;
+            let blob2 = ksyms::extract(&final_elf)?;
+            if blob1 != blob2 {
+                bail!("ksyms: symbol addresses shifted between passes (blob is not a fixed point)");
+            }
+            Ok(final_elf)
         }
         Err(e) => {
             eprintln!("xtask: symbol table generation failed ({e:#}); backtraces will show raw addresses");

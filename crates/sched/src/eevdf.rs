@@ -25,6 +25,12 @@ pub const BASE_SLICE: u64 = 1024;
 /// so heavy tasks (large weight) still advance instead of truncating to zero.
 const SCALE_SHIFT: u32 = 20;
 
+/// Maximum lag (in fixed-point vruntime units) a joining task may carry, so a
+/// long-sleeping, newly-woken, or migrated task cannot accrue unbounded credit
+/// (or debt) relative to the queue's virtual time (H4). About eight reference
+/// slices.
+const MAX_LAG: u128 = (BASE_SLICE as u128) << (SCALE_SHIFT + 3);
+
 /// Thread identifier the scheduler keys on.
 pub type Tid = u64;
 
@@ -84,6 +90,12 @@ impl Eevdf {
         self.entities.len()
     }
 
+    /// Reserves capacity for `n` runnable entities so the common enqueue path
+    /// (used from the timer IRQ) does not allocate.
+    pub fn reserve(&mut self, n: usize) {
+        self.entities.reserve(n);
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entities.is_empty()
@@ -126,6 +138,24 @@ impl Eevdf {
         let mut e = Entity { tid, weight, vruntime, deadline: 0 };
         e.renew_deadline();
         self.entities.push(e);
+    }
+
+    /// Adds a brand-new task placed at the queue's current virtual time `V`
+    /// (zero lag), so it neither monopolises the CPU nor starves (H4).
+    pub fn insert_at_v(&mut self, tid: Tid, weight: u64) {
+        let v = self.avg_vruntime();
+        self.insert_with(tid, weight, v);
+    }
+
+    /// Adds a returning task (woken from sleep, migrated, or re-queued after
+    /// running) at its carried vruntime, clamped to `V ± MAX_LAG` so stale or
+    /// foreign time bases cannot grant unbounded credit/debt (H4).
+    pub fn insert_clamped(&mut self, tid: Tid, weight: u64, carried_vruntime: u128) {
+        let v = self.avg_vruntime();
+        let lo = v.saturating_sub(MAX_LAG);
+        let hi = v.saturating_add(MAX_LAG);
+        let placed = carried_vruntime.clamp(lo, hi);
+        self.insert_with(tid, weight, placed);
     }
 
     /// Converts a real-time `delta` into the virtual-time it advances a task of
@@ -281,6 +311,66 @@ mod tests {
         q.charge(1, 10_000);
         let (tid, _) = q.steal_one().unwrap();
         assert_eq!(tid, 2);
+    }
+
+    #[test]
+    fn new_task_joins_at_virtual_time() {
+        // Task 1 runs alone for a while, pushing V up. A newcomer placed at V
+        // must then SHARE fairly going forward — not monopolise (which placing
+        // it at vruntime 0 would cause) nor be starved.
+        let mut q = Eevdf::new();
+        q.insert(1, WEIGHT_REF);
+        for _ in 0..100 {
+            q.charge(1, 1000);
+        }
+        q.insert_at_v(2, WEIGHT_REF);
+
+        let mut s1 = 0u64;
+        let mut s2 = 0u64;
+        for _ in 0..4000 {
+            let t = q.pick().unwrap();
+            if t == 1 {
+                s1 += 100;
+            } else {
+                s2 += 100;
+            }
+            q.charge(t, 100);
+        }
+        // Equal weights from a common V => roughly equal service.
+        let (hi, lo) = (s1.max(s2), s1.min(s2));
+        assert!(lo > 0 && (hi - lo) * 5 <= hi, "unfair after join: s1={s1} s2={s2}");
+    }
+
+    #[test]
+    fn migrated_task_is_lag_clamped() {
+        // A queue whose V is high (everyone has run a lot).
+        let mut q = Eevdf::new();
+        q.insert(1, WEIGHT_REF);
+        q.insert(2, WEIGHT_REF);
+        for _ in 0..500 {
+            q.charge(1, 1000);
+            q.charge(2, 1000);
+        }
+        let v = q.avg_vruntime();
+        // Migrate in a task whose foreign vruntime is 0 (far behind): it would
+        // otherwise monopolise. Clamped placement keeps it within MAX_LAG of V.
+        q.insert_clamped(99, WEIGHT_REF, 0);
+        // It is eligible but bounded: it cannot run forever. Simulate and check
+        // the established tasks still get serviced.
+        let mut got_99 = 0;
+        let mut got_other = 0;
+        for _ in 0..2000 {
+            let t = q.pick().unwrap();
+            if t == 99 {
+                got_99 += 1;
+            } else {
+                got_other += 1;
+            }
+            q.charge(t, 100);
+        }
+        let _ = v;
+        assert!(got_99 > 0, "migrated task never ran");
+        assert!(got_other > 0, "migrated task starved the others");
     }
 
     #[test]

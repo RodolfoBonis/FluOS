@@ -16,9 +16,16 @@
 /// Sentinel for "no frame" in the intrusive free lists.
 const NIL: u32 = u32::MAX;
 
-/// Marks a frame that is not the head of a free block (allocated, or interior
-/// to a larger block). No valid block order ever equals this.
+/// Marks a frame that is interior to a block or otherwise not a block head.
+/// No valid block order equals this.
 const NOT_FREE_HEAD: u8 = u8::MAX;
+
+/// High bit set in the `order` byte to mark an *allocated* block head (the low
+/// bits hold its order). A free head stores just its order (< `ALLOCATED`), so
+/// the marker space cleanly separates allocated heads, free heads, and interior
+/// frames — which lets `free_order` detect double, wrong-order, and interior
+/// frees (M2).
+const ALLOCATED: u8 = 0x80;
 
 /// Hard cap on the number of distinct orders. Order 31 already spans 2^31
 /// frames (8 TiB at 4 KiB), far beyond any region we manage.
@@ -148,7 +155,7 @@ impl<'a> Buddy<'a> {
                 }
                 k -= 1;
             }
-            self.free_order(self.base_frame + rel, k);
+            self.release(rel as u32, k);
             rel += 1usize << k;
         }
     }
@@ -216,7 +223,7 @@ impl<'a> Buddy<'a> {
             let buddy = block + (1u32 << j);
             self.insert(buddy, j as u8);
         }
-        self.order[block as usize] = NOT_FREE_HEAD;
+        self.order[block as usize] = ALLOCATED | order as u8;
         self.free_frames -= 1usize << order;
         Some(self.base_frame + block as usize)
     }
@@ -237,19 +244,30 @@ impl<'a> Buddy<'a> {
     pub fn free_order(&mut self, frame: usize, order: usize) {
         assert!(order <= self.max_order, "order {order} exceeds max");
         assert!(frame >= self.base_frame, "frame {frame} below region base");
-        let mut idx = (frame - self.base_frame) as u32;
+        let idx = (frame - self.base_frame) as u32;
         assert!((idx as usize) < self.frames, "frame {frame} above region");
         assert!(
             idx % (1u32 << order) == 0,
             "frame {frame} not aligned to order {order}"
         );
+        let marker = self.order[idx as usize];
+        assert!(marker != NOT_FREE_HEAD, "free of unallocated/interior frame {frame}");
+        assert!(marker & ALLOCATED != 0, "double free at frame {frame} (already free)");
         assert!(
-            self.order[idx as usize] == NOT_FREE_HEAD,
-            "double free at frame {frame}"
+            marker == ALLOCATED | order as u8,
+            "wrong-order free at frame {frame}: allocated as order {}, freed as {order}",
+            marker & !ALLOCATED
         );
 
-        self.free_frames += 1usize << order;
+        self.release(idx, order);
+    }
 
+    /// Returns a block `[idx, idx + 2^order)` to the free pool, coalescing with
+    /// buddies. Shared by [`free_order`](Self::free_order) (which validates the
+    /// caller first) and [`add_frames`](Self::add_frames) (which releases
+    /// never-allocated frames during setup).
+    fn release(&mut self, mut idx: u32, order: usize) {
+        self.free_frames += 1usize << order;
         let mut k = order;
         while k < self.max_order {
             let buddy = idx ^ (1u32 << k);
@@ -439,6 +457,42 @@ mod tests {
         assert_eq!(b.free_frames(), 64);
         // Fully contiguous: the whole region coalesces into one order-6 block.
         assert_eq!(b.alloc_order(6), Some(0));
+    }
+
+    #[test]
+    #[should_panic(expected = "unallocated/interior")]
+    fn freeing_interior_frame_panics() {
+        let mut arena = Arena::new(16);
+        let mut b = arena.buddy(0, 16, 4);
+        // Allocate an order-2 (4-frame) block at frame 0; frame 1 is interior.
+        let f = b.alloc_order(2).unwrap();
+        assert_eq!(f, 0);
+        b.free_order(1, 0); // frame 1 is not a block head
+    }
+
+    #[test]
+    #[should_panic(expected = "wrong-order free")]
+    fn wrong_order_free_panics() {
+        let mut arena = Arena::new(16);
+        let mut b = arena.buddy(0, 16, 4);
+        let f = b.alloc_order(2).unwrap(); // allocated as order 2
+        b.free_order(f, 1); // freed as order 1
+    }
+
+    #[test]
+    fn blocks_are_absolutely_aligned_with_aligned_base() {
+        // With a base that is a multiple of 2^max_order, every order-k block is
+        // physically aligned to 2^k (required for huge pages / DMA) — M1.
+        const MAX_ORDER: usize = 6;
+        let base = 3 << MAX_ORDER; // aligned to 2^max_order
+        let mut arena = Arena::new(1 << MAX_ORDER);
+        let mut b = arena.buddy(base, 1 << MAX_ORDER, MAX_ORDER);
+        for order in 0..=4 {
+            if let Some(frame) = b.alloc_order(order) {
+                assert_eq!(frame % (1 << order), 0, "order-{order} block {frame} misaligned");
+                b.free_order(frame, order);
+            }
+        }
     }
 
     #[test]

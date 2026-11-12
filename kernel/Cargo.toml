@@ -16,6 +16,9 @@ x86_64 = "0.15"
 mm = { path = "../crates/mm" }
 tty = { path = "../crates/tty" }
 sched = { path = "../crates/sched" }
+abi = { path = "../crates/abi" }
+vfs = { path = "../crates/vfs" }
+ksyms = { path = "../crates/ksyms" }
 
 [build-dependencies]
 fontdue = "0.9"

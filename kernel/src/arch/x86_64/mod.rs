@@ -10,12 +10,15 @@ pub mod input;
 pub mod port;
 pub mod ps2;
 pub mod serial;
+pub mod user;
 
-/// Installs the GDT/TSS and IDT on the bootstrap processor. After this call the
-/// CPU can take exceptions without triple-faulting.
-pub fn init_cpu() {
-    gdt::init();
+/// Installs the GDT/TSS and IDT on the bootstrap processor and returns the TSS
+/// pointer so per-CPU state can update its RSP0 for user processes. After this
+/// call the CPU can take exceptions without triple-faulting.
+pub fn init_cpu() -> *mut x86_64::structures::tss::TaskStateSegment {
+    let tss = gdt::init();
     idt::init();
+    tss
 }
 
 /// Idles the CPU until the next interrupt (timer or IPI). Interrupts are

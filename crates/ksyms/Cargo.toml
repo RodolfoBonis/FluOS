@@ -1,0 +1,6 @@
+[package]
+name = "ksyms"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "no_std kernel symbol-table blob format: build (host) and resolve (kernel)"

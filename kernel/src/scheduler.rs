@@ -30,14 +30,33 @@ static THREADS: SpinLock<Vec<Tid>> = SpinLock::new(Vec::new());
 /// Count of threads that have run to completion.
 static FINISHED: AtomicU32 = AtomicU32::new(0);
 
-/// Disables preemption on this CPU (nestable).
+/// Disables preemption on this CPU (nestable). The counter bump runs with
+/// interrupts off so a tick cannot migrate us between reading per-CPU state and
+/// the increment (C2); once the count is non-zero the thread is pinned.
 pub fn preempt_disable() {
+    let was_on = interrupts::are_enabled();
+    interrupts::disable();
     percpu::this().preempt_count.fetch_add(1, Ordering::Acquire);
+    if was_on {
+        interrupts::enable();
+    }
 }
 
-/// Re-enables preemption on this CPU.
+/// Re-enables preemption on this CPU, honouring a pending reschedule (M10): if
+/// the count hits zero and a tick asked to reschedule while preemption was off,
+/// reschedule now.
 pub fn preempt_enable() {
-    percpu::this().preempt_count.fetch_sub(1, Ordering::Release);
+    let was_on = interrupts::are_enabled();
+    interrupts::disable();
+    let cpu = percpu::this();
+    let prev = cpu.preempt_count.fetch_sub(1, Ordering::Release);
+    let resched = prev == 1 && cpu.need_resched.load(Ordering::Relaxed);
+    if was_on {
+        interrupts::enable();
+    }
+    if resched {
+        schedule();
+    }
 }
 
 /// Promotes the CPU's current execution into a thread so it can be scheduled.
@@ -66,20 +85,25 @@ pub fn adopt_current_as_idle() -> *mut Thread {
 }
 
 /// Spawns a worker on `cpu_id` running `entry(arg)` at the given nice level.
-pub fn spawn(entry: extern "C" fn(usize), arg: usize, nice: i8, cpu_id: u32) -> Tid {
+/// Returns the new thread's tid, or `EINVAL` if the target CPU is not online
+/// (rather than silently dropping the thread — M6).
+pub fn spawn(entry: extern "C" fn(usize), arg: usize, nice: i8, cpu_id: u32) -> Result<Tid, abi::Errno> {
     let weight = weight_from_nice(nice);
+    let Some(cpu) = percpu::by_id(cpu_id) else {
+        return Err(abi::Errno::EINVAL);
+    };
     let t: *mut Thread = Box::leak(Thread::new_worker(entry, arg, weight));
     // SAFETY: `t` was just leaked and is uniquely owned here.
     let tid = unsafe { (*t).tid() };
     THREADS.lock().push(tid);
-    if let Some(cpu) = percpu::by_id(cpu_id) {
-        cpu.runqueue.lock().insert_with(tid, weight, 0);
-        // Poke a remote CPU so it preempts and picks up the new thread promptly.
-        if cpu_id != percpu::cpu_id() {
-            crate::arch::x86_64::apic::send_reschedule(cpu.lapic_id);
-        }
+    cpu.runqueue.lock().insert_at_v(tid, weight);
+    // Poke a remote CPU so it preempts and picks up the new thread promptly.
+    // Read our own id with interrupts off so a migration can't make it stale.
+    let me = interrupts::without_interrupts(percpu::cpu_id);
+    if cpu_id != me {
+        crate::arch::x86_64::apic::send_reschedule(cpu.lapic_id);
     }
-    tid
+    Ok(tid)
 }
 
 /// Entry trampoline for freshly created threads: finishes the pending switch,
@@ -116,12 +140,26 @@ fn finish_switch() {
         return;
     }
     let idle = cpu.idle.load(Ordering::Acquire);
-    // SAFETY: `prev` is a live thread whose registers are now saved.
+    // SAFETY: `prev` is a live thread whose registers are now fully saved, so it
+    // is safe to make it runnable or to arm its sleep timer here (not before the
+    // switch, which would risk another CPU running a half-saved thread).
     unsafe {
-        if prev != idle && (*prev).state == State::Ready {
-            let weight = (*prev).weight;
-            let vruntime = u128::from((*prev).vruntime.load(Ordering::Relaxed));
-            cpu.runqueue.lock().insert_with((*prev).tid(), weight, vruntime);
+        if prev == idle {
+            return;
+        }
+        match (*prev).state {
+            State::Ready => {
+                let weight = (*prev).weight;
+                let vruntime = u128::from((*prev).vruntime.load(Ordering::Relaxed));
+                cpu.runqueue.lock().insert_clamped((*prev).tid(), weight, vruntime);
+            }
+            State::Blocked if (*prev).wake_at != 0 => {
+                // Arm the sleep timer now that `prev` is fully parked. Because the
+                // timer is inserted only here (never while the thread is current),
+                // the tick path can never wake a running thread (C1-B).
+                cpu.timers.lock().insert((*prev).wake_at, (*prev).tid());
+            }
+            _ => {}
         }
     }
 }
@@ -129,9 +167,11 @@ fn finish_switch() {
 /// Picks the next thread and switches to it. Safe to call from thread context
 /// (voluntary yield) or the timer handler.
 pub fn schedule() {
-    let cpu = percpu::this();
+    // Disable interrupts BEFORE reading per-CPU state: otherwise a tick could
+    // migrate us and leave `cpu` pointing at the previous CPU's runqueue (C2).
     let interrupts_were_on = interrupts::are_enabled();
     interrupts::disable();
+    let cpu = percpu::this();
     cpu.need_resched.store(false, Ordering::Relaxed);
 
     let cur = percpu::current();
@@ -169,7 +209,10 @@ pub fn schedule() {
     cpu.prev.store(cur, Ordering::Release);
     cpu.switches.fetch_add(1, Ordering::Relaxed);
     percpu::set_current(next);
+    // SAFETY: `next` is the live thread we are switching to.
+    unsafe { crate::process::switch_mm(next) };
 
+    thread::check_canary(cur);
     // SAFETY: both are live; `cur` is the running thread being switched out.
     unsafe { thread::switch(cur, next) };
 
@@ -190,17 +233,22 @@ pub fn yield_now() {
 pub fn tick() {
     let cpu = percpu::this();
 
-    // Advance local time and wake any threads whose sleep expired.
+    // Advance local time and wake any threads whose sleep expired. Use a fixed
+    // per-call buffer so the IRQ path never allocates (C3). Timers only hold
+    // parked (non-current) threads, so this can never double-run current (C1).
     let now = cpu.now.fetch_add(1, Ordering::Relaxed) + 1;
-    let woken = cpu.timers.lock().expire(now);
-    for tid in woken {
+    const WAKE_BATCH: usize = 64;
+    let mut woken = [0u64; WAKE_BATCH];
+    let n = cpu.timers.lock().expire_into(now, &mut woken);
+    for &tid in &woken[..n] {
         // SAFETY: a sleeping tid is a live Thread parked only in the timer queue.
         unsafe {
             let t = tid as *mut Thread;
             (*t).state = State::Ready;
+            (*t).wake_at = 0;
             let weight = (*t).weight;
             let vruntime = u128::from((*t).vruntime.load(Ordering::Relaxed));
-            cpu.runqueue.lock().insert_with(tid, weight, vruntime);
+            cpu.runqueue.lock().insert_clamped(tid, weight, vruntime);
         }
     }
 
@@ -222,16 +270,23 @@ pub fn tick() {
 /// Sleeps the current thread for `ticks` scheduling ticks, yielding the CPU.
 /// A timer requeues it (see [`tick`]) once the deadline passes.
 pub fn sleep_ticks(ticks: u64) {
+    // Run the block-then-switch as one interrupts-off critical section: a tick
+    // must not fire between marking Blocked and switching away, or the wakeup
+    // would be lost and the thread leaked (C1-A). The timer is armed by
+    // `finish_switch` once the thread is fully parked, not here.
+    let was_on = interrupts::are_enabled();
+    interrupts::disable();
     let cpu = percpu::this();
     let cur = percpu::current();
-    let deadline = cpu.now.load(Ordering::Relaxed) + ticks;
-    // SAFETY: `cur` is this CPU's running thread.
+    // SAFETY: `cur` is this CPU's running thread; only this CPU touches it.
     unsafe {
+        (*cur).wake_at = cpu.now.load(Ordering::Relaxed) + ticks.max(1);
         (*cur).state = State::Blocked;
-        cpu.timers.lock().insert(deadline, (*cur).tid());
     }
-    // Switch away; the Blocked thread is not re-queued until its timer fires.
     schedule();
+    if was_on {
+        interrupts::enable();
+    }
 }
 
 /// Idle-thread body: steal work if any, otherwise wait for an interrupt.
@@ -296,7 +351,7 @@ pub fn try_steal() -> bool {
             let t = tid as *mut Thread;
             let weight = (*t).weight;
             let vruntime = u128::from((*t).vruntime.load(Ordering::Relaxed));
-            me.runqueue.lock().insert_with(tid, weight, vruntime);
+            me.runqueue.lock().insert_clamped(tid, weight, vruntime);
         }
         moved += 1;
     }

@@ -8,6 +8,7 @@
 //! implausibly long, surfacing deadlocks instead of hanging.
 
 use core::cell::UnsafeCell;
+use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 use x86_64::instructions::interrupts;
@@ -62,7 +63,7 @@ impl<T: ?Sized> SpinLock<T> {
             }
         }
 
-        SpinGuard { lock: self, interrupts_were_enabled }
+        SpinGuard { lock: self, interrupts_were_enabled, _not_send: PhantomData }
     }
 
     /// Forcibly releases the lock without a guard. Only for the panic path,
@@ -80,6 +81,10 @@ impl<T: ?Sized> SpinLock<T> {
 pub struct SpinGuard<'a, T: ?Sized> {
     lock: &'a SpinLock<T>,
     interrupts_were_enabled: bool,
+    /// A raw pointer makes the guard `!Send` and `!Sync`: a lock guard must not
+    /// cross threads/CPUs (it would unlock on the wrong CPU and mis-manage the
+    /// interrupt flag) — M12.
+    _not_send: PhantomData<*const ()>,
 }
 
 impl<T: ?Sized> Deref for SpinGuard<'_, T> {

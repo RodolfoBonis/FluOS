@@ -181,6 +181,56 @@ pub fn write_str(s: &str) {
     }
 }
 
+/// Writes raw bytes (possibly escape sequences from a user program) to the
+/// console.
+pub fn write_bytes(bytes: &[u8]) {
+    if let Some(console) = CONSOLE.lock().as_mut() {
+        console.write(bytes);
+    }
+}
+
+/// Cooked line read from the keyboard into `buf`, with echo and backspace
+/// handling, blocking until Enter. Returns the number of bytes (including the
+/// trailing newline). This is the minimal line discipline for M4.
+pub fn read_line(buf: &mut [u8]) -> usize {
+    use crate::arch::x86_64::input;
+    use x86_64::instructions::interrupts;
+
+    let mut n = 0usize;
+    loop {
+        let byte = loop {
+            if let Some(b) = interrupts::without_interrupts(input::pop) {
+                break b;
+            }
+            // SAFETY: wait for the next keyboard IRQ.
+            unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)) };
+        };
+        match byte {
+            b'\r' | b'\n' => {
+                write_bytes(b"\n");
+                if n < buf.len() {
+                    buf[n] = b'\n';
+                    n += 1;
+                }
+                return n;
+            }
+            0x08 | 0x7f => {
+                if n > 0 {
+                    n -= 1;
+                    write_bytes(b"\x08 \x08");
+                }
+            }
+            b => {
+                if n < buf.len() {
+                    buf[n] = b;
+                    n += 1;
+                    write_bytes(&[b]);
+                }
+            }
+        }
+    }
+}
+
 /// Log sink: a plain function pointer so `log` stays decoupled from the console.
 fn sink(s: &str) {
     write_str(s);

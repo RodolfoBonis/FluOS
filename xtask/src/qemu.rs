@@ -15,9 +15,13 @@ const TEST_SUCCESS_STATUS: i32 = 0x21;
 /// TCG emulation on Apple Silicon is slow; leave generous headroom.
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
-pub fn run(iso: &Path, mode: Mode) -> Result<()> {
+pub fn run(iso: &Path, mode: Mode, smp: u32) -> Result<()> {
     let mut cmd = Command::new("qemu-system-x86_64");
-    cmd.args(["-machine", "q35", "-cpu", "max", "-m", "1G", "-smp", "4"])
+    // `thread=multi` runs each vCPU on its own host thread so SMP code is
+    // exercised with real parallelism (not round-robin single-threaded TCG).
+    cmd.args(["-machine", "q35", "-cpu", "max", "-m", "1G"])
+        .args(["-accel", "tcg,thread=multi"])
+        .args(["-smp", &smp.to_string()])
         .args(["-drive", &format!("if=pflash,format=raw,readonly=on,file={}", ovmf()?.display())])
         .arg("-cdrom")
         .arg(iso)

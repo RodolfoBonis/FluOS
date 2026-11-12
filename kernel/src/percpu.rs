@@ -18,7 +18,16 @@ use x86_64::registers::model_specific::GsBase;
 pub const MAX_CPUS: usize = 64;
 
 /// Everything a single CPU needs to schedule.
+///
+/// `repr(C)` with the syscall-entry scratch fields first: the assembly syscall
+/// entry reaches them at fixed offsets through the GS base (`gs:[0]` =
+/// `kernel_rsp`, `gs:[8]` = `user_rsp_scratch`).
+#[repr(C)]
 pub struct CpuState {
+    /// Kernel stack top for the current user thread's syscall/interrupt entry.
+    pub kernel_rsp: AtomicU64,
+    /// Scratch slot where the syscall entry parks the user RSP.
+    pub user_rsp_scratch: AtomicU64,
     pub cpu_id: u32,
     pub lapic_id: u32,
     /// Runnable threads on this CPU (EEVDF). Locked for cross-CPU stealing.
@@ -42,15 +51,25 @@ pub struct CpuState {
     pub steals: AtomicU64,
     /// Monotonic local tick counter (advanced by the timer), for timers.
     pub now: AtomicU64,
+    /// Pointer to this CPU's TSS (for updating RSP0 on context switch to user).
+    pub tss: AtomicU64,
+    /// Raw pointer to the current user process (`*const SpinLock<Process>`), 0
+    /// for kernel-only threads. The process stays alive in the process table.
+    pub current_proc: AtomicU64,
+    /// CR3 currently loaded on this CPU (to skip redundant reloads).
+    pub active_cr3: AtomicU64,
 }
 
 static CPUS: [AtomicPtr<CpuState>; MAX_CPUS] = [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
 static CPU_COUNT: AtomicU32 = AtomicU32::new(0);
+static PERCPU_READY: AtomicBool = AtomicBool::new(false);
 
 /// Initialises this CPU's state, publishes it in the table, and points the GS
 /// base at it. Returns a static reference to the new state.
-pub fn init(cpu_id: u32, lapic_id: u32) -> &'static CpuState {
+pub fn init(cpu_id: u32, lapic_id: u32, tss: u64) -> &'static CpuState {
     let state = Box::leak(Box::new(CpuState {
+        kernel_rsp: AtomicU64::new(0),
+        user_rsp_scratch: AtomicU64::new(0),
         cpu_id,
         lapic_id,
         runqueue: SpinLock::new(Eevdf::new()),
@@ -63,10 +82,19 @@ pub fn init(cpu_id: u32, lapic_id: u32) -> &'static CpuState {
         switches: AtomicU64::new(0),
         steals: AtomicU64::new(0),
         now: AtomicU64::new(0),
+        tss: AtomicU64::new(tss),
+        current_proc: AtomicU64::new(0),
+        active_cr3: AtomicU64::new(0),
     }));
 
+    // Pre-reserve runqueue capacity so timer-IRQ enqueues don't allocate (C3).
+    state.runqueue.lock().reserve(256);
     CPUS[cpu_id as usize].store(state, Ordering::Release);
     GsBase::write(VirtAddr::new(core::ptr::from_ref(state) as u64));
+    // KERNEL_GS_BASE holds the running thread's user GS (0 for kernel threads);
+    // swapgs exchanges it with GS_BASE on ring transitions.
+    x86_64::registers::model_specific::KernelGsBase::write(VirtAddr::new(0));
+    PERCPU_READY.store(true, Ordering::Release);
     state
 }
 
@@ -97,6 +125,16 @@ pub fn by_id(cpu_id: u32) -> Option<&'static CpuState> {
 /// This CPU's id.
 pub fn cpu_id() -> u32 {
     this().cpu_id
+}
+
+/// Whether per-CPU state (and the GS base) has been initialised on some CPU.
+pub fn is_ready() -> bool {
+    PERCPU_READY.load(Ordering::Acquire)
+}
+
+/// This CPU's id, or `None` before per-CPU state is set up (safe to call early).
+pub fn try_cpu_id() -> Option<u32> {
+    is_ready().then(cpu_id)
 }
 
 /// The thread currently running on this CPU.

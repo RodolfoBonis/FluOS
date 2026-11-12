@@ -1,0 +1,313 @@
+//! Userspace bring-up: loading an ELF into a process, building its initial
+//! stack (argv/envp/auxv the way musl expects), and entering ring 3.
+//!
+//! For the M4 self-test it also carries a tiny, self-contained raw-syscall
+//! "hello world" ELF built in [`hello_elf`], so the user-mode path (address
+//! space, ELF load, `syscall`/`sysret`) can be verified with no external
+//! toolchain or initramfs.
+
+use crate::arch::x86_64::user;
+use crate::fs::FdTable;
+use crate::process::{self, AddressSpace, Process};
+use crate::sync::SpinLock;
+use crate::thread::Thread;
+use crate::{elf, scheduler};
+use abi::types::{
+    AT_BASE, AT_CLKTCK, AT_EGID, AT_ENTRY, AT_EUID, AT_EXECFN, AT_GID, AT_HWCAP, AT_NULL, AT_PAGESZ,
+    AT_PHDR, AT_PHENT, AT_PHNUM, AT_RANDOM, AT_SECURE, AT_UID,
+};
+use abi::Errno;
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+/// Top of the initial user stack (just below the non-canonical hole).
+const STACK_TOP: u64 = 0x7fff_ffff_f000;
+/// Initial user stack size.
+const STACK_SIZE: u64 = 0x40000;
+
+/// Entry parameters handed to the user thread's trampoline.
+struct UserEntry {
+    entry: u64,
+    user_sp: u64,
+}
+
+/// Loads `elf` into a fresh process, builds its stack, and schedules a thread
+/// that enters user mode. Returns the process handle.
+pub fn spawn(elf_image: &[u8], argv: &[&str], envp: &[&str]) -> Result<Arc<SpinLock<Process>>, Errno> {
+    let proc = Process::new().ok_or(Errno::ENOMEM)?;
+    let (entry, user_sp, cr3) = {
+        let mut p = proc.lock();
+        let loaded = elf::load(&mut p.space, elf_image)?;
+        let user_sp = build_stack(&mut p.space, &loaded, argv, envp)?;
+        p.fds = FdTable::with_stdio();
+        (loaded.entry, user_sp, p.space.cr3())
+    };
+
+    process::register(proc.clone());
+    let ue = Box::leak(Box::new(UserEntry { entry, user_sp }));
+    let ptr = Arc::as_ptr(&proc) as u64;
+
+    let tid = scheduler::spawn(user_thread_start, core::ptr::from_mut(ue) as usize, 0, crate::percpu::cpu_id())?;
+    // SAFETY: `tid` is the address of the freshly spawned, live thread.
+    unsafe {
+        let t = tid as *mut Thread;
+        (*t).cr3 = cr3;
+        (*t).proc_ptr = ptr;
+    }
+    Ok(proc)
+}
+
+/// Trampoline run as a kernel thread; the scheduler's `switch_mm` has already
+/// installed this process's CR3, kernel stack, and current-process pointer, so
+/// it only needs to drop into user mode.
+extern "C" fn user_thread_start(arg: usize) {
+    // SAFETY: `arg` is the leaked `UserEntry` for this thread.
+    let ue = unsafe { &*(arg as *const UserEntry) };
+    // SAFETY: entry/user_sp are valid user addresses in the active space.
+    unsafe { user::enter_user(ue.entry, ue.user_sp) };
+}
+
+/// Builds the initial user stack: the strings block (argv, envp, 16 random
+/// bytes for `AT_RANDOM`, the exec filename) at the top, then the argc/argv/
+/// envp/auxv vector below it, 16-byte aligned. Returns the initial `rsp`.
+fn build_stack(space: &mut AddressSpace, loaded: &elf::Loaded, argv: &[&str], envp: &[&str]) -> Result<u64, Errno> {
+    space.map_region(STACK_TOP - STACK_SIZE, STACK_SIZE, true, false);
+
+    let mut strings: Vec<u8> = Vec::new();
+    let mut argv_off: Vec<usize> = Vec::new();
+    for s in argv {
+        argv_off.push(strings.len());
+        strings.extend_from_slice(s.as_bytes());
+        strings.push(0);
+    }
+    let mut envp_off: Vec<usize> = Vec::new();
+    for s in envp {
+        envp_off.push(strings.len());
+        strings.extend_from_slice(s.as_bytes());
+        strings.push(0);
+    }
+    let rand_off = strings.len();
+    let mut rnd = [0u8; 16];
+    crate::rng::fill(&mut rnd);
+    strings.extend_from_slice(&rnd);
+    let execfn_off = strings.len();
+    strings.extend_from_slice(argv.first().map_or(b"".as_slice(), |s| s.as_bytes()));
+    strings.push(0);
+
+    let strings_base = (STACK_TOP - strings.len() as u64) & !0xF;
+    space.write(strings_base, &strings);
+    let at = |off: usize| strings_base + off as u64;
+
+    let aux: [(u64, u64); 15] = [
+        (AT_PHDR, loaded.phdr),
+        (AT_PHENT, loaded.phent),
+        (AT_PHNUM, loaded.phnum),
+        (AT_PAGESZ, 4096),
+        (AT_ENTRY, loaded.entry),
+        (AT_BASE, loaded.base),
+        (AT_RANDOM, at(rand_off)),
+        (AT_HWCAP, 0),
+        (AT_CLKTCK, 100),
+        (AT_UID, 0),
+        (AT_EUID, 0),
+        (AT_GID, 0),
+        (AT_EGID, 0),
+        (AT_SECURE, 0),
+        (AT_EXECFN, at(execfn_off)),
+    ];
+
+    let mut vec: Vec<u64> = Vec::new();
+    vec.push(argv.len() as u64);
+    for &o in &argv_off {
+        vec.push(at(o));
+    }
+    vec.push(0);
+    for &o in &envp_off {
+        vec.push(at(o));
+    }
+    vec.push(0);
+    for (t, v) in aux {
+        vec.push(t);
+        vec.push(v);
+    }
+    vec.push(AT_NULL);
+    vec.push(0);
+
+    let vec_bytes = vec.len() * 8;
+    let rsp = (strings_base - vec_bytes as u64) & !0xF;
+    let mut bytes = Vec::with_capacity(vec_bytes);
+    for v in &vec {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    space.write(rsp, &bytes);
+    Ok(rsp)
+}
+
+/// Builds a tiny static ELF that writes a greeting and `exit_group(0)`s, used by
+/// the self-test. Entirely self-contained (no toolchain needed).
+pub fn hello_elf() -> Vec<u8> {
+    const V: u64 = 0x40_0000;
+    let msg: &[u8] = b"hello from FluOS userspace\n";
+    let headers = 64 + 56u64;
+
+    // Machine code (36 bytes); `msg` lives right after it.
+    let code_len = 36u64;
+    let msg_addr = V + headers + code_len;
+    let mut code: Vec<u8> = Vec::new();
+    code.extend_from_slice(&[0xB8, 1, 0, 0, 0]); // mov eax, 1 (write)
+    code.extend_from_slice(&[0xBF, 1, 0, 0, 0]); // mov edi, 1 (stdout)
+    code.push(0x48);
+    code.push(0xBE); // movabs rsi, imm64
+    code.extend_from_slice(&msg_addr.to_le_bytes());
+    code.push(0xBA); // mov edx, imm32 (len)
+    code.extend_from_slice(&(msg.len() as u32).to_le_bytes());
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    code.extend_from_slice(&[0xB8, 0xE7, 0, 0, 0]); // mov eax, 231 (exit_group)
+    code.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    debug_assert_eq!(code.len() as u64, code_len);
+
+    let filesz = headers + code_len + msg.len() as u64;
+    let entry = V + headers;
+
+    let mut elf = Vec::new();
+    // ELF header.
+    elf.extend_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0]);
+    elf.extend_from_slice(&[0; 8]); // e_ident padding
+    push_u16(&mut elf, 2); // e_type = ET_EXEC
+    push_u16(&mut elf, 62); // e_machine = x86_64
+    push_u32(&mut elf, 1); // e_version
+    push_u64(&mut elf, entry); // e_entry
+    push_u64(&mut elf, 64); // e_phoff
+    push_u64(&mut elf, 0); // e_shoff
+    push_u32(&mut elf, 0); // e_flags
+    push_u16(&mut elf, 64); // e_ehsize
+    push_u16(&mut elf, 56); // e_phentsize
+    push_u16(&mut elf, 1); // e_phnum
+    push_u16(&mut elf, 0); // e_shentsize
+    push_u16(&mut elf, 0); // e_shnum
+    push_u16(&mut elf, 0); // e_shstrndx
+    // Program header.
+    push_u32(&mut elf, 1); // p_type = PT_LOAD
+    push_u32(&mut elf, 7); // p_flags = RWX
+    push_u64(&mut elf, 0); // p_offset
+    push_u64(&mut elf, V); // p_vaddr
+    push_u64(&mut elf, V); // p_paddr
+    push_u64(&mut elf, filesz); // p_filesz
+    push_u64(&mut elf, filesz); // p_memsz
+    push_u64(&mut elf, 0x1000); // p_align
+    elf.extend_from_slice(&code);
+    elf.extend_from_slice(msg);
+    elf
+}
+
+fn push_u16(v: &mut Vec<u8>, x: u16) {
+    v.extend_from_slice(&x.to_le_bytes());
+}
+fn push_u32(v: &mut Vec<u8>, x: u32) {
+    v.extend_from_slice(&x.to_le_bytes());
+}
+fn push_u64(v: &mut Vec<u8>, x: u64) {
+    v.extend_from_slice(&x.to_le_bytes());
+}
+
+/// Builds a static ELF that calls `getpid` `n` times then `exit_group(0)`, for
+/// the syscall round-trip benchmark.
+pub fn getpid_loop_elf(n: u32) -> Vec<u8> {
+    const V: u64 = 0x40_0000;
+    let headers = 64 + 56u64;
+    let mut code: Vec<u8> = Vec::new();
+    code.push(0xBB); // mov ebx, imm32 (loop count)
+    code.extend_from_slice(&n.to_le_bytes());
+    // loop: mov eax,39 (getpid); syscall; dec ebx; jnz loop
+    code.extend_from_slice(&[0xB8, 0x27, 0, 0, 0]);
+    code.extend_from_slice(&[0x0F, 0x05]);
+    code.extend_from_slice(&[0xFF, 0xCB]); // dec ebx
+    code.extend_from_slice(&[0x75, 0xF5]); // jnz -11
+    // exit_group(0)
+    code.extend_from_slice(&[0xB8, 0xE7, 0, 0, 0]);
+    code.extend_from_slice(&[0x31, 0xFF]);
+    code.extend_from_slice(&[0x0F, 0x05]);
+
+    let filesz = headers + code.len() as u64;
+    let entry = V + headers;
+    let mut elf = Vec::new();
+    elf.extend_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0]);
+    elf.extend_from_slice(&[0; 8]);
+    push_u16(&mut elf, 2);
+    push_u16(&mut elf, 62);
+    push_u32(&mut elf, 1);
+    push_u64(&mut elf, entry);
+    push_u64(&mut elf, 64);
+    push_u64(&mut elf, 0);
+    push_u32(&mut elf, 0);
+    push_u16(&mut elf, 64);
+    push_u16(&mut elf, 56);
+    push_u16(&mut elf, 1);
+    push_u16(&mut elf, 0);
+    push_u16(&mut elf, 0);
+    push_u16(&mut elf, 0);
+    push_u32(&mut elf, 1);
+    push_u32(&mut elf, 5); // R+X
+    push_u64(&mut elf, 0);
+    push_u64(&mut elf, V);
+    push_u64(&mut elf, V);
+    push_u64(&mut elf, filesz);
+    push_u64(&mut elf, filesz);
+    push_u64(&mut elf, 0x1000);
+    elf.extend_from_slice(&code);
+    elf
+}
+
+/// Measures getpid round-trip latency by running a tight getpid loop in user
+/// mode and reading the kernel-side measurement.
+pub fn run_syscall_bench() {
+    const N: u32 = 200_000;
+    crate::syscall::bench_arm(u64::from(N));
+    let elf_image = getpid_loop_elf(N);
+    match spawn(&elf_image, &["/bench"], &[]) {
+        Ok(proc) => {
+            let mut spins = 0u64;
+            while proc.lock().exit_code.is_none() {
+                scheduler::yield_now();
+                spins += 1;
+                if spins > 200_000_000 {
+                    crate::log::error!("syscall bench: timed out");
+                    return;
+                }
+            }
+            crate::log::info!(
+                "syscall latency: ~{} cycles per getpid round-trip ({} calls)",
+                crate::syscall::bench_result(),
+                N,
+            );
+        }
+        Err(e) => crate::log::error!("syscall bench: spawn failed: {e:?}"),
+    }
+}
+
+/// Runs the userspace self-test: load the hello ELF, run it to completion, and
+/// report its exit status.
+pub fn run_selftest() {
+    let elf_image = hello_elf();
+    match spawn(&elf_image, &["/init"], &["PATH=/bin", "HOME=/", "TERM=xterm-256color"]) {
+        Ok(proc) => {
+            let mut spins = 0u64;
+            loop {
+                if proc.lock().exit_code.is_some() {
+                    break;
+                }
+                scheduler::yield_now();
+                spins += 1;
+                if spins > 50_000_000 {
+                    crate::log::error!("userspace selftest: timed out");
+                    return;
+                }
+            }
+            let code = proc.lock().exit_code;
+            crate::log::info!("userspace selftest: hello process exited with {code:?}");
+        }
+        Err(e) => crate::log::error!("userspace selftest: spawn failed: {e:?}"),
+    }
+}

@@ -15,7 +15,7 @@ use crate::boot;
 use core::sync::atomic::{AtomicU64, Ordering};
 use limine::memmap;
 use mm::buddy::{Buddy, Node};
-use spin::Mutex;
+use crate::sync::SpinLock;
 
 /// Page/frame size in bytes.
 pub const FRAME_SIZE: u64 = 4096;
@@ -27,7 +27,9 @@ const MAX_ORDER: usize = 18;
 /// available crate-wide without threading it through every call.
 static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
 
-static ALLOCATOR: Mutex<Option<Buddy<'static>>> = Mutex::new(None);
+/// IRQ-safe: the timer tick path can allocate (runqueue growth), so taking
+/// this lock must disable interrupts to avoid a same-CPU deadlock (C3).
+static ALLOCATOR: SpinLock<Option<Buddy<'static>>> = SpinLock::new(None);
 
 /// HHDM offset captured at init; valid after [`init`] has run.
 pub fn hhdm_offset() -> u64 {
@@ -56,7 +58,7 @@ pub fn init(hhdm: u64) {
     // Span of physical frames to manage: from the lowest usable frame to the
     // highest. Holes (reserved/MMIO) inside the span simply never get freed.
     let usable = || entries.iter().filter(|e| e.type_ == memmap::MEMMAP_USABLE);
-    let base_frame = usable()
+    let lowest = usable()
         .map(|e| frame_of(e.base))
         .min()
         .expect("no usable memory") as usize;
@@ -64,6 +66,11 @@ pub fn init(hhdm: u64) {
         .map(|e| frame_of(e.base + e.length))
         .max()
         .expect("no usable memory") as usize;
+    // Floor the managed base to 2^MAX_ORDER so a block's alignment relative to
+    // the base is also its *absolute* physical alignment (required for huge
+    // pages / DMA) — M1. Frames below the lowest usable one are simply never
+    // released into the pool.
+    let base_frame = lowest & !((1usize << MAX_ORDER) - 1);
     let frames = end_frame - base_frame;
 
     // Metadata layout: `frames` nodes (8 bytes each) followed by `frames` order

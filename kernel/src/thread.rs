@@ -18,6 +18,11 @@ pub type Tid = u64;
 /// Per-thread kernel stack size.
 pub const KSTACK_SIZE: usize = 32 * 1024;
 
+/// Canary written at the lowest address of each kernel stack; checked on every
+/// context switch in debug builds to catch kernel stack overflow (H5). A real
+/// unmapped guard page needs the kernel VA allocator, which lands with M4.
+const STACK_CANARY: u64 = 0x5353_4543_4652_4147; // "GARFCESS" ish
+
 /// FXSAVE image size.
 const FPU_AREA: usize = 512;
 
@@ -45,12 +50,24 @@ pub struct Thread {
     pub weight: u64,
     /// Accumulated virtual runtime (EEVDF units), carried across run periods.
     pub vruntime: AtomicU64,
+    /// Wake deadline (local ticks) when Blocked on a sleep; 0 otherwise. Only
+    /// touched by the owning CPU with interrupts off.
+    pub wake_at: u64,
     pub state: State,
     /// FXSAVE area; a raw pointer so it is reachable from the switch path.
     pub fpu: *mut u8,
     /// Base of the owned stack allocation, or null for the idle context.
     #[allow(dead_code)] // owns the allocation; freed when reaping lands
     stack: *mut u8,
+    /// Top of the kernel stack (for TSS RSP0 / syscall entry); 0 for idle.
+    pub kstack_top: u64,
+    /// User address space CR3 (0 = kernel-only thread).
+    pub cr3: u64,
+    /// User GS base (the value KERNEL_GS_BASE holds while this thread runs in
+    /// the kernel; swapped to GS on return to ring 3). Supports arch_prctl GS.
+    pub user_gs: u64,
+    /// Raw pointer to the owning process (`*const SpinLock<Process>`), 0 if none.
+    pub proc_ptr: u64,
     /// Times this thread was scheduled (self-test accounting).
     pub run_count: AtomicU64,
     /// Bitmask of CPUs this thread has executed on (self-test accounting).
@@ -100,13 +117,21 @@ impl Thread {
             arg,
             weight,
             vruntime: AtomicU64::new(0),
+            wake_at: 0,
             state: State::Ready,
             fpu: Self::new_fpu(),
             stack,
+            kstack_top: 0,
+            cr3: 0,
+            proc_ptr: 0,
+            user_gs: 0,
             run_count: AtomicU64::new(0),
             ran_on: AtomicU32::new(0),
         });
+        // SAFETY: `stack` owns KSTACK_SIZE bytes; the first 8 hold the canary.
+        unsafe { (stack as *mut u64).write(STACK_CANARY) };
         thread.rsp = Self::init_stack(stack);
+        thread.kstack_top = (stack as u64 + KSTACK_SIZE as u64) & !0xF;
         thread
     }
 
@@ -120,9 +145,14 @@ impl Thread {
             arg: 0,
             weight,
             vruntime: AtomicU64::new(0),
+            wake_at: 0,
             state: State::Running,
             fpu: Self::new_fpu(),
             stack: core::ptr::null_mut(),
+            kstack_top: 0,
+            cr3: 0,
+            proc_ptr: 0,
+            user_gs: 0,
             run_count: AtomicU64::new(1),
             ran_on: AtomicU32::new(0),
         })
@@ -151,6 +181,27 @@ impl Thread {
     }
 }
 
+/// Verifies a thread's stack canary (debug builds); panics on overflow.
+#[inline]
+pub fn check_canary(t: *const Thread) {
+    #[cfg(debug_assertions)]
+    {
+        // SAFETY: `t` is a live thread; a worker's stack base holds the canary
+        // (idle/bootstrap threads have no owned stack — `stack` is null).
+        unsafe {
+            let base = (*t).stack;
+            if !base.is_null() {
+                assert_eq!(
+                    (base as *const u64).read(),
+                    STACK_CANARY,
+                    "kernel stack overflow detected (canary clobbered)"
+                );
+            }
+        }
+    }
+    let _ = t;
+}
+
 /// Saves `old`'s FPU state, restores `new`'s, then switches stacks. On return,
 /// control resumes in whichever thread was switched *to* previously.
 ///
@@ -158,9 +209,17 @@ impl Thread {
 /// Both pointers must reference live threads; `old` must be the currently
 /// running thread on this CPU.
 pub unsafe fn switch(old: *mut Thread, new: *mut Thread) {
+    use x86_64::VirtAddr;
+    use x86_64::registers::model_specific::KernelGsBase;
     // SAFETY: caller guarantees both are live; the FPU areas are owned and
     // correctly sized, and `rsp` fields are valid stacks.
     unsafe {
+        // The per-CPU GS base stays in GS_BASE across the switch; KERNEL_GS_BASE
+        // holds the *running* thread's user GS, so it is per-thread and must be
+        // saved/restored here (swapgs restores it to GS on return to ring 3).
+        (*old).user_gs = KernelGsBase::read().as_u64();
+        KernelGsBase::write(VirtAddr::new((*new).user_gs));
+
         context::fxsave((*old).fpu);
         context::fxrstor((*new).fpu);
         context::context_switch(&mut (*old).rsp, (*new).rsp);
