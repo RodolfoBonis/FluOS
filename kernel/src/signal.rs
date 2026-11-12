@@ -191,6 +191,14 @@ pub fn notify_parent(ppid: i32) {
     send_to_pid(ppid, abi::types::SIGCHLD);
 }
 
+/// Whether the current process has a signal pending that is not blocked. Used
+/// by in-kernel blocking loops (tty reads, sleeps) to break out and let the
+/// signal be delivered on the syscall-return path.
+#[must_use]
+pub fn current_has_deliverable() -> bool {
+    process::current().is_some_and(|p| p.lock().sig.has_deliverable())
+}
+
 // --- rt_sigframe (Linux x86_64 layout) -------------------------------------
 
 #[repr(C)]
@@ -373,7 +381,8 @@ fn terminate(sig: i32) -> ! {
         };
         notify_parent(ppid);
     }
-    crate::log::info!("process terminated by signal {sig}");
+    let pid = process::current().map(|p| p.lock().pid);
+    crate::log::info!("process {pid:?} terminated by signal {sig}");
     crate::scheduler::thread_exit();
 }
 

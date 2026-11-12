@@ -1,5 +1,6 @@
 //! Build orchestration for FluOS: `cargo xtask <command>`.
 
+mod e2e;
 mod image;
 mod ksyms;
 mod limine;
@@ -17,6 +18,7 @@ commands:
   image   build a bootable UEFI ISO at build/fluos.iso
   run     boot the ISO in QEMU (graphical window + serial on stdio)
   test    boot headless and assert the kernel reaches `boot complete`
+  e2e     boot and drive the busybox shell over serial, asserting output
 ";
 
 #[derive(Clone, Copy)]
@@ -51,6 +53,7 @@ fn main() -> Result<()> {
         Some("run") => qemu::run(&image::build(profile, "")?, qemu::Mode::Interactive, smp),
         // `qemu-exit` makes the kernel signal QEMU's debug-exit device once boot completes.
         Some("test") => qemu::run(&image::build(profile, "qemu-exit")?, qemu::Mode::Test, smp),
+        Some("e2e") => e2e::run(&image::build(profile, "")?, smp),
         _ => {
             eprint!("{USAGE}");
             bail!("missing or unknown command")

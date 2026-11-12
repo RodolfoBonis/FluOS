@@ -47,6 +47,12 @@ pub fn termios() -> types::Termios {
 
 /// Updates the console termios (ioctl TCSETS).
 pub fn set_termios(t: types::Termios) {
+    crate::log::info!(
+        "tty: line discipline ICANON={} ECHO={} ISIG={}",
+        t.c_lflag & types::ICANON != 0,
+        t.c_lflag & types::ECHO != 0,
+        t.c_lflag & types::ISIG != 0,
+    );
     *TERMIOS.lock() = t;
 }
 
@@ -341,12 +347,16 @@ fn device_read(dev: u64, buf: &mut [u8]) -> SysResult {
         dev::CONSOLE | dev::TTY => {
             let t = *TERMIOS.lock();
             let echo = t.c_lflag & types::ECHO != 0;
-            let n = if t.c_lflag & types::ICANON != 0 {
+            let read = if t.c_lflag & types::ICANON != 0 {
                 crate::console::read_line(buf, echo)
             } else {
                 crate::console::read_raw(buf, echo)
             };
-            Ok(n as u64)
+            match read {
+                Some(n) => Ok(n as u64),
+                // Interrupted by a signal before any byte: restart or EINTR.
+                None => Err(Errno::ERESTARTSYS),
+            }
         }
         dev::NULL => Ok(0),
         dev::ZERO => {

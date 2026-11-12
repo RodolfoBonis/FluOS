@@ -104,6 +104,8 @@ fn handle(number: u64, a: [u64; 6], regs: &mut Regs) -> SysResult {
         nr::FUTEX => Ok(0),
         nr::SENDFILE => sys_sendfile(a[0] as i32, a[1] as i32, a[2], a[3] as usize),
         nr::KILL => sys_kill(a[0] as i32, a[1] as i32),
+        nr::TKILL => sys_tkill(a[0] as i32, a[1] as i32),
+        nr::TGKILL => sys_tkill(a[1] as i32, a[2] as i32),
         nr::WAIT4 => sys_wait4(a[0] as i32, a[1], a[2] as u32),
         nr::FORK | nr::VFORK => sys_fork(regs),
         nr::EXECVE => sys_execve(a[0], a[1], a[2]),
@@ -164,13 +166,28 @@ fn sys_getpgid(pid: i32) -> SysResult {
 }
 
 fn sys_setpgid(pid: i32, pgid: i32) -> SysResult {
-    let mut p = proc()?.lock();
-    if pid == 0 || pid == p.pid {
-        p.pgid = if pgid == 0 { p.pid } else { pgid };
-        Ok(0)
-    } else {
-        Err(Errno::ESRCH)
+    if pgid < 0 {
+        return Err(Errno::EINVAL);
     }
+    let self_pid = proc()?.lock().pid;
+    let target = if pid == 0 { self_pid } else { pid };
+    let newpg = if pgid == 0 { target } else { pgid };
+    if target == self_pid {
+        proc()?.lock().pgid = newpg;
+        return Ok(0);
+    }
+    // POSIX allows a parent to set a child's group (before it execs); a shell
+    // does this from both sides of `fork` to start a job's group race-free.
+    process::with_pid(target, |c| {
+        if c.ppid == self_pid {
+            c.pgid = newpg;
+            Ok(())
+        } else {
+            Err(Errno::ESRCH)
+        }
+    })
+    .unwrap_or(Err(Errno::ESRCH))
+    .map(|()| 0)
 }
 
 fn sys_setsid() -> SysResult {
@@ -514,6 +531,7 @@ fn sys_ioctl(_fd: i32, request: u64, arg: u64) -> SysResult {
             let pgid = i32::from_le_bytes(raw);
             if pgid > 0 {
                 fs::set_foreground_pgrp(pgid);
+                crate::log::info!("tty: foreground pgrp -> {pgid}");
             }
             Ok(0)
         }
@@ -751,6 +769,22 @@ fn sys_kill(pid: i32, sig: i32) -> SysResult {
         let pgid = if pid == 0 || pid == -1 { proc()?.lock().pgid } else { -pid };
         crate::signal::send_to_pgrp(pgid, sig);
         Ok(0)
+    }
+}
+
+/// `tkill(tid, sig)` / `tgkill(tgid, tid, sig)`: with one thread per process,
+/// the tid is the pid, so these post `sig` to that process.
+fn sys_tkill(tid: i32, sig: i32) -> SysResult {
+    if tid <= 0 || !(0..=crate::signal::NSIG as i32).contains(&sig) {
+        return Err(Errno::EINVAL);
+    }
+    if sig == 0 {
+        return Ok(0);
+    }
+    if crate::signal::send_to_pid(tid, sig) {
+        Ok(0)
+    } else {
+        Err(Errno::ESRCH)
     }
 }
 

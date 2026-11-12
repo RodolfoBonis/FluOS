@@ -59,6 +59,11 @@ extern "C" fn keyboard_handler() {
     apic::eoi();
 }
 
+extern "C" fn serial_handler() {
+    super::serial::drain_rx();
+    apic::eoi();
+}
+
 extern "C" fn spurious_handler() {}
 
 extern "C" fn timer_handler() {
@@ -84,6 +89,7 @@ extern "C" fn tlb_handler() {
 }
 
 irq_stub!(keyboard_stub, keyboard_handler);
+irq_stub!(serial_stub, serial_handler);
 irq_stub!(spurious_stub, spurious_handler);
 irq_stub!(timer_stub, timer_handler);
 irq_stub!(reschedule_stub, reschedule_handler);
@@ -98,6 +104,7 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     // frame and `iretq`.
     unsafe {
         idt[apic::KEYBOARD_VECTOR].set_handler_addr(VirtAddr::new(keyboard_stub as *const () as u64));
+        idt[apic::SERIAL_VECTOR].set_handler_addr(VirtAddr::new(serial_stub as *const () as u64));
         idt[apic::SPURIOUS_VECTOR].set_handler_addr(VirtAddr::new(spurious_stub as *const () as u64));
         idt[apic::TIMER_VECTOR].set_handler_addr(VirtAddr::new(timer_stub as *const () as u64));
         idt[apic::RESCHED_VECTOR].set_handler_addr(VirtAddr::new(reschedule_stub as *const () as u64));

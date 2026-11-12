@@ -189,25 +189,31 @@ pub fn write_bytes(bytes: &[u8]) {
     }
 }
 
-/// Blocks for the next keyboard byte, waiting on interrupts.
-fn next_byte() -> u8 {
+/// Blocks for the next input byte, waiting on interrupts. Returns `None` if a
+/// signal becomes deliverable to the current process first, so the enclosing
+/// read can abort and let the signal be delivered on the syscall-return path.
+fn next_byte() -> Option<u8> {
     use crate::arch::x86_64::input;
     use x86_64::instructions::interrupts;
     loop {
         if let Some(b) = interrupts::without_interrupts(input::pop) {
-            return b;
+            return Some(b);
         }
-        // SAFETY: wait for the next keyboard/timer IRQ.
+        if crate::signal::current_has_deliverable() {
+            return None;
+        }
+        // SAFETY: wait for the next keyboard/serial/timer IRQ.
         unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)) };
     }
 }
 
 /// Cooked line read (ICANON): line-buffered with optional echo and backspace
 /// editing, blocking until Enter. Returns bytes incl. the trailing newline.
-pub fn read_line(buf: &mut [u8], echo: bool) -> usize {
+pub fn read_line(buf: &mut [u8], echo: bool) -> Option<usize> {
     let mut n = 0usize;
     loop {
-        match next_byte() {
+        let byte = next_byte()?;
+        match byte {
             b'\r' | b'\n' => {
                 if echo {
                     write_bytes(b"\n");
@@ -216,7 +222,7 @@ pub fn read_line(buf: &mut [u8], echo: bool) -> usize {
                     buf[n] = b'\n';
                     n += 1;
                 }
-                return n;
+                return Some(n);
             }
             0x08 | 0x7f => {
                 if n > 0 {
@@ -242,14 +248,14 @@ pub fn read_line(buf: &mut [u8], echo: bool) -> usize {
 /// Raw read (non-canonical): blocks for one byte, then drains what is already
 /// queued, with no line editing. Echo is honoured if `echo` is set. This is what
 /// an interactive shell's own line editor uses.
-pub fn read_raw(buf: &mut [u8], echo: bool) -> usize {
+pub fn read_raw(buf: &mut [u8], echo: bool) -> Option<usize> {
     use crate::arch::x86_64::input;
     use x86_64::instructions::interrupts;
     if buf.is_empty() {
-        return 0;
+        return Some(0);
     }
     let mut n = 0usize;
-    let first = next_byte();
+    let first = next_byte()?;
     if echo {
         write_bytes(&[first]);
     }
@@ -267,7 +273,7 @@ pub fn read_raw(buf: &mut [u8], echo: bool) -> usize {
             None => break,
         }
     }
-    n
+    Some(n)
 }
 
 /// Log sink: a plain function pointer so `log` stays decoupled from the console.

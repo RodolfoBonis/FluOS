@@ -15,7 +15,9 @@ const TEST_SUCCESS_STATUS: i32 = 0x21;
 /// TCG emulation on Apple Silicon is slow; leave generous headroom.
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
-pub fn run(iso: &Path, mode: Mode, smp: u32) -> Result<()> {
+/// Builds the shared QEMU command (machine, accel, firmware, ISO, serial on
+/// stdio, debug-exit device). Callers add mode-specific flags.
+pub fn base_command(iso: &Path, smp: u32) -> Result<Command> {
     let mut cmd = Command::new("qemu-system-x86_64");
     // `thread=multi` runs each vCPU on its own host thread so SMP code is
     // exercised with real parallelism (not round-robin single-threaded TCG).
@@ -27,6 +29,11 @@ pub fn run(iso: &Path, mode: Mode, smp: u32) -> Result<()> {
         .arg(iso)
         .args(["-serial", "stdio", "-no-reboot"])
         .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]);
+    Ok(cmd)
+}
+
+pub fn run(iso: &Path, mode: Mode, smp: u32) -> Result<()> {
+    let mut cmd = base_command(iso, smp)?;
 
     match mode {
         Mode::Interactive => crate::run_cmd(&mut cmd),

@@ -15,6 +15,8 @@ use x86_64::registers::model_specific::Msr;
 
 /// IDT vector the keyboard IRQ is delivered on.
 pub const KEYBOARD_VECTOR: u8 = 0x21;
+/// Vector for the COM1 serial RX interrupt (ISA IRQ 4).
+pub const SERIAL_VECTOR: u8 = 0x22;
 /// LAPIC spurious-interrupt vector.
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
 /// LAPIC timer vector (scheduler preemption).
@@ -74,6 +76,7 @@ pub fn init(info: ApicInfo) {
         );
     } else {
         route_ioapic(&info, apic_id);
+        route_serial(apic_id, info.ioapic_gsi_base);
     }
     calibrate();
 
@@ -263,6 +266,21 @@ fn route_ioapic(info: &ApicInfo, dest_apic_id: u32) {
     }
     ioapic_write(base, redtbl_lo + 1, dest_apic_id << 24);
     ioapic_write(base, redtbl_lo, low);
+}
+
+/// Routes the COM1 serial RX line (ISA IRQ 4) to [`SERIAL_VECTOR`] on
+/// `dest_apic_id`, edge-triggered / active-high (the ISA default). Best-effort:
+/// if the GSI base is above 4 we skip it (serial input simply stays disabled).
+fn route_serial(dest_apic_id: u32, gsi_base: u32) {
+    const COM1_GSI: u32 = 4;
+    if COM1_GSI < gsi_base {
+        return;
+    }
+    let base = IOAPIC_VIRT.load(Ordering::Acquire);
+    let index = COM1_GSI - gsi_base;
+    let redtbl_lo = 0x10 + index * 2;
+    ioapic_write(base, redtbl_lo + 1, dest_apic_id << 24);
+    ioapic_write(base, redtbl_lo, u32::from(SERIAL_VECTOR));
 }
 
 fn ioapic_write(base: u64, reg: u32, value: u32) {
