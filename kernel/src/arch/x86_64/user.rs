@@ -153,7 +153,12 @@ extern "C" fn bad_sysret(regs: &Regs) -> ! {
         regs.rip,
     );
     if let Some(p) = crate::process::current() {
-        p.lock().exit_code = Some(128 + abi::types::SIGSEGV);
+        let ppid = {
+            let mut g = p.lock();
+            g.exit_code = Some(128 + abi::types::SIGSEGV);
+            g.ppid
+        };
+        crate::signal::notify_parent(ppid);
     }
     crate::scheduler::thread_exit();
 }

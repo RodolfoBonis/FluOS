@@ -109,11 +109,15 @@ fn dump(name: &str, f: &TrapFrame) {
 /// per-CPU and process state are reachable here.
 fn kill_current(signal: i32, name: &str, f: &TrapFrame) -> ! {
     let pid = crate::process::current().map(|p| {
-        let mut g = p.lock();
-        // Shell convention for "killed by signal N": 128 + N. Enough for the
-        // parent (and our selftests) to see the process died by that signal.
-        g.exit_code = Some(128 + signal);
-        g.pid
+        let (pid, ppid) = {
+            let mut g = p.lock();
+            // Shell convention for "killed by signal N": 128 + N. Enough for the
+            // parent (and our selftests) to see the process died by that signal.
+            g.exit_code = Some(128 + signal);
+            (g.pid, g.ppid)
+        };
+        crate::signal::notify_parent(ppid);
+        pid
     });
     crate::log::error!(
         "user fault: {name} at rip={:#018x} (pid={pid:?}) -> killed by signal {signal}",

@@ -89,6 +89,7 @@ pub const VERASE: usize = 2;
 pub const VEOF: usize = 4;
 pub const VMIN: usize = 6;
 pub const VTIME: usize = 5;
+pub const VSUSP: usize = 10;
 
 /// `struct iovec` (16 bytes).
 #[repr(C)]
@@ -111,6 +112,11 @@ pub struct Sigaction {
 
 pub const SIG_DFL: u64 = 0;
 pub const SIG_IGN: u64 = 1;
+
+// rt_sigprocmask `how` values.
+pub const SIG_BLOCK: i32 = 0;
+pub const SIG_UNBLOCK: i32 = 1;
+pub const SIG_SETMASK: i32 = 2;
 pub const SA_RESTORER: u64 = 0x0400_0000;
 pub const SA_SIGINFO: u64 = 0x0000_0004;
 pub const SA_RESTART: u64 = 0x1000_0000;
@@ -125,12 +131,19 @@ pub const SIGABRT: i32 = 6;
 pub const SIGBUS: i32 = 7;
 pub const SIGFPE: i32 = 8;
 pub const SIGKILL: i32 = 9;
+pub const SIGUSR1: i32 = 10;
 pub const SIGSEGV: i32 = 11;
+pub const SIGUSR2: i32 = 12;
 pub const SIGPIPE: i32 = 13;
 pub const SIGTERM: i32 = 15;
 pub const SIGCHLD: i32 = 17;
 pub const SIGCONT: i32 = 18;
 pub const SIGSTOP: i32 = 19;
+pub const SIGTSTP: i32 = 20;
+pub const SIGTTIN: i32 = 21;
+pub const SIGTTOU: i32 = 22;
+pub const SIGURG: i32 = 23;
+pub const SIGWINCH: i32 = 28;
 
 /// Fixed header of `struct linux_dirent64`; `d_name` follows inline.
 #[repr(C)]

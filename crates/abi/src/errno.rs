@@ -39,6 +39,9 @@ pub const ENOSYS: i64 = 38;
 pub const ENOTEMPTY: i64 = 39;
 pub const ELOOP: i64 = 40;
 pub const ETIMEDOUT: i64 = 110;
+/// Internal-only: a syscall interrupted by a signal that should restart.
+/// Never leaks to user space (converted to EINTR or a real restart).
+pub const ERESTARTSYS: i64 = 512;
 
 /// A Linux errno, stored as its positive value.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -62,6 +65,8 @@ impl Errno {
     pub const ECHILD: Errno = Errno(ECHILD);
     pub const EPERM: Errno = Errno(EPERM);
     pub const EAGAIN: Errno = Errno(EAGAIN);
+    pub const EINTR: Errno = Errno(EINTR);
+    pub const ERESTARTSYS: Errno = Errno(ERESTARTSYS);
 
     /// The value a syscall returns for this error: the negated errno.
     #[must_use]

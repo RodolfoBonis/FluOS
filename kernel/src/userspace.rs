@@ -18,6 +18,7 @@ use abi::types::{
 use abi::Errno;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 
 /// Top of the initial user stack (just below the non-canonical hole).
@@ -376,6 +377,142 @@ fn bad_setfs_elf() -> Vec<u8> {
     raw_exec_elf(&code)
 }
 
+/// Builds a single-RWX-segment `ET_EXEC` image with an explicit entry offset
+/// (used by the signal self-test, whose entry is past its handler/restorer).
+fn raw_exec_elf_at(code: &[u8], entry: u64) -> Vec<u8> {
+    const V: u64 = 0x40_0000;
+    let headers = 64 + 56u64;
+    let filesz = headers + code.len() as u64;
+    let mut elf = Vec::new();
+    elf.extend_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0]);
+    elf.extend_from_slice(&[0; 8]);
+    push_u16(&mut elf, 2);
+    push_u16(&mut elf, 62);
+    push_u32(&mut elf, 1);
+    push_u64(&mut elf, entry);
+    push_u64(&mut elf, 64);
+    push_u64(&mut elf, 0);
+    push_u32(&mut elf, 0);
+    push_u16(&mut elf, 64);
+    push_u16(&mut elf, 56);
+    push_u16(&mut elf, 1);
+    push_u16(&mut elf, 0);
+    push_u16(&mut elf, 0);
+    push_u16(&mut elf, 0);
+    push_u32(&mut elf, 1);
+    push_u32(&mut elf, 7); // RWX
+    push_u64(&mut elf, 0);
+    push_u64(&mut elf, V);
+    push_u64(&mut elf, V);
+    push_u64(&mut elf, filesz);
+    push_u64(&mut elf, filesz);
+    push_u64(&mut elf, 0x1000);
+    elf.extend_from_slice(code);
+    elf
+}
+
+/// Builds a program that installs a SIGUSR1 handler, sends SIGUSR1 to itself,
+/// and — after the handler returns via `rt_sigreturn` — continues. The handler
+/// writes `H`; main then writes `D`. Observing `HD` proves the whole path:
+/// `rt_sigaction`, delivery of a caught signal, the on-stack signal frame, and
+/// `rt_sigreturn` restoring the interrupted context.
+fn signal_handler_elf() -> Vec<u8> {
+    const V: u64 = 0x40_0000;
+    let headers = 64 + 56u64;
+
+    // handler: push 'H'; write(1, rsp, 1); add rsp,8; ret.
+    let handler: Vec<u8> = vec![
+        0xB8, 0x48, 0, 0, 0, // mov eax, 'H'
+        0x50, // push rax
+        0xB8, 1, 0, 0, 0, // mov eax, 1 (write)
+        0xBF, 1, 0, 0, 0, // mov edi, 1
+        0x48, 0x89, 0xE6, // mov rsi, rsp
+        0xBA, 1, 0, 0, 0, // mov edx, 1
+        0x0F, 0x05, // syscall
+        0x48, 0x83, 0xC4, 0x08, // add rsp, 8
+        0xC3, // ret -> restorer (pretcode)
+    ];
+    // restorer: mov eax,15 (rt_sigreturn); syscall.
+    let restorer: Vec<u8> = vec![0xB8, 0x0F, 0, 0, 0, 0x0F, 0x05];
+
+    let handler_addr = V + headers;
+    let restorer_addr = handler_addr + handler.len() as u64;
+    let entry = restorer_addr + restorer.len() as u64;
+
+    let mut main: Vec<u8> = Vec::new();
+    main.extend_from_slice(&[0x48, 0x83, 0xEC, 0x40]); // sub rsp, 64
+    main.extend_from_slice(&[0x48, 0xB8]); // movabs rax, handler_addr
+    main.extend_from_slice(&handler_addr.to_le_bytes());
+    main.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]); // mov [rsp], rax
+    main.extend_from_slice(&[0xC7, 0x44, 0x24, 0x08, 0x00, 0x00, 0x00, 0x14]); // mov dword [rsp+8], 0x14000000
+    main.extend_from_slice(&[0xC7, 0x44, 0x24, 0x0C, 0x00, 0x00, 0x00, 0x00]); // mov dword [rsp+12], 0
+    main.extend_from_slice(&[0x48, 0xB8]); // movabs rax, restorer_addr
+    main.extend_from_slice(&restorer_addr.to_le_bytes());
+    main.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x10]); // mov [rsp+16], rax
+    main.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    main.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x18]); // mov [rsp+24], rax (mask=0)
+    main.extend_from_slice(&[0xB8, 13, 0, 0, 0]); // mov eax, 13 (rt_sigaction)
+    main.extend_from_slice(&[0xBF, 10, 0, 0, 0]); // mov edi, 10 (SIGUSR1)
+    main.extend_from_slice(&[0x48, 0x89, 0xE6]); // mov rsi, rsp
+    main.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx (oldact=0)
+    main.extend_from_slice(&[0x41, 0xBA, 8, 0, 0, 0]); // mov r10d, 8 (sigsetsize)
+    main.extend_from_slice(&[0x0F, 0x05]); // syscall
+    main.extend_from_slice(&[0x48, 0x83, 0xC4, 0x40]); // add rsp, 64
+    main.extend_from_slice(&[0xB8, 39, 0, 0, 0]); // mov eax, 39 (getpid)
+    main.extend_from_slice(&[0x0F, 0x05]); // syscall
+    main.extend_from_slice(&[0x89, 0xC7]); // mov edi, eax (pid)
+    main.extend_from_slice(&[0xB8, 62, 0, 0, 0]); // mov eax, 62 (kill)
+    main.extend_from_slice(&[0xBE, 10, 0, 0, 0]); // mov esi, 10 (SIGUSR1)
+    main.extend_from_slice(&[0x0F, 0x05]); // syscall -> delivered on return
+    main.extend_from_slice(&[0xB8, 0x44, 0, 0, 0]); // mov eax, 'D'
+    main.extend_from_slice(&[0x50]); // push rax
+    main.extend_from_slice(&[0xB8, 1, 0, 0, 0]); // mov eax, 1 (write)
+    main.extend_from_slice(&[0xBF, 1, 0, 0, 0]); // mov edi, 1
+    main.extend_from_slice(&[0x48, 0x89, 0xE6]); // mov rsi, rsp
+    main.extend_from_slice(&[0xBA, 1, 0, 0, 0]); // mov edx, 1
+    main.extend_from_slice(&[0x0F, 0x05]); // syscall
+    main.extend_from_slice(&[0x48, 0x83, 0xC4, 0x08]); // add rsp, 8
+    main.extend_from_slice(&[0xB8, 0xE7, 0, 0, 0]); // mov eax, 231 (exit_group)
+    main.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi
+    main.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+    let mut code = Vec::new();
+    code.extend_from_slice(&handler);
+    code.extend_from_slice(&restorer);
+    code.extend_from_slice(&main);
+    raw_exec_elf_at(&code, entry)
+}
+
+/// Runs the signal self-test: a program that catches SIGUSR1, raises it on
+/// itself, and resumes after the handler. The kernel must set up and tear down
+/// the signal frame correctly; a clean exit (status 0) proves the round trip.
+pub fn run_signal_selftest() {
+    let image = signal_handler_elf();
+    match spawn(&image, &["/sig-test"], &[]) {
+        Ok(proc) => {
+            let mut spins = 0u64;
+            let code = loop {
+                if let Some(c) = proc.lock().exit_code {
+                    break Some(c);
+                }
+                scheduler::yield_now();
+                spins += 1;
+                if spins > 50_000_000 {
+                    break None;
+                }
+            };
+            match code {
+                Some(0) => crate::log::info!(
+                    "signal selftest: SIGUSR1 handler ran and rt_sigreturn resumed cleanly (exit 0)"
+                ),
+                Some(c) => crate::log::error!("signal selftest: unexpected exit status {c}"),
+                None => crate::log::error!("signal selftest: TIMED OUT"),
+            }
+        }
+        Err(e) => crate::log::error!("signal selftest: spawn failed: {e:?}"),
+    }
+}
+
 /// Runs the ring-3 security self-tests. Each spawns a hostile user program that
 /// must be *contained to its own process* — killed by a signal (bad instruction
 /// / bad memory access) or have its offending syscall rejected — without ever
@@ -487,8 +624,12 @@ pub fn run_init() {
         &["/bin/sh", "-i"],
         &["PATH=/bin", "HOME=/", "TERM=xterm-256color", "PS1=fluos$ "],
     ) {
-        Ok(_proc) => {
-            crate::log::info!("init: shell started");
+        Ok(proc) => {
+            // Make the shell's process group the terminal foreground group so
+            // Ctrl-C/Ctrl-Z reach it (and the jobs it runs in the same group).
+            let pgid = proc.lock().pgid;
+            crate::fs::set_foreground_pgrp(pgid);
+            crate::log::info!("init: shell started (foreground pgrp {pgid})");
             loop {
                 scheduler::yield_now();
             }

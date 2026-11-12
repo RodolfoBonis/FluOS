@@ -8,6 +8,7 @@
 //! file-descriptor table, pid).
 
 use crate::fs::FdTable;
+use crate::signal::SignalState;
 use crate::mm::{paging, phys};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -241,6 +242,8 @@ pub struct Process {
     pub sid: i32,
     /// Exit status once the process has exited.
     pub exit_code: Option<i32>,
+    /// Signal dispositions, pending set, and blocked mask.
+    pub sig: SignalState,
 }
 
 impl Process {
@@ -260,6 +263,7 @@ impl Process {
             pgid: pid,
             sid: pid,
             exit_code: None,
+            sig: SignalState::new(),
         })))
     }
 }
@@ -341,6 +345,9 @@ impl Process {
             pgid: parent.pgid,
             sid: parent.sid,
             exit_code: None,
+            // A child inherits handlers and the blocked mask; the pending set
+            // does not cross `fork`.
+            sig: parent.sig.forked(),
         })))
     }
 }
@@ -361,4 +368,29 @@ pub fn reap_child(parent_pid: i32) -> Option<(i32, i32)> {
 /// Whether `parent_pid` has any live (unreaped) children.
 pub fn has_children(parent_pid: i32) -> bool {
     PROCS.lock().iter().any(|p| p.lock().ppid == parent_pid)
+}
+
+/// Runs `f` against the process with pid `pid` (under its lock), returning the
+/// result, or `None` if no such live process exists.
+pub fn with_pid<R>(pid: i32, f: impl FnOnce(&mut Process) -> R) -> Option<R> {
+    let procs = PROCS.lock();
+    let proc = procs.iter().find(|p| p.lock().pid == pid)?.clone();
+    drop(procs);
+    let mut g = proc.lock();
+    Some(f(&mut g))
+}
+
+/// Runs `f` against every live process in group `pgid` (each under its lock),
+/// returning how many matched.
+pub fn for_each_in_pgrp(pgid: i32, mut f: impl FnMut(&mut Process)) -> usize {
+    let snapshot: Vec<Arc<SpinLock<Process>>> = PROCS.lock().iter().cloned().collect();
+    let mut n = 0;
+    for proc in snapshot {
+        let mut g = proc.lock();
+        if g.pgid == pgid {
+            f(&mut g);
+            n += 1;
+        }
+    }
+    n
 }

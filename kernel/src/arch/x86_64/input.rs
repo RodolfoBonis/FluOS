@@ -21,6 +21,11 @@ static INPUT: SpinLock<Ring> = SpinLock::new(Ring { buf: [0; CAP], head: 0, tail
 /// Enqueues a byte, dropping it if the ring is full (a stalled consumer should
 /// not wedge the interrupt handler).
 pub fn push(byte: u8) {
+    // Line-discipline first: a signal-generating control char (Ctrl-C/Z/\) is
+    // consumed here and never enqueued.
+    if crate::fs::tty_input_filter(byte) {
+        return;
+    }
     let mut ring = INPUT.lock();
     let next = (ring.head + 1) % CAP;
     if next != ring.tail {

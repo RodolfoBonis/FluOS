@@ -36,7 +36,16 @@ pub extern "C" fn dispatch(regs: &mut Regs) {
         crate::log::info!("SYS {n} {name}({:#x},{:#x},{:#x})", a[0], a[1], a[2]);
     }
     let result = handle(n, a, regs);
-    regs.rax = errno::encode(result);
+    let restartable = matches!(result, Err(Errno::ERESTARTSYS));
+    // ERESTARTSYS is internal: if no signal resolves it, fall back to EINTR.
+    let encoded = match result {
+        Err(Errno::ERESTARTSYS) => errno::encode(Err(Errno::ERESTARTSYS)),
+        other => errno::encode(other),
+    };
+    regs.rax = encoded;
+    // Deliver any pending signal on the way back to ring 3 (and resolve a
+    // pending restart against the chosen disposition).
+    crate::signal::on_syscall_return(regs, n, restartable);
 }
 
 /// The current process, or `EFAULT` if there somehow is none.
@@ -84,14 +93,14 @@ fn handle(number: u64, a: [u64; 6], regs: &mut Regs) -> SysResult {
         }
         nr::SCHED_GETAFFINITY => sys_sched_getaffinity(a[2], a[1] as usize),
         nr::SET_ROBUST_LIST | nr::RSEQ => Ok(0),
-        nr::RT_SIGPROCMASK | nr::RT_SIGACTION => Ok(0),
+        nr::RT_SIGACTION => sys_rt_sigaction(a[0] as i32, a[1], a[2], a[3] as usize),
+        nr::RT_SIGPROCMASK => sys_rt_sigprocmask(a[0] as i32, a[1], a[2], a[3] as usize),
+        nr::RT_SIGRETURN => crate::signal::sys_rt_sigreturn(regs),
         nr::PRLIMIT64 => sys_prlimit64(a[2], a[3]),
         nr::GETRLIMIT => sys_getrlimit(a[1]),
         nr::POLL | nr::PPOLL | nr::PSELECT6 | nr::SELECT => Ok(1),
-        nr::NANOSLEEP | nr::CLOCK_NANOSLEEP => {
-            crate::scheduler::yield_now();
-            Ok(0)
-        }
+        nr::NANOSLEEP => sys_nanosleep(a[0], a[1]),
+        nr::CLOCK_NANOSLEEP => sys_nanosleep(a[2], a[3]),
         nr::FUTEX => Ok(0),
         nr::SENDFILE => sys_sendfile(a[0] as i32, a[1] as i32, a[2], a[3] as usize),
         nr::KILL => sys_kill(a[0] as i32, a[1] as i32),
@@ -397,7 +406,12 @@ fn flush_tlb() {
 
 fn sys_exit(code: i32) -> SysResult {
     if let Some(p) = process::current() {
-        p.lock().exit_code = Some(code);
+        let ppid = {
+            let mut g = p.lock();
+            g.exit_code = Some(code);
+            g.ppid
+        };
+        crate::signal::notify_parent(ppid);
     }
     crate::log::info!("process exited with status {code}");
     crate::scheduler::thread_exit();
@@ -487,14 +501,22 @@ fn sys_ioctl(_fd: i32, request: u64, arg: u64) -> SysResult {
             Ok(0)
         }
         types::TIOCGPGRP => {
-            // Report the caller's own process group as the terminal foreground
-            // group, so a job-control shell sees itself as foreground and does
-            // not loop signalling itself (single-shell system).
-            let pgid = proc()?.lock().pgid;
+            // The terminal foreground group; fall back to the caller's own group
+            // if none has been set yet (keeps a job-control shell from looping).
+            let fg = fs::foreground_pgrp();
+            let pgid = if fg != 0 { fg } else { proc()?.lock().pgid };
             put_user(arg, pgid as u32)?;
             Ok(0)
         }
-        types::TIOCSPGRP => Ok(0),
+        types::TIOCSPGRP => {
+            let mut raw = [0u8; 4];
+            copy_from_user(arg, &mut raw)?;
+            let pgid = i32::from_le_bytes(raw);
+            if pgid > 0 {
+                fs::set_foreground_pgrp(pgid);
+            }
+            Ok(0)
+        }
         _ => Err(Errno::ENOTTY),
     }
 }
@@ -704,7 +726,124 @@ fn sys_sendfile(out_fd: i32, in_fd: i32, offset_ptr: u64, count: usize) -> SysRe
     Ok(total)
 }
 
-fn sys_kill(_pid: i32, _sig: i32) -> SysResult {
+/// `kill`: post `sig` to a pid (`pid > 0`), a process group (`pid < -1` or
+/// `pid == 0` for the caller's group), or broadcast (`pid == -1`, best-effort).
+/// `sig == 0` is an existence/permission probe.
+fn sys_kill(pid: i32, sig: i32) -> SysResult {
+    if !(0..=crate::signal::NSIG as i32).contains(&sig) {
+        return Err(Errno::EINVAL);
+    }
+    if sig == 0 {
+        // Existence check only.
+        return if pid <= 0 || process::with_pid(pid, |_| ()).is_some() {
+            Ok(0)
+        } else {
+            Err(Errno::ESRCH)
+        };
+    }
+    if pid > 0 {
+        if crate::signal::send_to_pid(pid, sig) {
+            Ok(0)
+        } else {
+            Err(Errno::ESRCH)
+        }
+    } else {
+        let pgid = if pid == 0 || pid == -1 { proc()?.lock().pgid } else { -pid };
+        crate::signal::send_to_pgrp(pgid, sig);
+        Ok(0)
+    }
+}
+
+/// `nanosleep`/`clock_nanosleep`: sleep for the requested `timespec`, waking
+/// early (with `ERESTARTSYS`) if a deliverable signal arrives. `rem` is filled
+/// with the remaining time on interruption.
+fn sys_nanosleep(req: u64, rem: u64) -> SysResult {
+    // timespec { i64 tv_sec; i64 tv_nsec }
+    let mut ts = [0u8; 16];
+    copy_from_user(req, &mut ts)?;
+    let secs = i64::from_le_bytes(ts[0..8].try_into().unwrap()).max(0) as u64;
+    let nsecs = i64::from_le_bytes(ts[8..16].try_into().unwrap()).max(0) as u64;
+    // The scheduler tick is the time base (~4 ms/slice => 250 ticks/s).
+    const TICKS_PER_SEC: u64 = 250;
+    let total_ns = secs.saturating_mul(1_000_000_000).saturating_add(nsecs);
+    let ticks = total_ns.saturating_mul(TICKS_PER_SEC) / 1_000_000_000;
+    let start = crate::percpu::this().now.load(Ordering::Relaxed);
+    let deadline = start.saturating_add(ticks.max(1));
+    loop {
+        let now = crate::percpu::this().now.load(Ordering::Relaxed);
+        if now >= deadline {
+            return Ok(0);
+        }
+        if let Some(pr) = process::current() {
+            if pr.lock().sig.has_deliverable() {
+                if rem != 0 {
+                    // Report (approximate) remaining time.
+                    let left_ticks = deadline - now;
+                    let left_ns = left_ticks.saturating_mul(1_000_000_000) / TICKS_PER_SEC;
+                    let mut out = [0u8; 16];
+                    out[0..8].copy_from_slice(&((left_ns / 1_000_000_000) as i64).to_le_bytes());
+                    out[8..16].copy_from_slice(&((left_ns % 1_000_000_000) as i64).to_le_bytes());
+                    let _ = copy_to_user(rem, &out);
+                }
+                return Err(Errno::ERESTARTSYS);
+            }
+        }
+        crate::scheduler::yield_now();
+    }
+}
+
+/// `rt_sigaction`: install/query a signal disposition. `sigsetsize` must be 8.
+fn sys_rt_sigaction(sig: i32, act: u64, oldact: u64, sigsetsize: usize) -> SysResult {
+    use crate::signal::SigAction;
+    if sigsetsize != 8 {
+        return Err(Errno::EINVAL);
+    }
+    let p = proc()?;
+    let old = p.lock().sig.action(sig);
+    if act != 0 {
+        let mut raw = [0u8; 32]; // handler, flags, restorer, mask (4 x u64)
+        copy_from_user(act, &mut raw)?;
+        let a = SigAction {
+            handler: u64::from_le_bytes(raw[0..8].try_into().unwrap()),
+            flags: u64::from_le_bytes(raw[8..16].try_into().unwrap()),
+            restorer: u64::from_le_bytes(raw[16..24].try_into().unwrap()),
+            mask: u64::from_le_bytes(raw[24..32].try_into().unwrap()),
+        };
+        p.lock().sig.set_action(sig, a);
+    }
+    if oldact != 0 {
+        let mut raw = [0u8; 32];
+        raw[0..8].copy_from_slice(&old.handler.to_le_bytes());
+        raw[8..16].copy_from_slice(&old.flags.to_le_bytes());
+        raw[16..24].copy_from_slice(&old.restorer.to_le_bytes());
+        raw[24..32].copy_from_slice(&old.mask.to_le_bytes());
+        copy_to_user(oldact, &raw)?;
+    }
+    Ok(0)
+}
+
+/// `rt_sigprocmask`: query/modify the blocked-signal mask. `sigsetsize` is 8.
+fn sys_rt_sigprocmask(how: i32, set: u64, oldset: u64, sigsetsize: usize) -> SysResult {
+    if sigsetsize != 8 {
+        return Err(Errno::EINVAL);
+    }
+    let p = proc()?;
+    let cur = p.lock().sig.mask();
+    if oldset != 0 {
+        copy_to_user(oldset, &cur.to_le_bytes())?;
+    }
+    if set != 0 {
+        let mut raw = [0u8; 8];
+        copy_from_user(set, &mut raw)?;
+        let arg = u64::from_le_bytes(raw);
+        let new = match how {
+            types::SIG_BLOCK => cur | arg,
+            types::SIG_UNBLOCK => cur & !arg,
+            types::SIG_SETMASK => arg,
+            _ => return Err(Errno::EINVAL),
+        };
+        p.lock().sig.set_mask(new);
+    }
     Ok(0)
 }
 
@@ -725,6 +864,11 @@ fn sys_wait4(_pid: i32, wstatus: u64, options: u32) -> SysResult {
         }
         if options & WNOHANG != 0 {
             return Ok(0);
+        }
+        if let Some(pr) = process::current() {
+            if pr.lock().sig.has_deliverable() {
+                return Err(Errno::ERESTARTSYS);
+            }
         }
         crate::scheduler::yield_now();
     }
@@ -772,6 +916,7 @@ fn sys_execve(path: u64, argv: u64, envp: u64) -> SysResult {
         p.brk = 0;
         p.brk_start = 0;
         p.mmap_next = 0x6000_0000;
+        p.sig.exec_reset();
         (loaded.entry, sp, p.space.cr3())
     };
 

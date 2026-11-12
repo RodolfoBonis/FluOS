@@ -12,6 +12,7 @@ use abi::{Errno, SysResult};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use crate::sync::SpinLock;
+use core::sync::atomic::{AtomicI32, Ordering};
 use vfs::{Ino, Vfs};
 
 /// The system-wide root filesystem (tmpfs + devfs), set up at boot.
@@ -24,8 +25,10 @@ static TERMIOS: SpinLock<types::Termios> = SpinLock::new(default_termios());
 const fn default_termios() -> types::Termios {
     let mut cc = [0u8; types::NCCS];
     cc[types::VERASE] = 0x7f;
-    cc[types::VINTR] = 3;
+    cc[types::VINTR] = 3; // Ctrl-C -> SIGINT
+    cc[types::VQUIT] = 0x1c; // Ctrl-\ -> SIGQUIT
     cc[types::VEOF] = 4;
+    cc[types::VSUSP] = 0x1a; // Ctrl-Z -> SIGTSTP
     cc[types::VMIN] = 1;
     types::Termios {
         c_iflag: types::ICRNL,
@@ -45,6 +48,49 @@ pub fn termios() -> types::Termios {
 /// Updates the console termios (ioctl TCSETS).
 pub fn set_termios(t: types::Termios) {
     *TERMIOS.lock() = t;
+}
+
+/// The terminal's foreground process group — the target of terminal-generated
+/// signals (Ctrl-C/Ctrl-Z). Zero means "unset" (no signals generated).
+static FOREGROUND_PGRP: AtomicI32 = AtomicI32::new(0);
+
+/// Sets the foreground process group of the controlling terminal.
+pub fn set_foreground_pgrp(pgid: i32) {
+    FOREGROUND_PGRP.store(pgid, Ordering::Relaxed);
+}
+
+/// The foreground process group, or 0 if unset.
+#[must_use]
+pub fn foreground_pgrp() -> i32 {
+    FOREGROUND_PGRP.load(Ordering::Relaxed)
+}
+
+/// Line-discipline input filter, called for every byte arriving from the
+/// keyboard or serial port (in IRQ context). When `ISIG` is enabled and the
+/// byte matches a signal-generating control character, the corresponding signal
+/// is sent to the foreground process group and the byte is *consumed* (returns
+/// `true`) so it never reaches the input queue.
+#[must_use]
+pub fn tty_input_filter(byte: u8) -> bool {
+    let t = *TERMIOS.lock();
+    if t.c_lflag & types::ISIG == 0 {
+        return false;
+    }
+    let pgrp = FOREGROUND_PGRP.load(Ordering::Relaxed);
+    if pgrp == 0 {
+        return false;
+    }
+    let sig = if byte != 0 && byte == t.c_cc[types::VINTR] {
+        types::SIGINT
+    } else if byte != 0 && byte == t.c_cc[types::VQUIT] {
+        types::SIGQUIT
+    } else if byte != 0 && byte == t.c_cc[types::VSUSP] {
+        types::SIGTSTP
+    } else {
+        return false;
+    };
+    crate::signal::send_to_pgrp(pgrp, sig);
+    true
 }
 
 /// Device numbers we recognise (`(major << 8) | minor`, Linux-ish).
