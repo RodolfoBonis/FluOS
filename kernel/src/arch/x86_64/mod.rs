@@ -1,7 +1,17 @@
 //! x86_64 architecture support.
 
+pub mod cpu;
+pub mod gdt;
+pub mod idt;
 pub mod port;
 pub mod serial;
+
+/// Installs the GDT/TSS and IDT on the bootstrap processor. After this call the
+/// CPU can take exceptions without triple-faulting.
+pub fn init_cpu() {
+    gdt::init();
+    idt::init();
+}
 
 /// Disables interrupts and halts this CPU forever.
 pub fn halt_forever() -> ! {

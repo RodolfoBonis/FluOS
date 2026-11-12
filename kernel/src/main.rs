@@ -2,12 +2,16 @@
 
 #![no_std]
 #![no_main]
+#![feature(abi_x86_interrupt)]
 
 mod arch;
 mod boot;
 mod log;
+mod mm;
 mod panic;
 mod video;
+
+extern crate alloc;
 
 /// Entry point jumped to by Limine on the bootstrap processor.
 #[unsafe(no_mangle)]
@@ -28,6 +32,20 @@ extern "C" fn kmain() -> ! {
         info.usable_bytes / (1024 * 1024),
         info.usable_regions
     );
+
+    arch::x86_64::init_cpu();
+    log::info!("gdt + idt installed");
+
+    let features = arch::x86_64::cpu::enable_protections();
+    log::info!(
+        "cpu protections: nx={} smep={} smap={} pcid={}",
+        features.nx,
+        features.smep,
+        features.smap,
+        features.pcid
+    );
+
+    mm::init(info.hhdm_offset);
 
     if let Some(fb) = boot::framebuffer() {
         video::splash(&fb);

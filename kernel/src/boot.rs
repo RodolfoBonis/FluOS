@@ -1,8 +1,8 @@
 //! Limine boot protocol requests and typed accessors over their responses.
 
 use limine::request::{
-    BootloaderInfoRequest, ExecutableCmdlineRequest, FramebufferRequest, HhdmRequest,
-    MemmapRequest,
+    BootloaderInfoRequest, ExecutableAddressRequest, ExecutableCmdlineRequest, FramebufferRequest,
+    HhdmRequest, MemmapRequest,
 };
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker, memmap};
 
@@ -25,6 +25,10 @@ static HHDM: HhdmRequest = HhdmRequest::new();
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 static MEMMAP: MemmapRequest = MemmapRequest::new();
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static EXECUTABLE_ADDRESS: ExecutableAddressRequest = ExecutableAddressRequest::new();
 
 #[used]
 #[unsafe(link_section = ".limine_requests")]
@@ -76,6 +80,18 @@ pub fn info() -> BootInfo {
         usable_bytes: usable.clone().map(|e| e.length).sum(),
         usable_regions: usable.count(),
     }
+}
+
+/// The firmware memory map entries.
+pub fn memmap() -> &'static [&'static memmap::Entry] {
+    MEMMAP.response().expect("memory map response").entries()
+}
+
+/// Physical and virtual load addresses of the kernel image, used to translate
+/// linker-script section symbols into physical frames when building page tables.
+pub fn kernel_address() -> (u64, u64) {
+    let resp = EXECUTABLE_ADDRESS.response().expect("executable address response");
+    (resp.physical_base, resp.virtual_base)
 }
 
 /// Kernel command line, empty when the bootloader passed none.
