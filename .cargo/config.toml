@@ -1,0 +1,6 @@
+[alias]
+xtask = "run --quiet --package xtask --"
+
+[target.x86_64-unknown-none]
+# Non-PIE kernel linked in the top 2 GiB (see kernel/linker.ld).
+rustflags = ["-C", "relocation-model=static", "-C", "code-model=kernel", "-C", "force-frame-pointers=yes"]
