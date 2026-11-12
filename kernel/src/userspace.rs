@@ -1281,8 +1281,14 @@ pub fn run_init() {
         crate::log::info!("init: starting {path} ({} KiB) as login shell", image.len() / 1024);
         // busybox fallback needs an explicit -i (its arg0 convention differs);
         // zsh/sh take a leading-'-' arg0 for a login shell.
+        // `zshrc=none` on the kernel cmdline launches the shell with `-f` (skip
+        // all rc files/plugins) — a debug knob to isolate a hung plugin/zinit
+        // config from a kernel bug.
+        let norc = crate::boot::cmdline().split_ascii_whitespace().any(|t| t == "zshrc=none");
         let argv: &[&str] = if *path == "/bin/busybox" {
             &["/bin/busybox", "sh", "-i"]
+        } else if norc {
+            &[arg0, "-l", "-f"]
         } else {
             &[arg0, "-l"]
         };
@@ -1290,7 +1296,12 @@ pub fn run_init() {
             Ok(proc) => {
                 // The shell is the session/foreground group leader on the console
                 // (its controlling terminal), so Ctrl-C/Ctrl-Z reach its jobs.
-                let pgid = proc.lock().pgid;
+                let pgid = {
+                    let mut g = proc.lock();
+                    // Kernel-spawned (no execve), so set comm for logs/strace here.
+                    g.comm = path.rsplit('/').next().unwrap_or(path).into();
+                    g.pgid
+                };
                 crate::fs::set_foreground_pgrp(pgid);
                 crate::log::info!("init: {path} started (foreground pgrp {pgid}, uid {UID})");
                 // Act as init: reap orphaned zombies (reclaiming their frames).

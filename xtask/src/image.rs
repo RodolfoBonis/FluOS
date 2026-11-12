@@ -32,6 +32,17 @@ fn initramfs_path() -> Option<PathBuf> {
 
 /// Builds `build/fluos.iso` with the given kernel command line and returns its path.
 pub fn build(profile: Profile, cmdline: &str) -> Result<PathBuf> {
+    // `$FLUOS_CMDLINE` appends kernel cmdline options (e.g. `strace=zsh`) for
+    // debugging, without threading a flag through every xtask subcommand.
+    let extra = std::env::var("FLUOS_CMDLINE").unwrap_or_default();
+    let cmdline = if extra.is_empty() {
+        cmdline.to_string()
+    } else if cmdline.is_empty() {
+        extra
+    } else {
+        format!("{cmdline} {extra}")
+    };
+    let cmdline = cmdline.as_str();
     let kernel = build_kernel(profile)?;
     let limine = limine::dir()?;
     let build = root().join("build");

@@ -552,6 +552,59 @@ pub fn wake_all(wq: &WaitQueue) {
     }
 }
 
+/// Wakes every BLOCKED thread belonging to `proc_ptr` and preempts running ones
+/// on other CPUs, so a group exit takes effect promptly: each sibling returns
+/// from its blocking syscall (or is preempted) and dies at the dispatcher's
+/// group-exit check. Threads are `Box::leak`'d (never freed), so iterating the
+/// global registry and dereferencing is sound even for `Finished` ones.
+pub fn kick_group(proc_ptr: u64) {
+    let tids: Vec<Tid> = THREADS.lock().iter().copied().collect();
+    let was_on = interrupts::are_enabled();
+    interrupts::disable();
+    let cpu = percpu::this();
+    for tid in tids {
+        // SAFETY: a registered tid points at a leaked, live `Thread`.
+        unsafe {
+            let t = tid as *mut Thread;
+            if (*t).proc_ptr != proc_ptr || (*t).state != State::Blocked {
+                continue;
+            }
+            // A wait-queue sleeper must be removed from its queue (generation-safe)
+            // before we re-ready it; a pure timed sleeper has no queue.
+            if (*t).wait_queue != 0 {
+                let wq = &*((*t).wait_queue as *const WaitQueue);
+                if !wq.remove_and_bump(tid) {
+                    continue; // still in the publish gap; it will re-check and exit
+                }
+            }
+            (*t).state = State::Ready;
+            (*t).wait_queue = 0;
+            (*t).wake_at = 0;
+            let weight = (*t).weight;
+            let vruntime = u128::from((*t).vruntime.load(Ordering::Relaxed));
+            cpu.runqueue.lock().insert_clamped(tid, weight, vruntime);
+        }
+    }
+    if was_on {
+        interrupts::enable();
+    }
+    // Preempt siblings currently running in user mode on other CPUs so they trap
+    // into the kernel and hit the group-exit check.
+    reschedule_all();
+}
+
+/// Sends a reschedule IPI to every other CPU.
+fn reschedule_all() {
+    let me = percpu::this().lapic_id;
+    for i in 0..percpu::count() {
+        if let Some(c) = percpu::by_id(i) {
+            if c.lapic_id != me {
+                crate::arch::x86_64::apic::send_reschedule(c.lapic_id);
+            }
+        }
+    }
+}
+
 /// Wakes a single thread blocked on a wait queue (targeted — e.g. a signal must
 /// interrupt a blocked `read`/`wait4`). No-op if the thread is not blocked on a
 /// wait queue (a plain timed sleep is left to expire / re-check). Safe from IRQ

@@ -104,6 +104,12 @@ pub fn poll_readable(file: &Arc<SpinLock<OpenFile>>) -> bool {
             FileKind::Pipe { pipe, write_end: false } => (Some(pipe.clone()), None),
             FileKind::PtyMaster(p) => (None, Some((p.clone(), true))),
             FileKind::PtySlave(p) => (None, Some((p.clone(), false))),
+            // The console/tty is readable only when input is actually queued —
+            // a shell's ZLE polls fd 0 with a zero timeout to probe for typeahead
+            // and must see "not ready" when the user hasn't typed, or it loops.
+            FileKind::Device(d) if *d == dev::CONSOLE || *d == dev::TTY => {
+                return crate::arch::x86_64::input::available() > 0;
+            }
             _ => return true,
         }
     };
@@ -227,6 +233,11 @@ pub enum FileKind {
     PtyMaster(Arc<Pty>),
     /// A slave side of a pseudo-terminal (/dev/pts/N).
     PtySlave(Arc<Pty>),
+    /// A synthetic read-only procfs file: a content snapshot taken at open time
+    /// plus a read cursor. See [`crate::procfs`].
+    ProcData { data: Arc<Vec<u8>>, offset: usize },
+    /// A synthetic procfs directory: its entries `(name, d_type)` and a cursor.
+    ProcDir { entries: Arc<Vec<(alloc::string::String, u8)>>, pos: usize },
 }
 
 /// Maximum bytes buffered in a pipe before writers block.
@@ -402,6 +413,12 @@ pub fn open_pts(ptn: u32, flags: u64) -> Result<Arc<SpinLock<OpenFile>>, Errno> 
 
 /// Per-PTY terminal state accessors (used by ioctl).
 impl Pty {
+    /// Bytes queued for the reader of the given end (`FIONREAD`): a master reads
+    /// the to-master stream, a slave the to-slave stream.
+    pub fn queued(&self, from_master: bool) -> usize {
+        let g = self.inner.lock();
+        if from_master { g.to_master.len() } else { g.to_slave.len() }
+    }
     pub fn termios(&self) -> types::Termios {
         self.inner.lock().termios
     }
@@ -685,6 +702,16 @@ impl FdTable {
     pub fn take_all(&mut self) -> Vec<Option<Arc<SpinLock<OpenFile>>>> {
         core::mem::take(&mut self.fds)
     }
+
+    /// The numbers of all currently-open descriptors (for `/proc/<pid>/fd`).
+    #[must_use]
+    pub fn open_fd_numbers(&self) -> Vec<i32> {
+        self.fds
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| slot.as_ref().map(|_| i as i32))
+            .collect()
+    }
 }
 
 // --- device and file I/O ---------------------------------------------------
@@ -724,7 +751,13 @@ pub fn read(file: &Arc<SpinLock<OpenFile>>, buf: &mut [u8]) -> SysResult {
             *offset += n as u64;
             Ok(n as u64)
         }
-        FileKind::Dir { .. } => Err(Errno::EISDIR),
+        FileKind::Dir { .. } | FileKind::ProcDir { .. } => Err(Errno::EISDIR),
+        FileKind::ProcData { data, offset } => {
+            let n = core::cmp::min(buf.len(), data.len().saturating_sub(*offset));
+            buf[..n].copy_from_slice(&data[*offset..*offset + n]);
+            *offset += n;
+            Ok(n as u64)
+        }
         FileKind::Pipe { .. } | FileKind::PtyMaster(_) | FileKind::PtySlave(_) => {
             unreachable!("handled above")
         }
@@ -764,7 +797,8 @@ pub fn write(file: &Arc<SpinLock<OpenFile>>, buf: &[u8]) -> SysResult {
             *offset += n as u64;
             Ok(n as u64)
         }
-        FileKind::Dir { .. } => Err(Errno::EISDIR),
+        FileKind::Dir { .. } | FileKind::ProcDir { .. } => Err(Errno::EISDIR),
+        FileKind::ProcData { .. } => Err(Errno::EBADF),
         FileKind::Pipe { .. } | FileKind::PtyMaster(_) | FileKind::PtySlave(_) => {
             unreachable!("handled above")
         }
@@ -781,6 +815,12 @@ pub fn open(cwd: Ino, path: &str, flags: u64, mode: u32) -> Result<Arc<SpinLock<
         if let Ok(ptn) = n.parse::<u32>() {
             return open_pts(ptn, flags);
         }
+    }
+    // The dynamic /proc provider (and its /dev/fd alias) owns these paths —
+    // including the `/proc/self/fd/N` magic links shell process substitution
+    // relies on. It returns `None` for anything it does not own.
+    if let Some(result) = crate::procfs::open(path, flags) {
+        return result;
     }
     with_vfs(|v| {
         let ino = match v.resolve(cwd, path, true) {

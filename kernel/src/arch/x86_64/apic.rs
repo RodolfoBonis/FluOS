@@ -51,6 +51,8 @@ static IOAPIC_VIRT: AtomicU64 = AtomicU64::new(0);
 static USE_TSC_DEADLINE: AtomicBool = AtomicBool::new(false);
 /// TSC ticks per scheduling slice (for TSC-deadline rearm).
 static TSC_PER_SLICE: AtomicU64 = AtomicU64::new(0);
+/// Calibrated TSC cycles per millisecond, for a monotonic `clock_gettime`.
+static TSC_PER_MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// LAPIC timer initial count for one slice (for periodic mode).
 static LAPIC_COUNT_PER_SLICE: AtomicU64 = AtomicU64::new(0);
 
@@ -142,9 +144,16 @@ fn calibrate() {
     let use_deadline = has_tsc_deadline() && has_invariant_tsc() && tsc_per_ms > 0;
     USE_TSC_DEADLINE.store(use_deadline, Ordering::Release);
     TSC_PER_SLICE.store(tsc_per_ms * SLICE_MS, Ordering::Release);
+    TSC_PER_MS.store(tsc_per_ms.max(1), Ordering::Release);
     // Fall back to a sane count if calibration produced nothing usable.
     let count = (lapic_per_ms * SLICE_MS).max(1).min(u64::from(u32::MAX));
     LAPIC_COUNT_PER_SLICE.store(count, Ordering::Release);
+}
+
+/// Calibrated TSC cycles per millisecond (at least 1), for deriving wall time.
+#[must_use]
+pub fn tsc_per_ms() -> u64 {
+    TSC_PER_MS.load(Ordering::Acquire).max(1)
 }
 
 /// Starts this CPU's scheduling timer. Call after the scheduler is ready on

@@ -241,6 +241,10 @@ pub const TCSETSF: u64 = 0x5404;
 pub const TIOCGPGRP: u64 = 0x540F;
 pub const TIOCSPGRP: u64 = 0x5410;
 pub const TIOCGWINSZ: u64 = 0x5413;
+pub const TCFLSH: u64 = 0x540B;
+pub const TIOCOUTQ: u64 = 0x5411;
+/// `FIONREAD` / `TIOCINQ`: queued input byte count.
+pub const FIONREAD: u64 = 0x541B;
 pub const TIOCSWINSZ: u64 = 0x5414;
 pub const TIOCSCTTY: u64 = 0x540E;
 pub const TIOCSPTLCK: u64 = 0x4004_5431; // _IOW('T', 0x31, int) unlockpt

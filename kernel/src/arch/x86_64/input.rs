@@ -35,6 +35,13 @@ pub fn push(byte: u8) {
     }
 }
 
+/// Number of bytes currently queued (for `FIONREAD`/`select` typeahead checks).
+#[must_use]
+pub fn available() -> usize {
+    let ring = INPUT.lock();
+    (ring.head + CAP - ring.tail) % CAP
+}
+
 /// Dequeues the next byte, if any.
 pub fn pop() -> Option<u8> {
     let mut ring = INPUT.lock();

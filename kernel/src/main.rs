@@ -16,6 +16,7 @@ mod mm;
 mod panic;
 mod percpu;
 mod process;
+mod procfs;
 mod rng;
 mod scheduler;
 mod signal;
@@ -86,6 +87,7 @@ extern "C" fn kmain() -> ! {
         smp::run_selftest();
 
         // Userspace: root filesystem, RNG, and the ring-3 self-test.
+        syscall::strace_init();
         fs::init(boot::initramfs());
         // SAFETY: `_rdtsc` reads the timestamp counter for an RNG seed.
         rng::seed(unsafe { core::arch::x86_64::_rdtsc() });

@@ -199,7 +199,7 @@ fn next_byte() -> Option<u8> {
         if let Some(b) = interrupts::without_interrupts(input::pop) {
             return Some(b);
         }
-        if crate::signal::current_has_deliverable() {
+        if crate::signal::current_has_deliverable() || crate::process::current_group_exiting() {
             return None;
         }
         // SAFETY: wait for the next keyboard/serial/timer IRQ.

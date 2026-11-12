@@ -12,6 +12,7 @@ use vfs::Ino;
 use crate::signal::SignalState;
 use crate::scheduler::WaitQueue;
 use crate::mm::{paging, phys};
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use crate::sync::SpinLock;
@@ -520,6 +521,14 @@ pub struct Process {
     /// Stored so a future `SA_ONSTACK` delivery can honour it; `ss_flags`
     /// defaults to `SS_DISABLE` (2).
     pub altstack: (u64, u64, i32),
+    /// Short command name (basename of the last `execve` path), for logs and the
+    /// `strace=<comm>` syscall tracer. Inherited across `fork` until `execve`.
+    pub comm: String,
+    /// Set by `exit_group` to the group exit status. Once set, every thread of
+    /// the group tears itself down at its next kernel exit point (see the
+    /// dispatcher) and the LAST one to die reports the status and closes the
+    /// shared fd table.
+    pub group_exit: Option<i32>,
 }
 
 impl Process {
@@ -546,7 +555,16 @@ impl Process {
             cwd: vfs::ROOT,
             umask: 0o022,
             altstack: (0, 0, 2),
+            comm: String::new(),
+            group_exit: None,
         })))
+    }
+
+    /// Whether a blocking syscall should abort now: either a signal is
+    /// deliverable, or the thread group is exiting (so this thread must die).
+    #[must_use]
+    pub fn interrupted(&self) -> bool {
+        self.group_exit.is_some() || self.sig.has_deliverable()
     }
 }
 
@@ -558,12 +576,30 @@ pub fn register(proc: Arc<SpinLock<Process>>) {
     PROCS.lock().push(proc);
 }
 
+/// Finds a live process by pid (clones the handle so the caller can lock it
+/// without holding the table lock). Used by procfs for `/proc/<pid>/...`.
+pub fn find(pid: i32) -> Option<Arc<SpinLock<Process>>> {
+    PROCS.lock().iter().find(|p| p.lock().pid == pid).cloned()
+}
+
+/// The pids of all live processes (for `/proc` directory listing).
+pub fn pids() -> Vec<i32> {
+    PROCS.lock().iter().map(|p| p.lock().pid).collect()
+}
+
 /// Sets the current process pointer for this CPU.
 #[allow(dead_code)] // switch_mm stores the pointer directly
 pub fn set_current(proc: &Arc<SpinLock<Process>>) {
     crate::percpu::this()
         .current_proc
         .store(Arc::as_ptr(proc) as u64, Ordering::Relaxed);
+}
+
+/// Whether the current process has begun a group exit (every thread must then
+/// tear itself down at its next kernel exit point).
+#[must_use]
+pub fn current_group_exiting() -> bool {
+    current().is_some_and(|p| p.lock().group_exit.is_some())
 }
 
 /// The process currently running on this CPU, if any.
@@ -648,6 +684,8 @@ impl Process {
             cwd: parent.cwd,
             umask: parent.umask,
             altstack: parent.altstack,
+            comm: parent.comm.clone(),
+            group_exit: None,
         })))
     }
 }

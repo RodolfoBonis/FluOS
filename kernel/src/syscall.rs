@@ -46,6 +46,12 @@ pub extern "C" fn dispatch(regs: &mut Regs) {
     // Deliver any pending signal on the way back to ring 3 (and resolve a
     // pending restart against the chosen disposition).
     crate::signal::on_syscall_return(regs, n, restartable);
+    // If this process is doing a group exit, this thread tears itself down here
+    // (it has just finished whatever syscall it was in / was woken from). The
+    // last thread to die closes the shared fd table and reports the status.
+    if process::current_group_exiting() {
+        group_thread_exit();
+    }
 }
 
 /// The current process, or `EFAULT` if there somehow is none.
@@ -53,7 +59,78 @@ fn proc() -> Result<&'static SpinLock<Process>, Errno> {
     process::current().ok_or(Errno::EFAULT)
 }
 
+/// `strace=` cmdline tracer. `strace=all` traces every process; `strace=<comm>`
+/// traces only processes whose command name (execve basename) matches. Off
+/// unless armed from the kernel cmdline by [`strace_init`].
+static STRACE_ON: AtomicBool = AtomicBool::new(false);
+static STRACE_TARGET: SpinLock<alloc::string::String> = SpinLock::new(alloc::string::String::new());
+
+/// Parses the kernel cmdline for `strace=<target>` and arms the tracer. Called
+/// once at boot.
+pub fn strace_init() {
+    let cmdline = crate::boot::cmdline();
+    for tok in cmdline.split_ascii_whitespace() {
+        if let Some(val) = tok.strip_prefix("strace=") {
+            if !val.is_empty() {
+                *STRACE_TARGET.lock() = val.into();
+                STRACE_ON.store(true, Ordering::Relaxed);
+                crate::log::info!("strace: armed for target '{val}'");
+            }
+        }
+    }
+}
+
+/// Whether the current process should be traced.
+fn strace_matches() -> bool {
+    if !STRACE_ON.load(Ordering::Relaxed) {
+        return false;
+    }
+    let target = STRACE_TARGET.lock();
+    if target.as_str() == "all" {
+        return true;
+    }
+    process::current().is_some_and(|p| p.lock().comm == *target)
+}
+
+/// Human-readable name for the common syscall numbers (falls back to the raw nr).
+fn sysname(nr: u64) -> &'static str {
+    match nr {
+        0 => "read", 1 => "write", 2 => "open", 3 => "close", 4 => "stat",
+        5 => "fstat", 6 => "lstat", 7 => "poll", 8 => "lseek", 9 => "mmap",
+        10 => "mprotect", 11 => "munmap", 12 => "brk", 13 => "rt_sigaction",
+        14 => "rt_sigprocmask", 15 => "rt_sigreturn", 16 => "ioctl",
+        19 => "readv", 20 => "writev", 21 => "access", 22 => "pipe",
+        23 => "select", 25 => "mremap", 32 => "dup", 33 => "dup2",
+        39 => "getpid", 56 => "clone", 57 => "fork", 59 => "execve",
+        60 => "exit", 61 => "wait4", 62 => "kill", 63 => "uname",
+        72 => "fcntl", 79 => "getcwd", 80 => "chdir", 82 => "rename",
+        83 => "mkdir", 86 => "link", 87 => "unlink", 88 => "symlink",
+        89 => "readlink", 90 => "chmod", 95 => "umask", 96 => "gettimeofday",
+        97 => "getrlimit", 98 => "getrusage", 102 => "getuid", 104 => "getgid",
+        107 => "geteuid", 108 => "getegid", 130 => "rt_sigsuspend",
+        131 => "sigaltstack", 157 => "prctl", 158 => "arch_prctl",
+        186 => "gettid", 202 => "futex", 217 => "getdents64",
+        218 => "set_tid_address", 228 => "clock_gettime", 231 => "exit_group",
+        257 => "openat", 258 => "mkdirat", 262 => "newfstatat", 263 => "unlinkat",
+        264 => "renameat", 267 => "readlinkat", 269 => "faccessat",
+        270 => "pselect6", 271 => "ppoll", 273 => "set_robust_list",
+        275 => "splice", 281 => "epoll_pwait", 292 => "dup3", 293 => "pipe2",
+        302 => "prlimit64", 318 => "getrandom", 334 => "rseq",
+        _ => "?",
+    }
+}
+
 fn handle(number: u64, a: [u64; 6], regs: &mut Regs) -> SysResult {
+    if strace_matches() {
+        crate::log::info!(
+            "strace {}({}) a0={:#x} a1={:#x} a2={:#x}",
+            sysname(number),
+            number,
+            a[0],
+            a[1],
+            a[2]
+        );
+    }
     match number {
         nr::WRITE => sys_write(a[0] as i32, a[1], a[2] as usize),
         nr::READ => sys_read(a[0] as i32, a[1], a[2] as usize),
@@ -101,6 +178,8 @@ fn handle(number: u64, a: [u64; 6], regs: &mut Regs) -> SysResult {
         nr::UNLINK => sys_unlinkat(types::AT_FDCWD, a[0]),
         nr::UNLINKAT => sys_unlinkat(a[0] as i32, a[1]),
         nr::CHMOD => sys_fchmodat(types::AT_FDCWD, a[0], a[1] as u32),
+        nr::SPLICE => sys_splice(a[0] as i32, a[3] as i32, a[4] as usize),
+        nr::SETRLIMIT | nr::FADVISE64 => Ok(0),
         nr::FCHMODAT => sys_fchmodat(a[0] as i32, a[1], a[2] as u32),
         nr::READLINK => sys_readlinkat(types::AT_FDCWD, a[0], a[1], a[2] as usize),
         nr::READLINKAT => sys_readlinkat(a[0] as i32, a[1], a[2], a[3] as usize),
@@ -127,7 +206,8 @@ fn handle(number: u64, a: [u64; 6], regs: &mut Regs) -> SysResult {
         nr::GETRLIMIT => sys_getrlimit(a[1]),
         nr::POLL => sys_poll(a[0], a[1] as usize, PollTimeout::Millis(a[2] as i64)),
         nr::PPOLL => sys_ppoll(a[0], a[1] as usize, a[2]),
-        nr::PSELECT6 | nr::SELECT => Ok(1),
+        nr::SELECT => sys_select(a[0] as i32, a[1], a[2], a[3], a[4]),
+        nr::PSELECT6 => sys_pselect6(a[0] as i32, a[1], a[2], a[3], a[4]),
         nr::NANOSLEEP => sys_nanosleep(a[0], a[1]),
         nr::CLOCK_NANOSLEEP => sys_nanosleep(a[2], a[3]),
         nr::FUTEX => sys_futex(a[0], a[1] as u32, a[2] as u32),
@@ -526,22 +606,54 @@ fn sys_exit_thread(code: i32) -> SysResult {
     crate::scheduler::thread_exit();
 }
 
-/// `exit_group`: terminates the whole thread group. Records the status, notifies
-/// the parent, and exits the calling thread. (Sibling threads finish on their
-/// own next exit; a joined program has none left by here.)
+/// `exit_group`: terminates the WHOLE thread group. Marks the group exiting,
+/// wakes/preempts every sibling (so a thread blocked in futex/poll/read/sleep
+/// returns and dies at the dispatcher's group-exit check), then tears down this
+/// calling thread. The LAST thread to die closes the shared fd table — which is
+/// what closes a pipe's write end so a reader (e.g. a shell waiting on
+/// `eval "$(cmd)"`) finally gets EOF, even when `cmd` is multithreaded.
 fn sys_exit_group(code: i32) -> SysResult {
     if let Some(p) = process::current() {
-        let (ppid, fds) = {
+        {
             let mut g = p.lock();
-            g.exit_code = Some(code);
-            g.thread_count = 0;
-            (g.ppid, g.fds.take_all())
-        };
-        drop(fds); // close files outside the lock -> peers see EOF/EPIPE now
-        crate::signal::notify_parent(ppid);
+            if g.group_exit.is_none() {
+                g.group_exit = Some(code);
+                g.exit_code = Some(code);
+            }
+        }
+        let proc_ptr = core::ptr::from_ref(p) as u64;
+        crate::scheduler::kick_group(proc_ptr);
     }
-    process::notify_child_exit();
-    crate::log::info!("process exited with status {code}");
+    group_thread_exit();
+}
+
+/// Tears down the calling thread as part of a group exit (or a normal last-thread
+/// exit): clears its child-tid futex, decrements the live-thread count, and — on
+/// the LAST thread — closes the shared fd table (outside the lock, so pipe/pty
+/// peers get EOF/EPIPE immediately), notifies the parent, and logs the status.
+fn group_thread_exit() -> ! {
+    // SAFETY: `current()` is this CPU's running thread.
+    let clear = unsafe { (*crate::percpu::current()).clear_child_tid };
+    if clear != 0 {
+        let _ = put_user(clear, 0u32);
+        futex_wake(clear);
+    }
+    let (last, ppid, code, fds) = if let Some(p) = process::current() {
+        let mut g = p.lock();
+        g.thread_count = g.thread_count.saturating_sub(1);
+        let last = g.thread_count == 0;
+        let code = g.exit_code.unwrap_or(0);
+        let fds = if last { Some(g.fds.take_all()) } else { None };
+        (last, g.ppid, code, fds)
+    } else {
+        (false, 0, 0, None)
+    };
+    drop(fds); // close files outside the process lock
+    if last {
+        crate::signal::notify_parent(ppid);
+        process::notify_child_exit();
+        crate::log::info!("process exited with status {code}");
+    }
     crate::scheduler::thread_exit();
 }
 
@@ -633,7 +745,7 @@ fn sys_futex(uaddr: u64, op: u32, val: u32) -> SysResult {
             if u32::from_le_bytes(cur) != val {
                 return Err(Errno::EAGAIN);
             }
-            if proc()?.lock().sig.has_deliverable() {
+            if proc()?.lock().interrupted() {
                 return Err(Errno::EINTR);
             }
             crate::scheduler::block_with_gen(bucket, generation);
@@ -763,7 +875,7 @@ fn sys_poll(fds: u64, nfds: usize, timeout: PollTimeout) -> SysResult {
                 return Ok(0);
             }
         }
-        if proc()?.lock().sig.has_deliverable() {
+        if proc()?.lock().interrupted() {
             return Err(Errno::EINTR);
         }
         crate::scheduler::sleep_ticks(1);
@@ -786,6 +898,95 @@ fn sys_ppoll(fds: u64, nfds: usize, tsptr: u64) -> SysResult {
         PollTimeout::Ticks(Some(ticks))
     };
     sys_poll(fds, nfds, timeout)
+}
+
+const SELECT_TICKS_PER_SEC: u64 = 250;
+
+/// `select(nfds, readfds, writefds, exceptfds, timeout)`: a real readiness check
+/// over the fd_set bitmaps (previously a fake "always 1 ready", which made zsh's
+/// ZLE typeahead probe take the wrong path and spin). A zero timeout returns
+/// immediately; NULL blocks until an fd is ready. Exceptfds is always cleared.
+fn sys_select(nfds: i32, rfds: u64, wfds: u64, efds: u64, tv: u64) -> SysResult {
+    let deadline = if tv == 0 {
+        None
+    } else {
+        let mut b = [0u8; 16];
+        copy_from_user(tv, &mut b)?;
+        let sec = i64::from_le_bytes(b[0..8].try_into().unwrap()).max(0) as u64;
+        let usec = i64::from_le_bytes(b[8..16].try_into().unwrap()).max(0) as u64;
+        let ticks = sec * SELECT_TICKS_PER_SEC + usec * SELECT_TICKS_PER_SEC / 1_000_000;
+        Some(crate::percpu::this().now.load(Ordering::Relaxed) + ticks)
+    };
+    select_core(nfds, rfds, wfds, efds, deadline)
+}
+
+/// `pselect6`: like select with a `timespec` timeout; the signal mask argument
+/// is ignored for now (matching `ppoll`).
+fn sys_pselect6(nfds: i32, rfds: u64, wfds: u64, efds: u64, ts: u64) -> SysResult {
+    let deadline = if ts == 0 {
+        None
+    } else {
+        let mut b = [0u8; 16];
+        copy_from_user(ts, &mut b)?;
+        let sec = i64::from_le_bytes(b[0..8].try_into().unwrap()).max(0) as u64;
+        let nsec = i64::from_le_bytes(b[8..16].try_into().unwrap()).max(0) as u64;
+        let ticks = sec * SELECT_TICKS_PER_SEC + nsec * SELECT_TICKS_PER_SEC / 1_000_000_000;
+        Some(crate::percpu::this().now.load(Ordering::Relaxed) + ticks)
+    };
+    select_core(nfds, rfds, wfds, efds, deadline)
+}
+
+fn select_core(nfds: i32, rfds: u64, wfds: u64, efds: u64, deadline: Option<u64>) -> SysResult {
+    let nfds = nfds.clamp(0, 1024) as usize;
+    let nbytes = (nfds + 7) / 8;
+    let mut rin = vec![0u8; nbytes];
+    let mut win = vec![0u8; nbytes];
+    if rfds != 0 {
+        copy_from_user(rfds, &mut rin)?;
+    }
+    if wfds != 0 {
+        copy_from_user(wfds, &mut win)?;
+    }
+    loop {
+        let mut rout = vec![0u8; nbytes];
+        let mut wout = vec![0u8; nbytes];
+        let mut count = 0u64;
+        for fdn in 0..nfds {
+            let byte = fdn / 8;
+            let bit = 1u8 << (fdn % 8);
+            if rfds != 0 && rin[byte] & bit != 0 {
+                if let Ok(file) = fd(fdn as i32) {
+                    if fs::poll_readable(&file) {
+                        rout[byte] |= bit;
+                        count += 1;
+                    }
+                }
+            }
+            if wfds != 0 && win[byte] & bit != 0 && fd(fdn as i32).is_ok() {
+                // No write-side backpressure is modelled yet: a valid fd is writable.
+                wout[byte] |= bit;
+                count += 1;
+            }
+        }
+        let now = crate::percpu::this().now.load(Ordering::Relaxed);
+        let expired = deadline.is_some_and(|d| now >= d);
+        if count > 0 || expired {
+            if rfds != 0 {
+                copy_to_user(rfds, &rout)?;
+            }
+            if wfds != 0 {
+                copy_to_user(wfds, &wout)?;
+            }
+            if efds != 0 {
+                copy_to_user(efds, &alloc::vec![0u8; nbytes])?;
+            }
+            return Ok(count);
+        }
+        if proc()?.lock().interrupted() {
+            return Err(Errno::EINTR);
+        }
+        crate::scheduler::sleep_ticks(1);
+    }
 }
 
 fn sys_ioctl(fd_num: i32, request: u64, arg: u64) -> SysResult {
@@ -889,6 +1090,25 @@ fn sys_ioctl(fd_num: i32, request: u64, arg: u64) -> SysResult {
         }
         types::TIOCSPTLCK | types::TIOCGPTLCK => Ok(0), // unlockpt/lock: accepted
         types::TIOCSCTTY => Ok(0), // controlling-terminal bookkeeping: accepted
+        types::FIONREAD => {
+            // Queued input bytes. zsh/ZLE uses this to probe typeahead and drive
+            // bracketed paste; a wrong answer makes it mis-handle keystrokes.
+            let n: u32 = match &kind {
+                TtyKind::PtyMaster(p) => p.queued(true) as u32,
+                TtyKind::PtySlave(p) => p.queued(false) as u32,
+                _ => crate::arch::x86_64::input::available() as u32,
+            };
+            put_user(arg, n)?;
+            Ok(0)
+        }
+        types::TIOCOUTQ => {
+            // Output is written synchronously, so nothing is ever queued.
+            put_user(arg, 0u32)?;
+            Ok(0)
+        }
+        // tcflush: accept but do NOT discard queued input (dropping bytes the
+        // shell still wants is worse than keeping a few stale ones).
+        types::TCFLSH => Ok(0),
         _ => Err(Errno::ENOTTY),
     }
 }
@@ -926,8 +1146,18 @@ fn sys_getrandom(buf: u64, len: usize) -> SysResult {
 }
 
 fn sys_clock_gettime(_clk: u64, ts: u64) -> SysResult {
-    // Monotonic-ish from the TSC is future work; report a fixed epoch for now.
-    let t = types::Timespec { tv_sec: 0, tv_nsec: 0 };
+    // A monotonic clock derived from the TSC and the APIC's calibrated
+    // cycles-per-ms. It must be non-zero and advancing: the Go runtime panics
+    // ("nanotime returning zero") otherwise, which crashed fzf under zinit.
+    let tpms = crate::arch::x86_64::apic::tsc_per_ms();
+    // SAFETY: `_rdtsc` reads the timestamp counter.
+    let tsc = unsafe { core::arch::x86_64::_rdtsc() };
+    let ms = tsc / tpms;
+    let sub = tsc % tpms; // leftover cycles within the current ms
+    let t = types::Timespec {
+        tv_sec: (ms / 1000) as i64,
+        tv_nsec: ((ms % 1000) * 1_000_000 + sub * 1_000_000 / tpms) as i64,
+    };
     let bytes = unsafe {
         core::slice::from_raw_parts(core::ptr::from_ref(&t).cast::<u8>(), size_of::<types::Timespec>())
     };
@@ -960,6 +1190,18 @@ fn sys_fstat(fd_num: i32, statbuf: u64) -> SysResult {
                 s.st_mode = types::S_IFCHR | 0o620;
                 s
             }
+            fs::FileKind::ProcData { data, .. } => {
+                let mut s = types::Stat::default();
+                s.st_mode = types::S_IFREG | 0o444;
+                s.st_size = data.len() as i64;
+                s
+            }
+            fs::FileKind::ProcDir { .. } => {
+                let mut s = types::Stat::default();
+                s.st_mode = types::S_IFDIR | 0o555;
+                s.st_nlink = 2;
+                s
+            }
         }
     };
     write_stat(statbuf, &st)
@@ -972,6 +1214,9 @@ fn sys_newfstatat(_dirfd: i32, path: u64, statbuf: u64, _flags: i32) -> SysResul
 
 fn sys_stat(path: u64, statbuf: u64, follow: bool) -> SysResult {
     let path = read_path(path)?;
+    if let Some(r) = crate::procfs::stat(&path) {
+        return write_stat(statbuf, &r?);
+    }
     let cwd = proc()?.lock().cwd;
     let st = fs::with_vfs(|v| {
         let ino = v.resolve(cwd, &path, follow)?;
@@ -990,23 +1235,38 @@ fn write_stat(statbuf: u64, st: &types::Stat) -> SysResult {
 
 fn sys_getdents64(fd_num: i32, buf: u64, len: usize) -> SysResult {
     let file = fd(fd_num)?;
-    let (ino, start) = {
+    // Snapshot the directory entries as (name, d_ino, d_type), from either the
+    // tmpfs or a synthetic procfs directory.
+    let (entries, start): (Vec<(alloc::string::String, u64, u8)>, usize) = {
         let f = file.lock();
         match &f.kind {
-            fs::FileKind::Dir { ino, pos } => (*ino, *pos),
+            fs::FileKind::Dir { ino, pos } => {
+                let e = fs::with_vfs(|v| v.readdir(*ino))?
+                    .into_iter()
+                    .map(|(n, c, t)| (n, u64::from(c) + 1, t))
+                    .collect();
+                (e, *pos)
+            }
+            fs::FileKind::ProcDir { entries, pos } => {
+                let e = entries
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (n, t))| (n.clone(), i as u64 + 1, *t))
+                    .collect();
+                (e, *pos)
+            }
             _ => return Err(Errno::ENOTDIR),
         }
     };
-    let entries = fs::with_vfs(|v| v.readdir(ino))?;
     let mut out: Vec<u8> = Vec::new();
     let mut pos = start;
     while pos < entries.len() {
-        let (name, child, dtype) = &entries[pos];
+        let (name, ino, dtype) = &entries[pos];
         let reclen = (19 + name.len() + 1 + 7) & !7; // header 19 + name + NUL, 8-aligned
         if out.len() + reclen > len {
             break;
         }
-        out.extend_from_slice(&(u64::from(*child) + 1).to_le_bytes()); // d_ino
+        out.extend_from_slice(&ino.to_le_bytes()); // d_ino
         out.extend_from_slice(&(pos as i64 + 1).to_le_bytes()); // d_off
         out.extend_from_slice(&(reclen as u16).to_le_bytes()); // d_reclen
         out.push(*dtype); // d_type
@@ -1018,8 +1278,9 @@ fn sys_getdents64(fd_num: i32, buf: u64, len: usize) -> SysResult {
         pos += 1;
     }
     copy_to_user(buf, &out)?;
-    if let fs::FileKind::Dir { pos: p, .. } = &mut file.lock().kind {
-        *p = pos;
+    match &mut file.lock().kind {
+        fs::FileKind::Dir { pos: p, .. } | fs::FileKind::ProcDir { pos: p, .. } => *p = pos,
+        _ => {}
     }
     Ok(out.len() as u64)
 }
@@ -1038,6 +1299,9 @@ fn sys_getcwd(buf: u64, size: usize) -> SysResult {
 
 fn sys_access(_dirfd: i32, path: u64) -> SysResult {
     let path = read_path(path)?;
+    if let Some(r) = crate::procfs::stat(&path) {
+        return r.map(|_| 0);
+    }
     let cwd = proc()?.lock().cwd;
     fs::with_vfs(|v| v.resolve(cwd, &path, true))?;
     Ok(0)
@@ -1156,6 +1420,12 @@ fn sys_fchmodat(dirfd: i32, path: u64, mode: u32) -> SysResult {
 /// the caller's buffer, truncated to its length; `EINVAL` if not a symlink.
 fn sys_readlinkat(dirfd: i32, path: u64, buf: u64, bufsize: usize) -> SysResult {
     let path = read_path(path)?;
+    if let Some(r) = crate::procfs::readlink(&path) {
+        let target = r?.into_bytes();
+        let n = target.len().min(bufsize);
+        copy_to_user(buf, &target[..n])?;
+        return Ok(n as u64);
+    }
     let base = {
         let g = proc()?.lock();
         dirfd_base(&g, dirfd, &path)?
@@ -1245,7 +1515,7 @@ fn sys_rt_sigsuspend(set_ptr: u64, sigsetsize: usize) -> SysResult {
     // after we return. Only a spurious timeout path undoes the arming.
     let mut delivered = false;
     for _ in 0..1024 {
-        if p.lock().sig.has_deliverable() {
+        if p.lock().interrupted() {
             delivered = true;
             break;
         }
@@ -1323,6 +1593,38 @@ fn read_path(ptr: u64) -> Result<alloc::string::String, Errno> {
 /// `kill`: minimal — signal 0 is an existence check (always OK here); real
 /// delivery lands with the signal subsystem. Returns success so job-control
 /// shells proceed.
+/// `splice(fd_in, off_in, fd_out, off_out, len, flags)`: moves up to `len`
+/// bytes between two descriptors through a kernel bounce buffer. Offsets are
+/// ignored (callers splicing to/from pipes pass NULL), which covers the shell
+/// and coreutils uses; it is a straightforward read-then-write, not zero-copy.
+fn sys_splice(fd_in: i32, fd_out: i32, len: usize) -> SysResult {
+    let len = len.min(MAX_RW);
+    let infile = fd(fd_in)?;
+    let outfile = fd(fd_out)?;
+    let mut buf = vec![0u8; len.min(4096).max(1)];
+    let mut total = 0u64;
+    while (total as usize) < len {
+        let want = buf.len().min(len - total as usize);
+        let n = fs::read(&infile, &mut buf[..want])?;
+        if n == 0 {
+            break; // EOF
+        }
+        let mut written = 0usize;
+        while written < n as usize {
+            let w = fs::write(&outfile, &buf[written..n as usize])?;
+            if w == 0 {
+                break;
+            }
+            written += w as usize;
+        }
+        total += written as u64;
+        if (written as u64) < n {
+            break;
+        }
+    }
+    Ok(total)
+}
+
 /// `sendfile(out, in, offset, count)`: copies up to `count` bytes from `in` to
 /// `out` through a kernel buffer.
 fn sys_sendfile(out_fd: i32, in_fd: i32, offset_ptr: u64, count: usize) -> SysResult {
@@ -1440,7 +1742,7 @@ fn sys_nanosleep(req: u64, rem: u64) -> SysResult {
             return Ok(0);
         }
         if let Some(pr) = process::current() {
-            if pr.lock().sig.has_deliverable() {
+            if pr.lock().interrupted() {
                 if rem != 0 {
                     // Report (approximate) remaining time.
                     let left_ticks = deadline - now;
@@ -1539,7 +1841,7 @@ fn sys_wait4(_pid: i32, wstatus: u64, options: u32) -> SysResult {
             return Ok(0);
         }
         if let Some(pr) = process::current() {
-            if pr.lock().sig.has_deliverable() {
+            if pr.lock().interrupted() {
                 return Err(Errno::ERESTARTSYS);
             }
         }
@@ -1596,6 +1898,7 @@ fn sys_execve(path: u64, argv: u64, envp: u64) -> SysResult {
         p.brk_start = 0;
         p.mmap_next = 0x6000_0000;
         p.sig.exec_reset();
+        p.comm = path.rsplit('/').next().unwrap_or(&path).into();
         (loaded.entry, sp, p.space.cr3())
     };
 
