@@ -770,12 +770,15 @@ fn cow_regression_elf() -> Vec<u8> {
     elf
 }
 
-/// Builds a program validating the shared-address-space CoW shootdown's READER
-/// coherence: after a fork makes a page CoW, the parent spawns a CLONE_VM reader
-/// thread that spins reading the page; the main thread writes it (CoW-copies +
-/// shoots down peers). The reader must observe the new value — without the
-/// shootdown its cached read-only entry would read the stale pre-copy frame
-/// forever and the join would hang. Exits 0 on success.
+/// Builds a program exercising shared-address-space CoW READER coherence: after
+/// a fork makes a page CoW, the parent spawns a CLONE_VM reader thread that
+/// spins reading the page; the main thread writes it (CoW-copies into a private
+/// frame and shoots down peers). The reader must observe the new value, and the
+/// join must complete. NOTE: this verifies the end-to-end coherence requirement,
+/// not the shootdown in isolation — the scheduler can migrate the spinning
+/// reader (flushing its TLB incidentally), so it is not a strict negative guard;
+/// a strict guard needs CPU pinning (sched_setaffinity, not yet implemented).
+/// The shootdown remains required for guaranteed coherence in all schedules.
 fn clone_cow_reader_elf() -> Vec<u8> {
     // r15 = shared page P (mmap); r14 = reader thread stack base; join word @[r15+64].
     let mmap_p: &[u8] = &[
