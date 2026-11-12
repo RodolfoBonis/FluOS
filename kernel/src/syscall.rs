@@ -68,12 +68,15 @@ fn handle(number: u64, a: [u64; 6], regs: &mut Regs) -> SysResult {
         nr::GETPID => sys_getpid(),
         nr::GETTID => sys_gettid(),
         nr::GETPPID => Ok(1),
-        nr::GETUID | nr::GETEUID | nr::GETGID | nr::GETEGID => Ok(0),
+        nr::GETUID | nr::GETEUID => Ok(u64::from(proc()?.lock().uid)),
+        nr::GETGID | nr::GETEGID => Ok(u64::from(proc()?.lock().gid)),
+        nr::SETUID => { proc()?.lock().uid = a[0] as u32; Ok(0) }
+        nr::SETGID => { proc()?.lock().gid = a[0] as u32; Ok(0) }
         nr::ARCH_PRCTL => sys_arch_prctl(a[0], a[1]),
         nr::SET_TID_ADDRESS => sys_set_tid_address(a[0]),
         nr::BRK => sys_brk(a[0]),
         nr::MMAP => sys_mmap(a[0], a[1], a[2], a[3], a[4] as i32, a[5]),
-        nr::MUNMAP => Ok(0), // regions are not reclaimed yet
+        nr::MUNMAP => sys_munmap(a[0], a[1]),
         nr::MPROTECT => Ok(0),
         nr::IOCTL => sys_ioctl(a[0] as i32, a[1], a[2]),
         nr::UNAME => sys_uname(a[0]),
@@ -85,6 +88,16 @@ fn handle(number: u64, a: [u64; 6], regs: &mut Regs) -> SysResult {
         nr::LSTAT => sys_stat(a[0], a[1], false),
         nr::GETDENTS64 => sys_getdents64(a[0] as i32, a[1], a[2] as usize),
         nr::GETCWD => sys_getcwd(a[0], a[1] as usize),
+        nr::CHDIR => sys_chdir(a[0]),
+        nr::MKDIR => sys_mkdirat(types::AT_FDCWD, a[0], a[1] as u32),
+        nr::MKDIRAT => sys_mkdirat(a[0] as i32, a[1], a[2] as u32),
+        nr::READLINK => sys_readlinkat(types::AT_FDCWD, a[0], a[1], a[2] as usize),
+        nr::READLINKAT => sys_readlinkat(a[0] as i32, a[1], a[2], a[3] as usize),
+        nr::UMASK => sys_umask(a[0] as u32),
+        nr::GETRUSAGE => sys_getrusage(a[0] as i32, a[1]),
+        nr::SIGALTSTACK => sys_sigaltstack(a[0], a[1]),
+        nr::RT_SIGSUSPEND => sys_rt_sigsuspend(a[0], a[1] as usize),
+        nr::PRCTL => Ok(0),
         nr::DUP => dup(a[0] as i32),
         nr::DUP2 => dup3(a[0] as i32, a[1] as i32),
         nr::DUP3 => dup3(a[0] as i32, a[1] as i32),
@@ -101,7 +114,9 @@ fn handle(number: u64, a: [u64; 6], regs: &mut Regs) -> SysResult {
         nr::RT_SIGRETURN => crate::signal::sys_rt_sigreturn(regs),
         nr::PRLIMIT64 => sys_prlimit64(a[2], a[3]),
         nr::GETRLIMIT => sys_getrlimit(a[1]),
-        nr::POLL | nr::PPOLL | nr::PSELECT6 | nr::SELECT => Ok(1),
+        nr::POLL => sys_poll(a[0], a[1] as usize, PollTimeout::Millis(a[2] as i64)),
+        nr::PPOLL => sys_ppoll(a[0], a[1] as usize, a[2]),
+        nr::PSELECT6 | nr::SELECT => Ok(1),
         nr::NANOSLEEP => sys_nanosleep(a[0], a[1]),
         nr::CLOCK_NANOSLEEP => sys_nanosleep(a[2], a[3]),
         nr::FUTEX => sys_futex(a[0], a[1] as u32, a[2] as u32),
@@ -290,10 +305,29 @@ fn sys_readv(fd_num: i32, iov: u64, count: usize) -> SysResult {
     Ok(total)
 }
 
-fn sys_openat(_dirfd: i32, path: u64, flags: u64, mode: u32) -> SysResult {
+fn sys_openat(dirfd: i32, path: u64, flags: u64, mode: u32) -> SysResult {
     let path = read_path(path)?;
-    let file = fs::open(vfs::ROOT, &path, flags, mode)?;
+    let (base, umask) = {
+        let g = proc()?.lock();
+        (dirfd_base(&g, dirfd, &path)?, g.umask)
+    };
+    let mode = if flags & types::O_CREAT != 0 { (mode & !umask) & 0o777 } else { mode };
+    let file = fs::open(base, &path, flags, mode)?;
     Ok(proc()?.lock().fds.alloc(file) as u64)
+}
+
+/// Resolves the directory a `*at` syscall path is relative to: the cwd for an
+/// absolute path or `AT_FDCWD`, otherwise the directory the given fd is open on.
+fn dirfd_base(g: &Process, dirfd: i32, path: &str) -> Result<vfs::Ino, Errno> {
+    if path.starts_with('/') || dirfd == types::AT_FDCWD {
+        return Ok(g.cwd);
+    }
+    let file = g.fds.get(dirfd)?;
+    let f = file.lock();
+    match &f.kind {
+        fs::FileKind::Dir { ino, .. } => Ok(*ino),
+        _ => Err(Errno::ENOTDIR),
+    }
 }
 
 fn sys_close(fd_num: i32) -> SysResult {
@@ -383,6 +417,30 @@ fn sys_brk(addr: u64) -> SysResult {
     Ok(addr)
 }
 
+/// `munmap(addr, len)`: unmaps the range and reclaims its frames. In a shared
+/// (CLONE_VM) address space, a TLB shootdown precedes reuse so a peer CPU cannot
+/// write a freed-then-recycled frame through a stale entry (use-after-free).
+fn sys_munmap(addr: u64, len: u64) -> SysResult {
+    if addr & 0xfff != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let p = proc()?;
+    let (shared, frames) = {
+        let mut g = p.lock();
+        let shared = g.thread_count > 1;
+        let frames = g.space.unmap_region(addr, len);
+        (shared, frames)
+    };
+    // Flush peers BEFORE freeing, so a stale entry can't reach a recycled frame.
+    if shared {
+        crate::mm::paging::shootdown_all();
+    }
+    for f in frames {
+        crate::mm::phys::free_user_frame(f);
+    }
+    Ok(0)
+}
+
 fn sys_mmap(addr: u64, len: u64, _prot: u64, flags: u64, _fd: i32, _off: u64) -> SysResult {
     if len == 0 || len > MAX_RW as u64 {
         return Err(Errno::EINVAL);
@@ -434,18 +492,22 @@ fn sys_exit_thread(code: i32) -> SysResult {
         let _ = put_user(clear, 0u32);
         futex_wake(clear);
     }
-    let last = if let Some(p) = process::current() {
+    let (last, ppid, fds) = if let Some(p) = process::current() {
         let mut g = p.lock();
         g.thread_count = g.thread_count.saturating_sub(1);
         let last = g.thread_count == 0;
         if last {
             g.exit_code = Some(code);
         }
-        Some((last, g.ppid))
+        // On the last thread, take the fd table so its files close now (peers
+        // blocked on a pipe/pty get EOF/EPIPE immediately, not only on reap).
+        let fds = if last { Some(g.fds.take_all()) } else { None };
+        (last, g.ppid, fds)
     } else {
-        None
+        (false, 0, None)
     };
-    if let Some((true, ppid)) = last {
+    drop(fds); // close files outside the process lock
+    if last {
         crate::signal::notify_parent(ppid);
         process::notify_child_exit();
         crate::log::info!("process exited with status {code}");
@@ -458,12 +520,13 @@ fn sys_exit_thread(code: i32) -> SysResult {
 /// own next exit; a joined program has none left by here.)
 fn sys_exit_group(code: i32) -> SysResult {
     if let Some(p) = process::current() {
-        let ppid = {
+        let (ppid, fds) = {
             let mut g = p.lock();
             g.exit_code = Some(code);
             g.thread_count = 0;
-            g.ppid
+            (g.ppid, g.fds.take_all())
         };
+        drop(fds); // close files outside the lock -> peers see EOF/EPIPE now
         crate::signal::notify_parent(ppid);
     }
     process::notify_child_exit();
@@ -625,10 +688,119 @@ fn sys_set_tid_address(ptr: u64) -> SysResult {
     sys_gettid()
 }
 
-fn sys_ioctl(_fd: i32, request: u64, arg: u64) -> SysResult {
+/// How long a `poll`/`ppoll` should wait.
+enum PollTimeout {
+    /// Milliseconds; negative means block indefinitely.
+    Millis(i64),
+    /// Scheduler ticks (converted from a ppoll timespec); `None` = indefinite.
+    Ticks(Option<u64>),
+}
+
+/// `poll(fds, nfds, timeout_ms)`: reports POLLIN readiness per fd (POLLOUT is
+/// assumed ready). Blocks by sleeping (not busy-spinning) until a fd is ready,
+/// the timeout elapses, or a signal arrives.
+fn sys_poll(fds: u64, nfds: usize, timeout: PollTimeout) -> SysResult {
+    const POLLIN: i16 = 0x001;
+    const POLLOUT: i16 = 0x004;
+    const POLLNVAL: i16 = 0x020;
+    const TICKS_PER_SEC: u64 = 250;
+    let nfds = nfds.min(1024);
+    let deadline = match timeout {
+        PollTimeout::Millis(ms) if ms < 0 => None,
+        PollTimeout::Millis(ms) => {
+            let ticks = (ms as u64).saturating_mul(TICKS_PER_SEC) / 1000;
+            Some(crate::percpu::this().now.load(Ordering::Relaxed) + ticks)
+        }
+        PollTimeout::Ticks(None) => None,
+        PollTimeout::Ticks(Some(t)) => {
+            Some(crate::percpu::this().now.load(Ordering::Relaxed) + t)
+        }
+    };
+    loop {
+        let mut ready = 0u64;
+        for i in 0..nfds {
+            let base = fds + (i * 8) as u64;
+            let mut pfd = [0u8; 8];
+            copy_from_user(base, &mut pfd)?;
+            let fdn = i32::from_le_bytes(pfd[0..4].try_into().unwrap());
+            let events = i16::from_le_bytes(pfd[4..6].try_into().unwrap());
+            let mut revents: i16 = 0;
+            if fdn >= 0 {
+                match fd(fdn) {
+                    Ok(file) => {
+                        if events & POLLIN != 0 && fs::poll_readable(&file) {
+                            revents |= POLLIN;
+                        }
+                        if events & POLLOUT != 0 {
+                            revents |= POLLOUT;
+                        }
+                    }
+                    Err(_) => revents |= POLLNVAL,
+                }
+            }
+            copy_to_user(base + 6, &revents.to_le_bytes())?;
+            if revents != 0 {
+                ready += 1;
+            }
+        }
+        if ready > 0 {
+            return Ok(ready);
+        }
+        let now = crate::percpu::this().now.load(Ordering::Relaxed);
+        if let Some(d) = deadline {
+            if now >= d {
+                return Ok(0);
+            }
+        }
+        if proc()?.lock().sig.has_deliverable() {
+            return Err(Errno::EINTR);
+        }
+        crate::scheduler::sleep_ticks(1);
+    }
+}
+
+/// `ppoll(fds, nfds, timespec, sigmask, sz)`: like poll with a timespec timeout
+/// (NULL = block indefinitely); the signal mask is ignored for now.
+fn sys_ppoll(fds: u64, nfds: usize, tsptr: u64) -> SysResult {
+    const TICKS_PER_SEC: u64 = 250;
+    let timeout = if tsptr == 0 {
+        PollTimeout::Ticks(None)
+    } else {
+        let mut ts = [0u8; 16];
+        copy_from_user(tsptr, &mut ts)?;
+        let secs = i64::from_le_bytes(ts[0..8].try_into().unwrap()).max(0) as u64;
+        let nsecs = i64::from_le_bytes(ts[8..16].try_into().unwrap()).max(0) as u64;
+        let ticks = secs.saturating_mul(TICKS_PER_SEC)
+            + nsecs.saturating_mul(TICKS_PER_SEC) / 1_000_000_000;
+        PollTimeout::Ticks(Some(ticks))
+    };
+    sys_poll(fds, nfds, timeout)
+}
+
+fn sys_ioctl(fd_num: i32, request: u64, arg: u64) -> SysResult {
+    use fs::TtyKind;
+    let file = fd(fd_num)?;
+    let kind = fs::tty_kind(&file);
+    if matches!(kind, TtyKind::NotTty) {
+        // A handful of ioctls are harmless no-ops on non-ttys; the rest ENOTTY.
+        return Err(Errno::ENOTTY);
+    }
+
+    // Helpers that read/write the terminal state of whichever tty `fd` is.
+    let get_termios = |k: &TtyKind| -> types::Termios {
+        match k {
+            TtyKind::PtyMaster(p) | TtyKind::PtySlave(p) => p.termios(),
+            _ => fs::termios(),
+        }
+    };
+    let put_termios = |k: &TtyKind, t: types::Termios| match k {
+        TtyKind::PtyMaster(p) | TtyKind::PtySlave(p) => p.set_termios(t),
+        _ => fs::set_termios(t),
+    };
+
     match request {
         types::TCGETS => {
-            let t = fs::termios();
+            let t = get_termios(&kind);
             let bytes = unsafe {
                 core::slice::from_raw_parts(core::ptr::from_ref(&t).cast::<u8>(), size_of::<types::Termios>())
             };
@@ -641,21 +813,41 @@ fn sys_ioctl(_fd: i32, request: u64, arg: u64) -> SysResult {
                 core::slice::from_raw_parts_mut(core::ptr::from_mut(&mut t).cast::<u8>(), size_of::<types::Termios>())
             };
             copy_from_user(arg, bytes)?;
-            fs::set_termios(t);
+            put_termios(&kind, t);
             Ok(0)
         }
         types::TIOCGWINSZ => {
-            let ws = types::Winsize { ws_row: 40, ws_col: 128, ws_xpixel: 0, ws_ypixel: 0 };
+            let ws = match &kind {
+                TtyKind::PtyMaster(p) | TtyKind::PtySlave(p) => p.winsize(),
+                _ => fs::console_winsize(),
+            };
             let bytes = unsafe {
                 core::slice::from_raw_parts(core::ptr::from_ref(&ws).cast::<u8>(), size_of::<types::Winsize>())
             };
             copy_to_user(arg, bytes)?;
             Ok(0)
         }
+        types::TIOCSWINSZ => {
+            let mut ws = types::Winsize::default();
+            let bytes = unsafe {
+                core::slice::from_raw_parts_mut(core::ptr::from_mut(&mut ws).cast::<u8>(), size_of::<types::Winsize>())
+            };
+            copy_from_user(arg, bytes)?;
+            // Set the size and deliver SIGWINCH to the terminal's foreground group.
+            let fg = match &kind {
+                TtyKind::PtyMaster(p) | TtyKind::PtySlave(p) => p.set_winsize(ws),
+                _ => fs::set_console_winsize(ws),
+            };
+            if fg > 0 {
+                crate::signal::send_to_pgrp(fg, types::SIGWINCH);
+            }
+            Ok(0)
+        }
         types::TIOCGPGRP => {
-            // The terminal foreground group; fall back to the caller's own group
-            // if none has been set yet (keeps a job-control shell from looping).
-            let fg = fs::foreground_pgrp();
+            let fg = match &kind {
+                TtyKind::PtyMaster(p) | TtyKind::PtySlave(p) => p.fg_pgrp(),
+                _ => fs::foreground_pgrp(),
+            };
             let pgid = if fg != 0 { fg } else { proc()?.lock().pgid };
             put_user(arg, pgid as u32)?;
             Ok(0)
@@ -665,11 +857,27 @@ fn sys_ioctl(_fd: i32, request: u64, arg: u64) -> SysResult {
             copy_from_user(arg, &mut raw)?;
             let pgid = i32::from_le_bytes(raw);
             if pgid > 0 {
-                fs::set_foreground_pgrp(pgid);
-                crate::log::info!("tty: foreground pgrp -> {pgid}");
+                match &kind {
+                    TtyKind::PtyMaster(p) | TtyKind::PtySlave(p) => p.set_fg_pgrp(pgid),
+                    _ => {
+                        fs::set_foreground_pgrp(pgid);
+                        crate::log::info!("tty: foreground pgrp -> {pgid}");
+                    }
+                }
             }
             Ok(0)
         }
+        types::TIOCGPTN => {
+            // Master only: the slave number for ptsname (/dev/pts/N).
+            if let TtyKind::PtyMaster(p) = &kind {
+                put_user(arg, p.ptn)?;
+                Ok(0)
+            } else {
+                Err(Errno::ENOTTY)
+            }
+        }
+        types::TIOCSPTLCK | types::TIOCGPTLCK => Ok(0), // unlockpt/lock: accepted
+        types::TIOCSCTTY => Ok(0), // controlling-terminal bookkeeping: accepted
         _ => Err(Errno::ENOTTY),
     }
 }
@@ -735,6 +943,12 @@ fn sys_fstat(fd_num: i32, statbuf: u64) -> SysResult {
                 s.st_mode = types::S_IFIFO | 0o600;
                 s
             }
+            // PTY ends report as character devices (isatty() => true).
+            fs::FileKind::PtyMaster(_) | fs::FileKind::PtySlave(_) => {
+                let mut s = types::Stat::default();
+                s.st_mode = types::S_IFCHR | 0o620;
+                s
+            }
         }
     };
     write_stat(statbuf, &st)
@@ -747,8 +961,9 @@ fn sys_newfstatat(_dirfd: i32, path: u64, statbuf: u64, _flags: i32) -> SysResul
 
 fn sys_stat(path: u64, statbuf: u64, follow: bool) -> SysResult {
     let path = read_path(path)?;
+    let cwd = proc()?.lock().cwd;
     let st = fs::with_vfs(|v| {
-        let ino = v.resolve(vfs::ROOT, &path, follow)?;
+        let ino = v.resolve(cwd, &path, follow)?;
         v.stat(ino)
     })?;
     write_stat(statbuf, &st)
@@ -799,18 +1014,143 @@ fn sys_getdents64(fd_num: i32, buf: u64, len: usize) -> SysResult {
 }
 
 fn sys_getcwd(buf: u64, size: usize) -> SysResult {
-    let cwd = b"/\0";
-    if size < cwd.len() {
+    let cwd = proc()?.lock().cwd;
+    let path = fs::with_vfs(|v| v.path_of(cwd))?;
+    let mut bytes = path.into_bytes();
+    bytes.push(0);
+    if size < bytes.len() {
         return Err(Errno::ERANGE);
     }
-    copy_to_user(buf, cwd)?;
-    Ok(cwd.len() as u64)
+    copy_to_user(buf, &bytes)?;
+    Ok(bytes.len() as u64)
 }
 
 fn sys_access(_dirfd: i32, path: u64) -> SysResult {
     let path = read_path(path)?;
-    fs::with_vfs(|v| v.resolve(vfs::ROOT, &path, true))?;
+    let cwd = proc()?.lock().cwd;
+    fs::with_vfs(|v| v.resolve(cwd, &path, true))?;
     Ok(0)
+}
+
+/// `chdir`: point the process cwd at the resolved directory inode.
+fn sys_chdir(path: u64) -> SysResult {
+    let path = read_path(path)?;
+    let cwd = proc()?.lock().cwd;
+    let ino = fs::with_vfs(|v| {
+        let ino = v.resolve(cwd, &path, true)?;
+        if v.kind(ino)? != vfs::Kind::Dir {
+            return Err(Errno::ENOTDIR);
+        }
+        Ok(ino)
+    })?;
+    proc()?.lock().cwd = ino;
+    Ok(0)
+}
+
+/// `mkdir`/`mkdirat`: create a directory, honouring the process umask.
+fn sys_mkdirat(dirfd: i32, path: u64, mode: u32) -> SysResult {
+    let path = read_path(path)?;
+    let (base, umask) = {
+        let g = proc()?.lock();
+        (dirfd_base(&g, dirfd, &path)?, g.umask)
+    };
+    fs::with_vfs(|v| {
+        let (dir, name) = v.split_parent(base, &path)?;
+        v.mkdir(dir, name, (mode & !umask) & 0o777)?;
+        Ok(())
+    })?;
+    Ok(0)
+}
+
+/// `readlink`/`readlinkat`: copy a symlink's target (not NUL-terminated) into
+/// the caller's buffer, truncated to its length; `EINVAL` if not a symlink.
+fn sys_readlinkat(dirfd: i32, path: u64, buf: u64, bufsize: usize) -> SysResult {
+    let path = read_path(path)?;
+    let base = {
+        let g = proc()?.lock();
+        dirfd_base(&g, dirfd, &path)?
+    };
+    let target = fs::with_vfs(|v| {
+        let ino = v.resolve(base, &path, false)?; // do not follow the final link
+        Ok(v.readlink(ino)?.as_bytes().to_vec())
+    })?;
+    let n = target.len().min(bufsize);
+    copy_to_user(buf, &target[..n])?;
+    Ok(n as u64)
+}
+
+/// `umask`: set the file-creation mask, returning the previous value.
+fn sys_umask(mask: u32) -> SysResult {
+    let p = proc()?;
+    let mut g = p.lock();
+    let old = g.umask;
+    g.umask = mask & 0o777;
+    Ok(u64::from(old))
+}
+
+/// `getrusage`: report zeroed counters (we do not yet track per-process CPU
+/// time). `struct rusage` is 144 bytes on x86_64.
+fn sys_getrusage(_who: i32, usage: u64) -> SysResult {
+    if usage != 0 {
+        copy_to_user(usage, &[0u8; 144])?;
+    }
+    Ok(0)
+}
+
+/// `sigaltstack`: store/report the alternate signal stack. `stack_t` is
+/// `{ void *ss_sp; int ss_flags; size_t ss_size; }` = 24 bytes (ss_size at
+/// offset 16 after 4 bytes of padding).
+fn sys_sigaltstack(new: u64, old: u64) -> SysResult {
+    let p = proc()?;
+    if old != 0 {
+        let (sp, size, flags) = p.lock().altstack;
+        let mut out = [0u8; 24];
+        out[0..8].copy_from_slice(&sp.to_le_bytes());
+        out[8..12].copy_from_slice(&flags.to_le_bytes());
+        out[16..24].copy_from_slice(&size.to_le_bytes());
+        copy_to_user(old, &out)?;
+    }
+    if new != 0 {
+        let mut inb = [0u8; 24];
+        copy_from_user(new, &mut inb)?;
+        let sp = u64::from_le_bytes(inb[0..8].try_into().unwrap());
+        let flags = i32::from_le_bytes(inb[8..12].try_into().unwrap());
+        let size = u64::from_le_bytes(inb[16..24].try_into().unwrap());
+        p.lock().altstack = (sp, size, flags);
+    }
+    Ok(0)
+}
+
+/// `rt_sigsuspend`: atomically install `set` as the blocked mask, give pending
+/// work (e.g. a child exiting and posting `SIGCHLD`) a chance to run, then
+/// restore the previous mask and return `EINTR` — sigsuspend's only outcome.
+///
+/// We deliberately do *not* block forever on `has_deliverable`: under the
+/// "deliver on syscall-return" model a signal can be delivered (its handler run,
+/// the pending bit cleared) during a `yield_now` before we observe it, which
+/// would wedge us permanently. POSIX allows sigsuspend to return `EINTR`
+/// spuriously — callers re-test their own condition in a loop — so a bounded
+/// wait that always returns is both race-free and correct for job-control loops
+/// (zsh re-checks `waitpid` after each return).
+fn sys_rt_sigsuspend(set_ptr: u64, sigsetsize: usize) -> SysResult {
+    if sigsetsize != 8 {
+        return Err(Errno::EINVAL);
+    }
+    let mut tmp = [0u8; 8];
+    copy_from_user(set_ptr, &mut tmp)?;
+    let newmask = u64::from_le_bytes(tmp);
+    let p = proc()?;
+    let old = p.lock().sig.set_mask(newmask);
+    // Bounded wait: break early once something is deliverable, but never spin
+    // forever. Each yield lets other threads (and exiting children) run.
+    for _ in 0..64 {
+        if p.lock().sig.has_deliverable() {
+            break;
+        }
+        crate::scheduler::yield_now();
+    }
+    p.lock().sig.set_mask(old);
+    Err(Errno::EINTR)
 }
 
 /// `sched_setaffinity(pid, cpusetsize, mask)`. Only the calling thread (pid 0
@@ -1141,6 +1481,9 @@ fn sys_execve(path: u64, argv: u64, envp: u64) -> SysResult {
         let loaded = crate::elf::load(&mut space, &image)?;
         let sp = crate::userspace::build_stack(&mut space, &loaded, &argv_refs, &envp_refs)
             .map_err(|_| Errno::ENOMEM)?;
+        // Reclaim the old image's user frames before swapping in the new space
+        // (shared CoW frames are only freed if this was the last owner).
+        p.space.free_leaves();
         p.space = space;
         p.brk = 0;
         p.brk_start = 0;

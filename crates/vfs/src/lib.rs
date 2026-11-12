@@ -89,6 +89,40 @@ impl Vfs {
         Ok(self.get(ino)?.kind)
     }
 
+    /// Absolute path of `ino`, built by walking `parent` pointers up to [`ROOT`].
+    /// This is the single source of truth for `getcwd` — the kernel stores a
+    /// process's cwd as an inode, not a string, so the reported path can never
+    /// drift from the tree.
+    pub fn path_of(&self, ino: Ino) -> Result<String, Errno> {
+        self.get(ino)?; // validate
+        if ino == ROOT {
+            return Ok(String::from("/"));
+        }
+        let mut parts: Vec<&str> = Vec::new();
+        let mut cur = ino;
+        // Bounded by inode count: each step moves strictly toward ROOT.
+        for _ in 0..=self.inodes.len() {
+            if cur == ROOT {
+                let mut out = String::new();
+                for name in parts.iter().rev() {
+                    out.push('/');
+                    out.push_str(name);
+                }
+                return Ok(out);
+            }
+            let parent = self.get(cur)?.parent;
+            let name = self
+                .get(parent)?
+                .children
+                .iter()
+                .find_map(|(n, &c)| (c == cur).then_some(n.as_str()))
+                .ok_or(Errno::ENOENT)?;
+            parts.push(name);
+            cur = parent;
+        }
+        Err(Errno(abi::errno::ELOOP))
+    }
+
     /// Looks up a single `name` within directory `dir` (no symlink following).
     pub fn lookup(&self, dir: Ino, name: &str) -> Result<Ino, Errno> {
         let node = self.get(dir)?;
@@ -346,6 +380,21 @@ impl Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_of_walks_parents() {
+        let mut fs = Vfs::new();
+        assert_eq!(fs.path_of(ROOT).unwrap(), "/");
+        let a = fs.mkdir(ROOT, "home", 0o755).unwrap();
+        let b = fs.mkdir(a, "rodolfo", 0o755).unwrap();
+        let c = fs.mkdir(b, ".config", 0o755).unwrap();
+        assert_eq!(fs.path_of(a).unwrap(), "/home");
+        assert_eq!(fs.path_of(b).unwrap(), "/home/rodolfo");
+        assert_eq!(fs.path_of(c).unwrap(), "/home/rodolfo/.config");
+        // resolve("..") then path_of agrees.
+        let up = fs.resolve(c, "..", true).unwrap();
+        assert_eq!(fs.path_of(up).unwrap(), "/home/rodolfo");
+    }
 
     #[test]
     fn create_read_write_file() {

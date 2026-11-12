@@ -35,12 +35,26 @@ struct UserEntry {
 /// Loads `elf` into a fresh process, builds its stack, and schedules a thread
 /// that enters user mode. Returns the process handle.
 pub fn spawn(elf_image: &[u8], argv: &[&str], envp: &[&str]) -> Result<Arc<SpinLock<Process>>, Errno> {
+    spawn_as(elf_image, argv, envp, 0, 0)
+}
+
+/// Spawns a user process running as `uid`/`gid` (0,0 for the selftests; a real
+/// user for the login shell). The ids are set before the thread is enqueued.
+pub fn spawn_as(
+    elf_image: &[u8],
+    argv: &[&str],
+    envp: &[&str],
+    uid: u32,
+    gid: u32,
+) -> Result<Arc<SpinLock<Process>>, Errno> {
     let proc = Process::new().ok_or(Errno::ENOMEM)?;
     let (entry, user_sp, cr3) = {
         let mut p = proc.lock();
         let loaded = elf::load(&mut p.space, elf_image)?;
         let user_sp = build_stack(&mut p.space, &loaded, argv, envp)?;
         p.fds = FdTable::with_stdio();
+        p.uid = uid;
+        p.gid = gid;
         (loaded.entry, user_sp, p.space.cr3())
     };
 
@@ -883,6 +897,175 @@ fn clone_cow_reader_elf() -> Vec<u8> {
     raw_exec_elf(&c)
 }
 
+/// Builds a program exercising the PTY subsystem end to end: open /dev/ptmx
+/// (master), open /dev/pts/0 (slave), write "hi" to the master, read it back
+/// from the slave, and verify. Exits 0 on match. (Assumes ptn 0 — it is the
+/// first and only PTY opened during the self-tests.)
+fn pty_elf() -> Vec<u8> {
+    const V: u64 = 0x40_0000;
+    let headers: u64 = 64 + 56;
+    let base = V + headers;
+    // Data laid out first in the segment; code follows.
+    let mut data: Vec<u8> = Vec::new();
+    let ptmx = base + data.len() as u64;
+    data.extend_from_slice(b"/dev/ptmx\0");
+    let pts = base + data.len() as u64;
+    data.extend_from_slice(b"/dev/pts/0\0");
+    let hi = base + data.len() as u64;
+    data.extend_from_slice(b"hi");
+    let buf = base + data.len() as u64;
+    data.extend_from_slice(&[0, 0]);
+
+    let mut c: Vec<u8> = Vec::new();
+    // master = open(ptmx, O_RDWR)
+    c.extend_from_slice(&[0xB8, 0x02, 0, 0, 0]); // mov eax, 2
+    c.extend_from_slice(&[0x48, 0xBF]);
+    c.extend_from_slice(&ptmx.to_le_bytes()); // movabs rdi, ptmx
+    c.extend_from_slice(&[0xBE, 0x02, 0, 0, 0]); // mov esi, 2 (O_RDWR)
+    c.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+    c.extend_from_slice(&[0x0F, 0x05]); // syscall
+    c.extend_from_slice(&[0x49, 0x89, 0xC4]); // mov r12, rax (master)
+    // slave = open(pts, O_RDWR)
+    c.extend_from_slice(&[0xB8, 0x02, 0, 0, 0]);
+    c.extend_from_slice(&[0x48, 0xBF]);
+    c.extend_from_slice(&pts.to_le_bytes());
+    c.extend_from_slice(&[0xBE, 0x02, 0, 0, 0]);
+    c.extend_from_slice(&[0x31, 0xD2]);
+    c.extend_from_slice(&[0x0F, 0x05]);
+    c.extend_from_slice(&[0x49, 0x89, 0xC5]); // mov r13, rax (slave)
+    // write(master, "hi", 2)
+    c.extend_from_slice(&[0xB8, 0x01, 0, 0, 0]); // mov eax, 1
+    c.extend_from_slice(&[0x44, 0x89, 0xE7]); // mov edi, r12d
+    c.extend_from_slice(&[0x48, 0xBE]);
+    c.extend_from_slice(&hi.to_le_bytes()); // movabs rsi, hi
+    c.extend_from_slice(&[0xBA, 0x02, 0, 0, 0]); // mov edx, 2
+    c.extend_from_slice(&[0x0F, 0x05]);
+    // read(slave, buf, 2)
+    c.extend_from_slice(&[0xB8, 0x00, 0, 0, 0]); // mov eax, 0
+    c.extend_from_slice(&[0x44, 0x89, 0xEF]); // mov edi, r13d
+    c.extend_from_slice(&[0x48, 0xBE]);
+    c.extend_from_slice(&buf.to_le_bytes()); // movabs rsi, buf
+    c.extend_from_slice(&[0xBA, 0x02, 0, 0, 0]); // mov edx, 2
+    c.extend_from_slice(&[0x0F, 0x05]);
+    // verify buf == "hi"
+    c.extend_from_slice(&[0x48, 0xB8]);
+    c.extend_from_slice(&buf.to_le_bytes()); // movabs rax, buf
+    c.extend_from_slice(&[0x0F, 0xB6, 0x08]); // movzx ecx, byte [rax]
+    c.extend_from_slice(&[0x80, 0xF9, 0x68]); // cmp cl, 'h'
+    c.extend_from_slice(&[0x75, 0x00]);
+    let jne1 = c.len() - 1;
+    c.extend_from_slice(&[0x0F, 0xB6, 0x48, 0x01]); // movzx ecx, byte [rax+1]
+    c.extend_from_slice(&[0x80, 0xF9, 0x69]); // cmp cl, 'i'
+    c.extend_from_slice(&[0x75, 0x00]);
+    let jne2 = c.len() - 1;
+    c.extend_from_slice(&[0xB8, 0xE7, 0, 0, 0, 0x31, 0xFF, 0x0F, 0x05]); // exit_group 0
+    let fail = c.len();
+    c.extend_from_slice(&[0xB8, 0xE7, 0, 0, 0, 0xBF, 0x01, 0, 0, 0, 0x0F, 0x05]); // exit_group 1
+
+    let patch8 = |c: &mut Vec<u8>, pos: usize, target: usize| {
+        c[pos] = ((target as i64 - (pos as i64 + 1)) as i8) as u8;
+    };
+    patch8(&mut c, jne1, fail);
+    patch8(&mut c, jne2, fail);
+
+    let mut seg = data;
+    let entry = base + seg.len() as u64;
+    seg.extend_from_slice(&c);
+    raw_exec_elf_at(&seg, entry)
+}
+
+/// Builds a program that proves the pipe primitive end to end: pipe2(), fork,
+/// the child writes "PX" to the write end, the parent reads it from the read
+/// end and verifies, then reaps the child. Exits 0 on match. This validates
+/// pipes independently of busybox/the shell e2e (and its timing).
+fn pipe_selftest_elf() -> Vec<u8> {
+    // r12d = read fd, r13d = write fd; scratch buffers on the stack.
+    let mut c: Vec<u8> = Vec::new();
+    c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x20]); // sub rsp, 32
+    c.extend_from_slice(&[0xB8, 0x25, 0x01, 0x00, 0x00]); // mov eax, 293 (pipe2)
+    c.extend_from_slice(&[0x48, 0x89, 0xE7]); // mov rdi, rsp
+    c.extend_from_slice(&[0x31, 0xF6]); // xor esi, esi
+    c.extend_from_slice(&[0x0F, 0x05]); // syscall
+    c.extend_from_slice(&[0x44, 0x8B, 0x24, 0x24]); // mov r12d, [rsp]
+    c.extend_from_slice(&[0x44, 0x8B, 0x6C, 0x24, 0x04]); // mov r13d, [rsp+4]
+    c.extend_from_slice(&[0xB8, 0x39, 0, 0, 0, 0x0F, 0x05]); // fork
+    c.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+    c.extend_from_slice(&[0x0F, 0x84, 0, 0, 0, 0]); // jz child (rel32)
+    let jz_child = c.len() - 4;
+    // --- parent ---
+    // close(write end) so only the child holds a writer
+    c.extend_from_slice(&[0xB8, 0x03, 0, 0, 0, 0x44, 0x89, 0xEF, 0x0F, 0x05]); // mov eax,3; mov edi,r13d; syscall (close)
+    // n1 = read(read fd, [rsp+8], 8)  -> expect 2 bytes "PX"
+    c.extend_from_slice(&[0xB8, 0x00, 0, 0, 0]); // mov eax, 0
+    c.extend_from_slice(&[0x44, 0x89, 0xE7]); // mov edi, r12d
+    c.extend_from_slice(&[0x48, 0x8D, 0x74, 0x24, 0x08]); // lea rsi, [rsp+8]
+    c.extend_from_slice(&[0xBA, 0x08, 0, 0, 0]); // mov edx, 8
+    c.extend_from_slice(&[0x0F, 0x05]); // syscall
+    c.extend_from_slice(&[0x48, 0x83, 0xF8, 0x02]); // cmp rax, 2
+    c.extend_from_slice(&[0x75, 0x00]); let jne_n1 = c.len() - 1; // jne fail
+    c.extend_from_slice(&[0x0F, 0xB6, 0x4C, 0x24, 0x08]); // movzx ecx, byte [rsp+8]
+    c.extend_from_slice(&[0x80, 0xF9, 0x50]); // cmp cl, 'P'
+    c.extend_from_slice(&[0x75, 0x00]); let jne_p = c.len() - 1;
+    c.extend_from_slice(&[0x0F, 0xB6, 0x4C, 0x24, 0x09]); // movzx ecx, byte [rsp+9]
+    c.extend_from_slice(&[0x80, 0xF9, 0x58]); // cmp cl, 'X'
+    c.extend_from_slice(&[0x75, 0x00]); let jne_x = c.len() - 1;
+    // n2 = read(read fd, [rsp+16], 8) -> expect 0 (EOF: all writers closed)
+    c.extend_from_slice(&[0xB8, 0x00, 0, 0, 0]);
+    c.extend_from_slice(&[0x44, 0x89, 0xE7]);
+    c.extend_from_slice(&[0x48, 0x8D, 0x74, 0x24, 0x10]); // lea rsi, [rsp+16]
+    c.extend_from_slice(&[0xBA, 0x08, 0, 0, 0]);
+    c.extend_from_slice(&[0x0F, 0x05]);
+    c.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+    c.extend_from_slice(&[0x75, 0x00]); let jnz_eof = c.len() - 1; // jnz fail (n2 != 0)
+    // wait4(-1,0,0,0)
+    c.extend_from_slice(&[0xB8, 0x3D, 0, 0, 0, 0xBF, 0xFF, 0xFF, 0xFF, 0xFF, 0x31, 0xF6, 0x31, 0xD2, 0x45, 0x31, 0xD2, 0x0F, 0x05]);
+    c.extend_from_slice(&[0xB8, 0xE7, 0, 0, 0, 0x31, 0xFF, 0x0F, 0x05]); // exit_group 0
+    let fail = c.len();
+    c.extend_from_slice(&[0xB8, 0xE7, 0, 0, 0, 0xBF, 0x01, 0, 0, 0, 0x0F, 0x05]); // exit_group 1
+    let child = c.len();
+    // --- child ---
+    c.extend_from_slice(&[0xB8, 0x03, 0, 0, 0, 0x44, 0x89, 0xE7, 0x0F, 0x05]); // close(read fd): mov eax,3; mov edi,r12d; syscall
+    c.extend_from_slice(&[0x66, 0xC7, 0x44, 0x24, 0x18, 0x50, 0x58]); // mov word [rsp+24], 0x5850 ("PX")
+    c.extend_from_slice(&[0xB8, 0x01, 0, 0, 0]); // mov eax, 1 (write)
+    c.extend_from_slice(&[0x44, 0x89, 0xEF]); // mov edi, r13d
+    c.extend_from_slice(&[0x48, 0x8D, 0x74, 0x24, 0x18]); // lea rsi, [rsp+24]
+    c.extend_from_slice(&[0xBA, 0x02, 0, 0, 0]); // mov edx, 2
+    c.extend_from_slice(&[0x0F, 0x05]);
+    c.extend_from_slice(&[0xB8, 0xE7, 0, 0, 0, 0x31, 0xFF, 0x0F, 0x05]); // exit_group 0 (closes child's write end -> parent EOF)
+
+    let patch8 = |c: &mut Vec<u8>, pos: usize, target: usize| {
+        let rel = target as i64 - (pos as i64 + 1);
+        assert!((-128..=127).contains(&rel));
+        c[pos] = (rel as i8) as u8;
+    };
+    for &pos in &[jne_n1, jne_p, jne_x, jnz_eof] {
+        patch8(&mut c, pos, fail);
+    }
+    let rel = child as i64 - (jz_child as i64 + 4);
+    let rb = (rel as i32).to_le_bytes();
+    c[jz_child..jz_child + 4].copy_from_slice(&rb);
+    raw_exec_elf(&c)
+}
+
+/// Reclamation observability: spawns a batch of tiny processes, waits for each
+/// to exit, reaps it, and logs the free-frame count before and after. With leaf
+/// reclamation working the two counts are close (only a few page-table frames
+/// per process leak, pending the teardown/CR3-eviction step); a large drop would
+/// indicate leaf frames are leaking.
+pub fn run_reclaim_selftest() {
+    let (before, _) = crate::mm::phys::stats();
+    for _ in 0..4 {
+        if let Ok(proc) = spawn(&hello_elf(), &["/r"], &["PATH=/bin"]) {
+            let _ = await_exit(&proc, "reclaim");
+        }
+        crate::process::reap_orphan_zombies();
+    }
+    let (after, _) = crate::mm::phys::stats();
+    crate::log::info!(
+        "reclaim selftest: free frames {before} -> {after} after 4 spawn+exit+reap (leaf frames reclaimed; page-table frames leak until teardown lands)"
+    );
+}
+
 /// Runs the memory-management self-tests (CoW fork, anonymous demand paging).
 /// Each must exit 0; anything else indicates a VM correctness bug.
 pub fn run_vm_selftests() {
@@ -895,24 +1078,16 @@ pub fn run_vm_selftests() {
         ("anon demand paging", demand_mmap_elf()),
         ("cow RO-code + RW-data same PT (shared-space shootdown)", cow_regression_elf()),
         ("clone(CLONE_VM) reader sees CoW write (shootdown)", clone_cow_reader_elf()),
+        ("pty: master<->slave via /dev/ptmx + /dev/pts/0", pty_elf()),
+        ("pipe2 + fork read/write + EOF", pipe_selftest_elf()),
     ] {
         match spawn(&image, &["/vm-test"], &[]) {
             Ok(proc) => {
-                let mut spins = 0u64;
-                let code = loop {
-                    if let Some(c) = proc.lock().exit_code {
-                        break Some(c);
-                    }
-                    scheduler::yield_now();
-                    spins += 1;
-                    if spins > 50_000_000 {
-                        break None;
-                    }
-                };
-                match code {
-                    Some(0) => crate::log::info!("vm selftest [{name}]: OK"),
-                    Some(c) => crate::log::error!("vm selftest [{name}]: FAILED (exit {c})"),
-                    None => crate::log::error!("vm selftest [{name}]: TIMED OUT"),
+                let code = await_exit(&proc, name);
+                if code == 0 {
+                    crate::log::info!("vm selftest [{name}]: OK");
+                } else {
+                    crate::log::error!("vm selftest [{name}]: FAILED (exit {code})");
                 }
             }
             Err(e) => crate::log::error!("vm selftest [{name}]: spawn failed: {e:?}"),
@@ -927,30 +1102,63 @@ pub fn run_signal_selftest() {
     let image = signal_handler_elf();
     match spawn(&image, &["/sig-test"], &[]) {
         Ok(proc) => {
-            let mut spins = 0u64;
-            let code = loop {
-                if let Some(c) = proc.lock().exit_code {
-                    break Some(c);
-                }
-                scheduler::yield_now();
-                spins += 1;
-                if spins > 50_000_000 {
-                    break None;
-                }
-            };
-            match code {
-                Some(0) => crate::log::info!(
+            let code = await_exit(&proc, "signal");
+            if code == 0 {
+                crate::log::info!(
                     "signal selftest: SIGUSR1 handler ran and rt_sigreturn resumed cleanly (exit 0)"
-                ),
-                Some(c) => crate::log::error!("signal selftest: unexpected exit status {c}"),
-                None => crate::log::error!("signal selftest: TIMED OUT"),
+                );
+            } else {
+                crate::log::error!("signal selftest: unexpected exit status {code}");
             }
         }
         Err(e) => crate::log::error!("signal selftest: spawn failed: {e:?}"),
     }
 }
 
-/// Runs the ring-3 security self-tests. Each spawns a hostile user program that
+/// Dumps every CPU's current thread (id/state) for diagnosing a stuck self-test.
+/// A running process that never exits is almost always a lost wakeup or a lock
+/// held across a block; this converts an otherwise silent hang into a panic with
+/// a backtrace and this per-CPU snapshot.
+fn watchdog_dump(name: &str) {
+    crate::log::error!("WATCHDOG: self-test '{name}' did not finish in time; per-CPU state:");
+    let n = crate::percpu::count();
+    for id in 0..n {
+        if let Some(cpu) = crate::percpu::by_id(id) {
+            let cur = cpu.current.load(core::sync::atomic::Ordering::Acquire);
+            let (tid, ltid, state) = if cur.is_null() {
+                (0, 0, crate::thread::State::Finished)
+            } else {
+                // SAFETY: `cur` is this CPU's live current thread pointer.
+                unsafe { ((*cur).tid(), (*cur).linux_tid, (*cur).state) }
+            };
+            let preempt = cpu.preempt_count.load(core::sync::atomic::Ordering::Relaxed);
+            crate::log::error!(
+                "  cpu{id}: current tid={tid:#x} linux_tid={ltid} state={state:?} preempt_count={preempt}"
+            );
+        }
+    }
+}
+
+/// Waits for `proc` to exit, returning its status. A TSC-based watchdog turns a
+/// stuck self-test into a diagnostic dump + panic instead of an indefinite spin.
+fn await_exit(proc: &Arc<SpinLock<Process>>, name: &str) -> i32 {
+    // SAFETY: `_rdtsc` reads the timestamp counter.
+    let start = unsafe { core::arch::x86_64::_rdtsc() };
+    // Generous ceiling (~tens of seconds under TCG); only ever hit by a real hang.
+    const WATCHDOG_CYCLES: u64 = 120_000_000_000;
+    loop {
+        if let Some(c) = proc.lock().exit_code {
+            return c;
+        }
+        scheduler::yield_now();
+        if unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start) > WATCHDOG_CYCLES {
+            watchdog_dump(name);
+            panic!("self-test watchdog: '{name}' never finished");
+        }
+    }
+}
+
+/// Runs the ring-3 security self-tests. Each spawns a hostile user program that/// Runs the ring-3 security self-tests. Each spawns a hostile user program that
 /// must be *contained to its own process* — killed by a signal (bad instruction
 /// / bad memory access) or have its offending syscall rejected — without ever
 /// panicking or wedging the kernel. Every case must reach an exit status, and
@@ -973,32 +1181,21 @@ pub fn run_security_selftests() {
     for (name, image, expected) in cases {
         match spawn(&image, &["/sec-test"], &[]) {
             Ok(proc) => {
-                let mut spins = 0u64;
-                let code = loop {
-                    if let Some(c) = proc.lock().exit_code {
-                        break Some(c);
-                    }
-                    scheduler::yield_now();
-                    spins += 1;
-                    if spins > 50_000_000 {
-                        break None;
-                    }
-                };
-                match code {
-                    Some(c) if c == expected => {
-                        crate::log::info!("security selftest [{name}]: contained, exit status {c}");
-                        passed += 1;
-                    }
-                    Some(c) => crate::log::error!(
-                        "security selftest [{name}]: FAILED -- exit status {c}, expected {expected}"
-                    ),
-                    None => crate::log::error!("security selftest [{name}]: TIMED OUT"),
+                let code = await_exit(&proc, name);
+                if code == expected {
+                    crate::log::info!("security selftest [{name}]: contained, exit status {code}");
+                    passed += 1;
+                } else {
+                    crate::log::error!(
+                        "security selftest [{name}]: FAILED -- exit status {code}, expected {expected}"
+                    );
                 }
             }
             Err(e) => crate::log::error!("security selftest [{name}]: spawn failed: {e:?}"),
         }
     }
     crate::log::info!("security selftests: {passed}/{total} processes contained; kernel alive");
+    crate::process::reap_orphan_zombies();
 }
 
 /// Measures getpid round-trip latency by running a tight getpid loop in user
@@ -1057,29 +1254,53 @@ pub fn run_selftest() {
 /// (`argv[0] = "/bin/sh"`). The calling (bootstrap) thread then yields forever,
 /// letting the scheduler run the shell. Only reached on a real boot.
 pub fn run_init() {
-    let image = match crate::fs::read_file("/bin/busybox") {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            crate::log::error!("init: /bin/busybox not found in initramfs: {e:?}");
-            return;
-        }
-    };
-    crate::log::info!("init: loading /bin/busybox ({} KiB) as /bin/sh", image.len() / 1024);
-    match spawn(
-        &image,
-        &["/bin/sh", "-i"],
-        &["PATH=/bin", "HOME=/", "TERM=xterm-256color", "PS1=fluos$ "],
-    ) {
-        Ok(proc) => {
-            // Make the shell's process group the terminal foreground group so
-            // Ctrl-C/Ctrl-Z reach it (and the jobs it runs in the same group).
-            let pgid = proc.lock().pgid;
-            crate::fs::set_foreground_pgrp(pgid);
-            crate::log::info!("init: shell started (foreground pgrp {pgid})");
-            loop {
-                scheduler::yield_now();
+    // Preferred login shell first, then fallbacks. argv[0] starting with '-'
+    // makes it a login shell (reads /etc/zprofile, ~/.zprofile, ~/.zshrc).
+    const CANDIDATES: &[(&str, &str)] = &[
+        ("/usr/bin/zsh", "-zsh"),
+        ("/bin/sh", "-sh"),
+        ("/bin/busybox", "sh"),
+    ];
+    const UID: u32 = 1000;
+    const GID: u32 = 1000;
+    let envp = &[
+        "HOME=/home/rodolfo",
+        "USER=rodolfo",
+        "LOGNAME=rodolfo",
+        "SHELL=/usr/bin/zsh",
+        "TERM=xterm-256color",
+        "PATH=/usr/bin:/usr/local/bin:/bin",
+        "PWD=/home/rodolfo",
+    ];
+
+    for (path, arg0) in CANDIDATES {
+        let image = match crate::fs::read_file(path) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        crate::log::info!("init: starting {path} ({} KiB) as login shell", image.len() / 1024);
+        // busybox fallback needs an explicit -i (its arg0 convention differs);
+        // zsh/sh take a leading-'-' arg0 for a login shell.
+        let argv: &[&str] = if *path == "/bin/busybox" {
+            &["/bin/busybox", "sh", "-i"]
+        } else {
+            &[arg0, "-l"]
+        };
+        match spawn_as(&image, argv, envp, UID, GID) {
+            Ok(proc) => {
+                // The shell is the session/foreground group leader on the console
+                // (its controlling terminal), so Ctrl-C/Ctrl-Z reach its jobs.
+                let pgid = proc.lock().pgid;
+                crate::fs::set_foreground_pgrp(pgid);
+                crate::log::info!("init: {path} started (foreground pgrp {pgid}, uid {UID})");
+                // Act as init: reap orphaned zombies (reclaiming their frames).
+                loop {
+                    scheduler::yield_now();
+                    crate::process::reap_orphan_zombies();
+                }
             }
+            Err(e) => crate::log::error!("init: failed to start {path}: {e:?}"),
         }
-        Err(e) => crate::log::error!("init: failed to start shell: {e:?}"),
     }
+    crate::log::error!("init: no login shell found (tried zsh, sh, busybox)");
 }

@@ -62,6 +62,61 @@ pub fn set_termios(t: types::Termios) {
 /// signals (Ctrl-C/Ctrl-Z). Zero means "unset" (no signals generated).
 static FOREGROUND_PGRP: AtomicI32 = AtomicI32::new(0);
 
+/// The console's window size (TIOCGWINSZ/TIOCSWINSZ on /dev/console).
+static CONSOLE_WINSIZE: SpinLock<types::Winsize> =
+    SpinLock::new(types::Winsize { ws_row: 40, ws_col: 128, ws_xpixel: 0, ws_ypixel: 0 });
+
+/// The console window size.
+pub fn console_winsize() -> types::Winsize {
+    *CONSOLE_WINSIZE.lock()
+}
+
+/// Sets the console window size; returns the foreground pgrp to SIGWINCH.
+pub fn set_console_winsize(ws: types::Winsize) -> i32 {
+    *CONSOLE_WINSIZE.lock() = ws;
+    FOREGROUND_PGRP.load(Ordering::Relaxed)
+}
+
+/// Classifies an open file as a kind of terminal, for ioctl dispatch.
+pub enum TtyKind {
+    Console,
+    PtyMaster(Arc<Pty>),
+    PtySlave(Arc<Pty>),
+    NotTty,
+}
+
+/// Returns the terminal kind of `file` (for ioctl).
+pub fn tty_kind(file: &Arc<SpinLock<OpenFile>>) -> TtyKind {
+    match &file.lock().kind {
+        FileKind::Device(d) if *d == dev::CONSOLE || *d == dev::TTY => TtyKind::Console,
+        FileKind::PtyMaster(p) => TtyKind::PtyMaster(p.clone()),
+        FileKind::PtySlave(p) => TtyKind::PtySlave(p.clone()),
+        _ => TtyKind::NotTty,
+    }
+}
+
+/// Whether an open file is readable right now (for poll/select). Blocking kinds
+/// (pipe/pty) report real readiness; everything else is treated as ready.
+pub fn poll_readable(file: &Arc<SpinLock<OpenFile>>) -> bool {
+    let (pipe, pty) = {
+        let f = file.lock();
+        match &f.kind {
+            FileKind::Pipe { pipe, write_end: false } => (Some(pipe.clone()), None),
+            FileKind::PtyMaster(p) => (None, Some((p.clone(), true))),
+            FileKind::PtySlave(p) => (None, Some((p.clone(), false))),
+            _ => return true,
+        }
+    };
+    if let Some(pipe) = pipe {
+        let g = pipe.inner.lock();
+        return !g.buf.is_empty() || g.writers == 0;
+    }
+    if let Some((pty, from_master)) = pty {
+        return pty_readable(&pty, from_master);
+    }
+    true
+}
+
 /// Sets the foreground process group of the controlling terminal.
 pub fn set_foreground_pgrp(pgid: i32) {
     FOREGROUND_PGRP.store(pgid, Ordering::Relaxed);
@@ -204,7 +259,7 @@ impl Pipe {
 /// Reads from the read end, blocking while the pipe is empty and writers remain.
 /// Returns 0 at EOF (all write ends closed) and `ERESTARTSYS` if a signal is
 /// pending (so it can be delivered on the syscall-return path).
-fn pipe_read(pipe: &Arc<Pipe>, buf: &mut [u8]) -> SysResult {
+fn pipe_read(pipe: &Arc<Pipe>, buf: &mut [u8], nonblock: bool) -> SysResult {
     if buf.is_empty() {
         return Ok(0);
     }
@@ -223,6 +278,9 @@ fn pipe_read(pipe: &Arc<Pipe>, buf: &mut [u8]) -> SysResult {
         if inner.writers == 0 {
             return Ok(0); // EOF: no writers and buffer drained
         }
+        if nonblock {
+            return Err(Errno::EAGAIN);
+        }
         if crate::signal::current_has_deliverable() {
             return Err(Errno::ERESTARTSYS);
         }
@@ -236,7 +294,7 @@ fn pipe_read(pipe: &Arc<Pipe>, buf: &mut [u8]) -> SysResult {
 /// Writes to the write end, blocking while the pipe is full and readers remain.
 /// Returns the number of bytes written (>=1 once it makes progress), `EPIPE`
 /// (after raising SIGPIPE) if all readers have gone, or `ERESTARTSYS`.
-fn pipe_write(pipe: &Arc<Pipe>, buf: &[u8]) -> SysResult {
+fn pipe_write(pipe: &Arc<Pipe>, buf: &[u8], nonblock: bool) -> SysResult {
     if buf.is_empty() {
         return Ok(0);
     }
@@ -259,6 +317,9 @@ fn pipe_write(pipe: &Arc<Pipe>, buf: &[u8]) -> SysResult {
             drop(g);
             crate::scheduler::wake_all(&pipe.read_wq); // data available
             return Ok(n as u64);
+        }
+        if nonblock {
+            return Err(Errno::EAGAIN);
         }
         if crate::signal::current_has_deliverable() {
             return Err(Errno::ERESTARTSYS);
@@ -616,6 +677,14 @@ impl FdTable {
     pub fn fork_clone(&self) -> FdTable {
         FdTable { fds: self.fds.clone() }
     }
+
+    /// Removes and returns all descriptor slots, leaving the table empty. The
+    /// caller drops the returned `Vec` to close the files — do it OUTSIDE any
+    /// lock, since closing a pipe/pty end wakes blocked peers (so a process exit
+    /// delivers EOF/EPIPE immediately, not only when it is later reaped).
+    pub fn take_all(&mut self) -> Vec<Option<Arc<SpinLock<OpenFile>>>> {
+        core::mem::take(&mut self.fds)
+    }
 }
 
 // --- device and file I/O ---------------------------------------------------
@@ -641,7 +710,7 @@ pub fn read(file: &Arc<SpinLock<OpenFile>>, buf: &mut [u8]) -> SysResult {
         (blk, nb)
     };
     match blk {
-        Some(Blk::Pipe(pipe)) => return pipe_read(&pipe, buf),
+        Some(Blk::Pipe(pipe)) => return pipe_read(&pipe, buf, nonblock),
         Some(Blk::PtyM(pty)) => return pty_read(&pty, true, buf, nonblock),
         Some(Blk::PtyS(pty)) => return pty_read(&pty, false, buf, nonblock),
         None => {}
@@ -681,7 +750,7 @@ pub fn write(file: &Arc<SpinLock<OpenFile>>, buf: &[u8]) -> SysResult {
         (blk, nb)
     };
     match blk {
-        Some(Blk::Pipe(pipe)) => return pipe_write(&pipe, buf),
+        Some(Blk::Pipe(pipe)) => return pipe_write(&pipe, buf, nonblock),
         Some(Blk::PtyM(pty)) => return pty_write(&pty, true, buf, nonblock),
         Some(Blk::PtyS(pty)) => return pty_write(&pty, false, buf, nonblock),
         None => {}
@@ -706,6 +775,13 @@ pub fn write(file: &Arc<SpinLock<OpenFile>>, buf: &[u8]) -> SysResult {
 pub fn open(cwd: Ino, path: &str, flags: u64, mode: u32) -> Result<Arc<SpinLock<OpenFile>>, Errno> {
     let readable = flags & 0b11 != types::O_WRONLY;
     let writable = flags & 0b11 != types::O_RDONLY;
+    // PTY slaves live at /dev/pts/N but have no persistent node; resolve them to
+    // the live PTY by number (the path ptsname() hands back is absolute).
+    if let Some(n) = path.strip_prefix("/dev/pts/") {
+        if let Ok(ptn) = n.parse::<u32>() {
+            return open_pts(ptn, flags);
+        }
+    }
     with_vfs(|v| {
         let ino = match v.resolve(cwd, path, true) {
             Ok(ino) => ino,

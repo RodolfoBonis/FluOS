@@ -17,9 +17,12 @@ fn limine_conf(cmdline: &str, with_initramfs: bool) -> String {
     )
 }
 
-/// Locates an initramfs to embed: prefer the ports-rootfs output, fall back to
-/// the kernel test image.
+/// Locates an initramfs to embed: `$FLUOS_INITRAMFS` if set, else prefer the
+/// ports-rootfs output, falling back to the kernel test image.
 fn initramfs_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("FLUOS_INITRAMFS") {
+        return Some(PathBuf::from(path));
+    }
     let candidates = [
         root().join("build/initramfs.cpio"),
         root().join("build/kernel-test/initramfs.cpio"),

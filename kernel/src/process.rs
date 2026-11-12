@@ -8,6 +8,7 @@
 //! file-descriptor table, pid).
 
 use crate::fs::FdTable;
+use vfs::Ino;
 use crate::signal::SignalState;
 use crate::scheduler::WaitQueue;
 use crate::mm::{paging, phys};
@@ -302,6 +303,9 @@ impl AddressSpace {
                         } else {
                             f
                         };
+                        // The child now shares this frame: bump its refcount so
+                        // it is freed only when the last owner drops it.
+                        phys::frame_incref(frame);
                         child.map_page_raw(vaddr, frame, shared);
                     }
                 }
@@ -363,6 +367,17 @@ impl AddressSpace {
             return Cow::Fault;
         }
         let old = unsafe { (*pte).addr().as_u64() };
+        // Sole owner (refcount 1): no copy needed — just take it writable in
+        // place and clear the CoW marker. This is the common post-exec case.
+        if phys::frame_refcount(old) <= 1 {
+            let new_flags = (f & !PTE_COW) | Flags::WRITABLE;
+            // SAFETY: upgrade this leaf's permissions in place.
+            unsafe { (*pte).set_flags(new_flags) };
+            x86_64::instructions::tlb::flush(VirtAddr::new(page));
+            return Cow::Copied;
+        }
+        // Shared: copy into a private frame, repoint the leaf, and drop this
+        // space's reference to the old (shared) frame.
         let Some(new) = phys::alloc_frame() else {
             return Cow::Fault;
         };
@@ -374,14 +389,82 @@ impl AddressSpace {
                 PAGE as usize,
             );
         }
-        // Point the leaf at the private copy and make it writable, clearing the
-        // CoW marker. Now that intermediate entries are always writable/user,
-        // this in-place upgrade + invlpg takes effect on the retry.
         let new_flags = (f & !PTE_COW) | Flags::WRITABLE;
         // SAFETY: re-point this leaf at the private copy, now writable.
         unsafe { (*pte).set_addr(PhysAddr::new(new), new_flags) };
         x86_64::instructions::tlb::flush(VirtAddr::new(page));
+        // This space no longer references the shared frame.
+        phys::free_user_frame(old);
         Cow::Copied
+    }
+
+    /// Reclaims every user data (leaf) frame in this address space, dropping one
+    /// reference each (freeing the frame when it was the last owner). Called when
+    /// the owning process has exited: no thread runs this space, so there is no
+    /// live TLB to shoot down — an idle CPU still parked on this CR3 (lazy TLB)
+    /// executes only kernel code and never touches these user addresses.
+    ///
+    /// The page-table frames themselves (PML4/PDPT/PD/PT) are intentionally NOT
+    /// freed yet: reclaiming them safely needs the CR3-eviction/shootdown step
+    /// (a CPU must never run on freed tables), which lands with QEMU validation.
+    /// Leaf frames are the bulk of memory; the table frames are a few per space.
+    pub fn free_leaves(&mut self) {
+        let hhdm = self.hhdm;
+        // SAFETY: the PML4 is HHDM-mapped; we only read present, non-huge entries
+        // in the user half (0..256) and free the leaf frames they point at.
+        unsafe {
+            let pml4 = &*((hhdm + self.pml4_phys) as *const PageTable);
+            for i in 0..256 {
+                if !pml4[i].flags().contains(Flags::PRESENT) {
+                    continue;
+                }
+                let pdpt = &*((hhdm + pml4[i].addr().as_u64()) as *const PageTable);
+                for e3 in pdpt.iter() {
+                    if !e3.flags().contains(Flags::PRESENT) || e3.flags().contains(Flags::HUGE_PAGE) {
+                        continue;
+                    }
+                    let pd = &*((hhdm + e3.addr().as_u64()) as *const PageTable);
+                    for e2 in pd.iter() {
+                        if !e2.flags().contains(Flags::PRESENT) || e2.flags().contains(Flags::HUGE_PAGE) {
+                            continue;
+                        }
+                        let pt = &*((hhdm + e2.addr().as_u64()) as *const PageTable);
+                        for e1 in pt.iter() {
+                            if e1.flags().contains(Flags::PRESENT) {
+                                phys::free_user_frame(e1.addr().as_u64());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Unmaps `[vaddr, vaddr+size)`, clearing the leaf PTEs and RETURNING the
+    /// physical frames that were mapped (without freeing them). The caller frees
+    /// them with [`phys::free_user_frame`] only AFTER any required TLB shootdown,
+    /// so a peer CPU cannot write a freed-then-recycled frame through a stale
+    /// entry (use-after-free). Used by `munmap`.
+    pub fn unmap_region(&mut self, vaddr: u64, size: u64) -> Vec<u64> {
+        let start = vaddr & !(PAGE - 1);
+        let end = (vaddr.saturating_add(size) + PAGE - 1) & !(PAGE - 1);
+        self.regions.retain(|r| r.end <= start || r.start >= end);
+        let mut freed = Vec::new();
+        let mut a = start;
+        while a < end {
+            // SAFETY: walk reads this space's tables; we hold &mut self.
+            if let Some(pte) = unsafe { self.walk_pte(a) } {
+                let f = unsafe { (*pte).flags() };
+                if f.contains(Flags::PRESENT) {
+                    let frame = unsafe { (*pte).addr().as_u64() };
+                    // SAFETY: clear the leaf now; the frame is freed later.
+                    unsafe { (*pte).set_unused() };
+                    freed.push(frame);
+                }
+            }
+            a += PAGE;
+        }
+        freed
     }
 
     /// Translates a user virtual address to a physical address, if mapped.
@@ -424,6 +507,19 @@ pub struct Process {
     /// Number of live threads in this thread group (1 until `clone(CLONE_VM)`
     /// adds more). The last thread to exit reports the group's exit status.
     pub thread_count: u32,
+    /// Real/effective user and group ids (login shell runs as a real user).
+    pub uid: u32,
+    pub gid: u32,
+    /// Current working directory, stored as an inode so `getcwd` is always
+    /// consistent with the live tree (see `vfs::path_of`). Inherited across
+    /// `fork`.
+    pub cwd: Ino,
+    /// File-creation mask applied to `mode` on `open(O_CREAT)`/`mkdir`.
+    pub umask: u32,
+    /// Alternate signal stack set via `sigaltstack`: `(ss_sp, ss_size, ss_flags)`.
+    /// Stored so a future `SA_ONSTACK` delivery can honour it; `ss_flags`
+    /// defaults to `SS_DISABLE` (2).
+    pub altstack: (u64, u64, i32),
 }
 
 impl Process {
@@ -445,6 +541,11 @@ impl Process {
             sig: SignalState::new(),
             main_thread: 0,
             thread_count: 1,
+            uid: 0,
+            gid: 0,
+            cwd: vfs::ROOT,
+            umask: 0o022,
+            altstack: (0, 0, 2),
         })))
     }
 }
@@ -496,16 +597,28 @@ pub unsafe fn switch_mm(next: *mut crate::thread::Thread) {
     if cr3 != 0 {
         cpu.current_proc.store(proc_ptr, Ordering::Relaxed);
         crate::arch::x86_64::user::set_kernel_stack(kstack_top);
+        // User thread: switch to its address space only if different from the
+        // one currently loaded.
+        if cpu.active_cr3.load(Ordering::Relaxed) != cr3 {
+            let frame = PhysFrame::containing_address(PhysAddr::new(cr3));
+            // SAFETY: `cr3` is a valid PML4 whose higher half maps the kernel.
+            unsafe { Cr3::write(frame, Cr3Flags::empty()) };
+            cpu.active_cr3.store(cr3, Ordering::Relaxed);
+        }
     } else {
+        // Kernel-only thread (idle / kernel worker): LAZY TLB. Keep whatever user
+        // CR3 is already loaded rather than switching to the kernel PML4 — the
+        // kernel higher half is mapped in every address space, so kernel code,
+        // stack, and data are reachable. This avoids two CR3 reloads (and two
+        // full TLB flushes) on every user<->idle bounce, which is a large win
+        // under TCG softmmu. active_cr3 is left unchanged so the next user thread
+        // with that same CR3 skips the reload entirely.
+        //
+        // SAFETY NOTE: this holds a possibly-foreign user CR3 while in the
+        // kernel. It is sound only because user address spaces are never freed
+        // yet; frame reclamation must flush/step off a dying space's CR3 from any
+        // CPU parked on it before freeing its page tables.
         cpu.current_proc.store(0, Ordering::Relaxed);
-    }
-
-    let target = if cr3 == 0 { paging::kernel_pml4_phys() } else { cr3 };
-    if cpu.active_cr3.load(Ordering::Relaxed) != target {
-        let frame = PhysFrame::containing_address(PhysAddr::new(target));
-        // SAFETY: `target` is a valid PML4 whose higher half maps the kernel.
-        unsafe { Cr3::write(frame, Cr3Flags::empty()) };
-        cpu.active_cr3.store(target, Ordering::Relaxed);
     }
 }
 
@@ -530,6 +643,11 @@ impl Process {
             sig: parent.sig.forked(),
             main_thread: 0,
             thread_count: 1,
+            uid: parent.uid,
+            gid: parent.gid,
+            cwd: parent.cwd,
+            umask: parent.umask,
+            altstack: parent.altstack,
         })))
     }
 }
@@ -543,13 +661,50 @@ pub fn reap_child(parent_pid: i32) -> Option<(i32, i32)> {
         g.ppid == parent_pid && g.exit_code.is_some()
     })?;
     let child = procs.remove(idx);
-    let g = child.lock();
-    Some((g.pid, g.exit_code.unwrap_or(0)))
+    drop(procs); // release PROCS before the (potentially long) frame reclaim
+    let mut g = child.lock();
+    let result = (g.pid, g.exit_code.unwrap_or(0));
+    // Reclaim the child's user memory now that it is reaped. Shared (CoW) frames
+    // are only freed when the child held the last reference.
+    g.space.free_leaves();
+    drop(g);
+    Some(result)
 }
 
 /// Whether `parent_pid` has any live (unreaped) children.
 pub fn has_children(parent_pid: i32) -> bool {
     PROCS.lock().iter().any(|p| p.lock().ppid == parent_pid)
+}
+
+/// Reaps exited processes that no live parent will `wait4` (orphans whose parent
+/// is init/pid 1, which is the role the kernel plays for its own spawned
+/// processes). Frees each one's user frames and removes it. Returns the count
+/// reaped. Call periodically from the init/idle path so kernel-spawned and
+/// orphaned processes don't leak.
+pub fn reap_orphan_zombies() -> usize {
+    // Collect orphan zombies under the PROCS lock, then free their memory with
+    // the lock released (free_leaves can be long).
+    let orphans: Vec<Arc<SpinLock<Process>>> = {
+        let mut procs = PROCS.lock();
+        let mut taken = Vec::new();
+        procs.retain(|p| {
+            let g = p.lock();
+            let orphan_zombie = g.exit_code.is_some() && g.ppid <= 1;
+            drop(g);
+            if orphan_zombie {
+                taken.push(p.clone());
+                false // remove from PROCS
+            } else {
+                true
+            }
+        });
+        taken
+    };
+    let n = orphans.len();
+    for proc in orphans {
+        proc.lock().space.free_leaves();
+    }
+    n
 }
 
 /// Wait queue a parent blocks on in `wait4`; woken whenever any process exits.

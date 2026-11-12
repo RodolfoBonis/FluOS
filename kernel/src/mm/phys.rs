@@ -12,9 +12,10 @@
 //! metadata external so those caches can be added without disturbing it.
 
 use crate::boot;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use limine::memmap;
 use mm::buddy::{Buddy, Node};
+use mm::refcount::RefCounts;
 use crate::sync::SpinLock;
 
 /// Page/frame size in bytes.
@@ -30,6 +31,14 @@ static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
 /// IRQ-safe: the timer tick path can allocate (runqueue growth), so taking
 /// this lock must disable interrupts to avoid a same-CPU deadlock (C3).
 static ALLOCATOR: SpinLock<Option<Buddy<'static>>> = SpinLock::new(None);
+
+/// Per-frame reference counts (for CoW sharing + reclamation), covering the
+/// managed span starting at `REFC_BASE`. Installed by [`init_refcounts`] once
+/// the heap is up; before then, refcount ops are no-ops (early boot uses no
+/// user frames). The backing slice is leaked for `'static`.
+static REFCOUNTS: SpinLock<Option<RefCounts<'static>>> = SpinLock::new(None);
+static REFC_BASE: AtomicUsize = AtomicUsize::new(0);
+static REFC_LEN: AtomicUsize = AtomicUsize::new(0);
 
 /// HHDM offset captured at init; valid after [`init`] has run.
 pub fn hhdm_offset() -> u64 {
@@ -111,6 +120,8 @@ pub fn init(hhdm: u64) {
 
     let free = buddy.free_frames();
     *ALLOCATOR.lock() = Some(buddy);
+    REFC_BASE.store(base_frame, Ordering::Relaxed);
+    REFC_LEN.store(frames, Ordering::Relaxed);
     crate::log::info!(
         "frame allocator: {} MiB free ({} frames), {} KiB metadata",
         free as u64 * FRAME_SIZE / (1024 * 1024),
@@ -143,7 +154,12 @@ pub fn alloc_frame() -> Option<u64> {
 /// first. The block is at least `count` frames (rounded up to a power of two).
 pub fn alloc_frames(count: usize) -> Option<u64> {
     let frame = ALLOCATOR.lock().as_mut()?.alloc_frames(count)?;
-    Some(frame as u64 * FRAME_SIZE)
+    let phys = frame as u64 * FRAME_SIZE;
+    // Start every freshly allocated frame at refcount 1, so user frames can be
+    // shared (incref) and reclaimed (free_user_frame) symmetrically. Kernel
+    // frames freed via free_frames ignore this.
+    frame_set_ref(phys, 1);
+    Some(phys)
 }
 
 /// Allocates one frame and zeroes it. Page-table frames must be zeroed before
@@ -156,6 +172,71 @@ pub fn alloc_frame_zeroed() -> Option<u64> {
         core::ptr::write_bytes(phys_to_virt(phys) as *mut u8, 0, FRAME_SIZE as usize);
     }
     Some(phys)
+}
+
+/// Allocates the per-frame reference-count table from the heap. Call once, after
+/// the heap is online. Until then refcount operations are inert.
+pub fn init_refcounts() {
+    let n = REFC_LEN.load(Ordering::Relaxed);
+    if n == 0 {
+        return;
+    }
+    // One zeroed AtomicU16 per managed frame, leaked for the kernel's lifetime.
+    let mut v: alloc::vec::Vec<AtomicU16> = alloc::vec::Vec::with_capacity(n);
+    for _ in 0..n {
+        v.push(AtomicU16::new(0));
+    }
+    let slice: &'static [AtomicU16] = alloc::vec::Vec::leak(v);
+    *REFCOUNTS.lock() = Some(RefCounts::new(slice));
+    crate::log::info!("frame refcounts: {} entries ({} KiB)", n, n * 2 / 1024);
+}
+
+/// Index into the refcount table for a physical address, if in range.
+fn refc_index(phys: u64) -> Option<usize> {
+    let base = REFC_BASE.load(Ordering::Relaxed);
+    let idx = (frame_of(phys) as usize).checked_sub(base)?;
+    (idx < REFC_LEN.load(Ordering::Relaxed)).then_some(idx)
+}
+
+/// Sets a frame's reference count (used when a user frame is first allocated,
+/// `n = 1`). No-op before [`init_refcounts`].
+pub fn frame_set_ref(phys: u64, n: u16) {
+    if let (Some(rc), Some(i)) = (REFCOUNTS.lock().as_ref(), refc_index(phys)) {
+        rc.set(i, n);
+    }
+}
+
+/// The current reference count of a frame (0 if untracked/out of range).
+pub fn frame_refcount(phys: u64) -> u16 {
+    match (REFCOUNTS.lock().as_ref(), refc_index(phys)) {
+        (Some(rc), Some(i)) => rc.get(i),
+        _ => 0,
+    }
+}
+
+/// Adds a reference to a shared frame (e.g. a `fork` CoW page).
+pub fn frame_incref(phys: u64) {
+    if let (Some(rc), Some(i)) = (REFCOUNTS.lock().as_ref(), refc_index(phys)) {
+        rc.incref(i);
+    }
+}
+
+/// Drops a user reference to `phys` and frees the frame to the buddy allocator
+/// when the last reference goes away. Safe to call on any user frame; frames
+/// with no refcount entry (out of range) are left alone.
+pub fn free_user_frame(phys: u64) {
+    let should_free = {
+        let guard = REFCOUNTS.lock();
+        match (guard.as_ref(), refc_index(phys)) {
+            (Some(rc), Some(i)) => rc.decref(i),
+            // No refcount table yet / out of range: free directly (early frames
+            // are kernel-owned and never reach this path in practice).
+            _ => true,
+        }
+    };
+    if should_free {
+        free_frames(phys, 1);
+    }
 }
 
 /// Frees `count` frames previously obtained from [`alloc_frames`] at `phys`.

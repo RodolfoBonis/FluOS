@@ -53,11 +53,13 @@ impl Console {
     /// Waits until `needle` appears in the capture at or after byte offset
     /// `since` (so a command's echo of its own text isn't mistaken for output).
     fn wait_for_since(&self, since: usize, needle: &str, timeout: Duration) -> Result<()> {
-        let deadline = Instant::now() + timeout;
+        let start = Instant::now();
+        let deadline = start + timeout;
         loop {
             {
                 let cap = self.capture.lock().unwrap();
                 if cap.len() >= since && cap[since..].contains(needle) {
+                    println!("[e2e] <- {needle:?} in {} ms", start.elapsed().as_millis());
                     return Ok(());
                 }
             }
@@ -127,7 +129,10 @@ fn drive(con: &mut Console) -> Result<()> {
 
     // 1) Boot must complete and the shell must start.
     con.wait_for("boot complete", remaining())?;
-    con.wait_for("init: shell started", remaining())?;
+    // `run_init` logs "init: <path> started (foreground pgrp ...)" once it has
+    // exec'd the login shell as the controlling-tty foreground group; the path
+    // varies (zsh/sh/busybox) so we match the path-independent tail.
+    con.wait_for("started (foreground pgrp", remaining())?;
     // Give the shell a beat to print its first prompt.
     std::thread::sleep(Duration::from_millis(300));
 
@@ -135,24 +140,24 @@ fn drive(con: &mut Console) -> Result<()> {
     // satisfied by the terminal's echo of the typed command itself.
     let m = con.mark();
     con.send_line("echo val=$((21+21))")?;
-    con.wait_for_since(m, "val=42", Duration::from_secs(45))?;
+    con.wait_for_since(m, "val=42", Duration::from_secs(20))?;
 
     // 3) ls lists the busybox applets directory (the marker is not in the cmd).
     let m = con.mark();
     con.send_line("ls /bin")?;
-    con.wait_for_since(m, "busybox", Duration::from_secs(45))?;
+    con.wait_for_since(m, "busybox", Duration::from_secs(20))?;
 
     // 4) cat a known file from the initramfs (content, not the command).
     let m = con.mark();
     con.send_line("cat /etc/hostname")?;
-    con.wait_for_since(m, "fluos", Duration::from_secs(45))?;
+    con.wait_for_since(m, "fluos", Duration::from_secs(20))?;
 
     // 5) a pipeline: echo | cat (exercises pipe2 + blocking pipe read/write and
     // the shell's fork/dup2 plumbing). Arithmetic keeps the marker out of the
     // typed command, so matching proves it flowed echo -> pipe -> cat -> tty.
     let m = con.mark();
     con.send_line("echo p$((6*7))x | cat")?;
-    con.wait_for_since(m, "p42x", Duration::from_secs(45))?;
+    con.wait_for_since(m, "p42x", Duration::from_secs(20))?;
 
     // 6) Ctrl-C of a foreground job blocked in a tty read: the job must die and
     // the shell must survive and stay responsive. `cat` with no args blocks in

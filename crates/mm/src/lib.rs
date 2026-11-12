@@ -7,6 +7,7 @@
 //! table.
 //!
 //! - [`buddy::Buddy`] — a binary buddy allocator over abstract frame indices.
+//! - [`refcount::RefCounts`] — per-frame reference counts for CoW + reclamation.
 //! - [`slab::Slab`] — a slab object cache with power-of-two size classes,
 //!   fed by an abstract [`slab::PageSource`].
 //!
@@ -16,4 +17,5 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod buddy;
+pub mod refcount;
 pub mod slab;

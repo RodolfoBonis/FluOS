@@ -15,6 +15,7 @@ pub fn init(hhdm: u64) {
     phys::init(hhdm);
     paging::init(hhdm);
     heap::smoke_test();
+    phys::init_refcounts();
 
     let (free, total) = phys::stats();
     crate::log::info!(

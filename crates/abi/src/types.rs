@@ -242,6 +242,10 @@ pub const TIOCGPGRP: u64 = 0x540F;
 pub const TIOCSPGRP: u64 = 0x5410;
 pub const TIOCGWINSZ: u64 = 0x5413;
 pub const TIOCSWINSZ: u64 = 0x5414;
+pub const TIOCSCTTY: u64 = 0x540E;
+pub const TIOCSPTLCK: u64 = 0x4004_5431; // _IOW('T', 0x31, int) unlockpt
+pub const TIOCGPTN: u64 = 0x8004_5430;    // _IOR('T', 0x30, uint) ptsname number
+pub const TIOCGPTLCK: u64 = 0x8004_5439;
 
 #[cfg(test)]
 mod tests {
