@@ -71,3 +71,26 @@ pub fn enable_protections() -> Features {
 
     features
 }
+
+
+/// Whether the CPU supports MONITOR/MWAIT (CPUID.01H:ECX bit 3).
+pub fn has_monitor() -> bool {
+    __cpuid_count(1, 0).ecx & (1 << 3) != 0
+}
+
+/// Enables SSE/FXSAVE so the kernel (and context switching) can use the FPU and
+/// SSE registers: clear CR0.EM, set CR0.MP, and set CR4.OSFXSR / OSXMMEXCPT.
+pub fn enable_sse() {
+    // SAFETY: these bits only enable native FPU/SSE handling, which long mode
+    // already requires; Limine sets most of them, we make it explicit per CPU.
+    unsafe {
+        Cr0::update(|f| {
+            f.remove(Cr0Flags::EMULATE_COPROCESSOR);
+            f.insert(Cr0Flags::MONITOR_COPROCESSOR);
+        });
+        Cr4::update(|f| {
+            f.insert(Cr4Flags::OSFXSR);
+            f.insert(Cr4Flags::OSXMMEXCPT_ENABLE);
+        });
+    }
+}

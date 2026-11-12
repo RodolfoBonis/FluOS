@@ -2,6 +2,7 @@
 
 pub mod acpi;
 pub mod apic;
+pub mod context;
 pub mod cpu;
 pub mod gdt;
 pub mod idt;
@@ -15,6 +16,34 @@ pub mod serial;
 pub fn init_cpu() {
     gdt::init();
     idt::init();
+}
+
+/// Idles the CPU until the next interrupt (timer or IPI). Interrupts are
+/// enabled before halting so the wakeup is delivered. `_monitor_addr` is the
+/// address the scheduler would MONITOR; a plain `hlt` wake is used for now.
+pub fn idle_wait(monitor_addr: usize) {
+    if cpu::has_monitor() {
+        // SAFETY: arm MONITOR on `monitor_addr` (this CPU's `need_resched`),
+        // then MWAIT with interrupts enabled. A store to that line (a wakeup) or
+        // any interrupt (timer/IPI) resumes us; the periodic timer guarantees we
+        // never sleep forever.
+        unsafe {
+            core::arch::asm!(
+                "monitor",
+                in("rax") monitor_addr, in("rcx") 0, in("rdx") 0,
+                options(nostack, preserves_flags),
+            );
+            core::arch::asm!(
+                "sti",
+                "mwait",
+                in("rax") 0u32, in("rcx") 0u32,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+    } else {
+        // SAFETY: `sti; hlt` enables interrupts then halts until one arrives.
+        unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)) };
+    }
 }
 
 /// Disables interrupts and halts this CPU forever.

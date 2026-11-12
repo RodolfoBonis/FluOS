@@ -41,6 +41,24 @@ fn main() {
     println!("cargo:rerun-if-changed={dir}/linker.ld");
 
     generate_font_atlas();
+    embed_symbol_env();
+}
+
+/// Points `FLUOS_KSYMS_FILE` at the symbol blob xtask generated (via the
+/// `FLUOS_KSYMS` env), or at an empty placeholder when building standalone.
+fn embed_symbol_env() {
+    println!("cargo:rerun-if-env-changed=FLUOS_KSYMS");
+    let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR set by cargo"));
+    let file = match env::var("FLUOS_KSYMS") {
+        Ok(path) if std::path::Path::new(&path).exists() => path,
+        _ => {
+            let placeholder = out.join("ksyms_empty.bin");
+            // Magic "KSY1" + count 0.
+            fs::write(&placeholder, b"KSY1\x00\x00\x00\x00").expect("write ksyms placeholder");
+            placeholder.display().to_string()
+        }
+    };
+    println!("cargo:rustc-env=FLUOS_KSYMS_FILE={file}");
 }
 
 fn generate_font_atlas() {

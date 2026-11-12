@@ -10,7 +10,7 @@ use crate::boot::Framebuffer;
 use crate::font::{self, CELL_H, CELL_W};
 use alloc::vec;
 use alloc::vec::Vec;
-use spin::Mutex;
+use crate::sync::SpinLock;
 use tty::{Rgb, Terminal, resolve};
 
 /// Default foreground/background, matching the splash theme.
@@ -166,7 +166,7 @@ fn replacement_alpha(px: usize, py: usize) -> u8 {
     if on_edge && inside { 0xC0 } else { 0 }
 }
 
-static CONSOLE: Mutex<Option<Console>> = Mutex::new(None);
+static CONSOLE: SpinLock<Option<Console>> = SpinLock::new(None);
 
 /// Brings up the framebuffer console and mirrors kernel logs to it.
 pub fn init(fb: &Framebuffer) {

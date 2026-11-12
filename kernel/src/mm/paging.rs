@@ -17,6 +17,12 @@ use x86_64::structures::paging::{
 };
 use x86_64::{PhysAddr, VirtAddr};
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Physical address of the kernel PML4, published by [`init`] so APs can load
+/// the same tables.
+static KERNEL_PML4: AtomicU64 = AtomicU64::new(0);
+
 const GIB: u64 = 0x4000_0000;
 const MIB2: u64 = 0x20_0000;
 const KIB4: u64 = 0x1000;
@@ -82,6 +88,7 @@ pub fn init(hhdm: u64) {
     map_hhdm(&mut mapper, &mut frames, hhdm);
 
     let pml4_frame = PhysFrame::containing_address(PhysAddr::new(pml4_phys));
+    KERNEL_PML4.store(pml4_phys, Ordering::Release);
     // SAFETY: `pml4_frame` holds a complete set of tables that map this code,
     // the current stack (via the HHDM), and all RAM/MMIO, so execution
     // continues seamlessly after the switch.
@@ -176,6 +183,17 @@ where
     }
 }
 
+/// Loads the kernel page tables on the calling CPU (used by APs, which start on
+/// the bootloader's tables and must adopt ours before touching kernel-only
+/// mappings such as device MMIO).
+pub fn activate() {
+    let phys = KERNEL_PML4.load(Ordering::Acquire);
+    let frame = PhysFrame::containing_address(PhysAddr::new(phys));
+    // SAFETY: `frame` is the kernel PML4 built by `init`; it maps this code, the
+    // HHDM, and all device MMIO, so the switch is seamless on any CPU.
+    unsafe { Cr3::write(frame, Cr3Flags::empty()) };
+}
+
 /// Reconstructs an `OffsetPageTable` over the *currently active* PML4, so we
 /// can add mappings after the initial switch (e.g. for device MMIO).
 fn active_mapper(hhdm: u64) -> OffsetPageTable<'static> {
@@ -189,10 +207,21 @@ fn active_mapper(hhdm: u64) -> OffsetPageTable<'static> {
     }
 }
 
-/// Maps a device MMIO region at `phys_base..phys_base+size` into the HHDM as
-/// uncacheable, writable, non-executable pages, so the kernel can reach APIC and
-/// similar registers that live above RAM (outside the initial direct map).
-pub fn map_mmio(phys_base: u64, size: u64) {
+/// Dedicated virtual window for uncacheable device MMIO, bump-allocated by
+/// [`map_mmio`]. It is a canonical higher-half range distinct from both the HHDM
+/// (which is cacheable and partly huge-page-mapped) and the kernel image, so UC
+/// 4 KiB mappings can be laid down here without splitting any huge page.
+const MMIO_WINDOW_BASE: u64 = 0xffff_fe00_0000_0000;
+static MMIO_NEXT: AtomicU64 = AtomicU64::new(MMIO_WINDOW_BASE);
+
+/// Maps a device MMIO region `phys_base..phys_base+size` as **uncacheable**,
+/// writable, non-executable 4 KiB pages in the dedicated MMIO window, and
+/// returns the virtual address of `phys_base`.
+///
+/// Device registers (APIC, I/O APIC, ...) must be uncacheable; mapping them in a
+/// fresh window (rather than the HHDM) both guarantees UC and avoids having to
+/// split the 1 GiB HHDM huge page that happens to cover the APIC physical range.
+pub fn map_mmio(phys_base: u64, size: u64) -> u64 {
     let hhdm = phys::hhdm_offset();
     let mut mapper = active_mapper(hhdm);
     let mut frames = Frames;
@@ -200,22 +229,20 @@ pub fn map_mmio(phys_base: u64, size: u64) {
 
     let start = phys_base & !(KIB4 - 1);
     let end = (phys_base + size).div_ceil(KIB4) * KIB4;
-    let mut p = start;
-    while p < end {
-        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(hhdm + p));
-        let frame = PhysFrame::containing_address(PhysAddr::new(p));
-        // SAFETY: mapping a device page to its own physical frame in the active
-        // tables; the region is MMIO, so no RAM is aliased.
+    let pages = (end - start) / KIB4;
+    let va_base = MMIO_NEXT.fetch_add(pages * KIB4, Ordering::Relaxed);
+
+    for i in 0..pages {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va_base + i * KIB4));
+        let frame = PhysFrame::containing_address(PhysAddr::new(start + i * KIB4));
+        // SAFETY: fresh window VA mapped to a device frame; no RAM is aliased
+        // and the VA range is handed out uniquely by the bump allocator.
         match unsafe { mapper.map_to(page, frame, flags, &mut frames) } {
             Ok(flush) => flush.flush(),
-            // Already reachable: either an explicit 4 KiB mapping or, more
-            // commonly, covered by a 1 GiB HHDM huge page (APIC MMIO sits in the
-            // high direct-mapped range). Both are fine — we can touch it as-is.
-            Err(MapToError::PageAlreadyMapped(_)) | Err(MapToError::ParentEntryHugePage) => {}
             Err(e) => panic!("MMIO mapping failed: {e:?}"),
         }
-        p += KIB4;
     }
+    va_base + (phys_base & (KIB4 - 1))
 }
 
 /// Whether the CPU supports 1 GiB pages (CPUID 8000_0001h EDX bit 26).

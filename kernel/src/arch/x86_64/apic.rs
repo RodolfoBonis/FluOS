@@ -1,58 +1,183 @@
-//! Local and I/O APIC bring-up for device interrupts.
+//! Local and I/O APIC: device interrupts, the per-CPU scheduling timer, and IPIs.
 //!
 //! We fully mask the legacy 8259 PICs (after remapping their vectors out of the
-//! exception range, so a stray spurious IRQ lands on a defined vector), enable
-//! the Local APIC, and program one I/O APIC redirection entry to route the PS/2
-//! keyboard's GSI to [`KEYBOARD_VECTOR`] on the bootstrap CPU. MMIO for both
-//! APICs lives above RAM, so it is mapped on demand through the HHDM.
+//! exception range) and drive everything through the APICs. The Local APIC's
+//! timer preempts the scheduler — in TSC-deadline mode when the CPU supports it
+//! (tickless), otherwise periodic — calibrated once against the PIT. Inter-
+//! processor interrupts provide reschedule and TLB-shootdown signalling.
 
 use super::acpi::ApicInfo;
 use super::port::{inb, outb};
-use crate::mm::{paging, phys};
-use core::sync::atomic::{AtomicU64, Ordering};
+use crate::mm::paging;
+use core::arch::x86_64::{__cpuid_count, _rdtsc};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use x86_64::registers::model_specific::Msr;
 
 /// IDT vector the keyboard IRQ is delivered on.
 pub const KEYBOARD_VECTOR: u8 = 0x21;
 /// LAPIC spurious-interrupt vector.
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
+/// LAPIC timer vector (scheduler preemption).
+pub const TIMER_VECTOR: u8 = 0x30;
+/// Reschedule IPI vector.
+pub const RESCHED_VECTOR: u8 = 0x40;
+/// TLB-shootdown IPI vector.
+pub const TLB_VECTOR: u8 = 0x41;
 
 // LAPIC register offsets.
 const LAPIC_ID: u64 = 0x20;
 const LAPIC_EOI: u64 = 0xB0;
 const LAPIC_SVR: u64 = 0xF0;
+const LAPIC_ICR_LOW: u64 = 0x300;
+const LAPIC_ICR_HIGH: u64 = 0x310;
+const LVT_TIMER: u64 = 0x320;
+const TIMER_INIT_COUNT: u64 = 0x380;
+const TIMER_CUR_COUNT: u64 = 0x390;
+const TIMER_DIVIDE: u64 = 0x3E0;
 
-/// HHDM virtual address of the LAPIC register page, set during [`init`].
+/// IA32_TSC_DEADLINE MSR.
+const IA32_TSC_DEADLINE: u32 = 0x6E0;
+
+/// Scheduling quantum in milliseconds.
+const SLICE_MS: u64 = 4;
+
+/// Virtual address of the LAPIC register page, set during [`init`].
 static LAPIC_VIRT: AtomicU64 = AtomicU64::new(0);
+/// Virtual address of the I/O APIC register window, set during [`init`].
+static IOAPIC_VIRT: AtomicU64 = AtomicU64::new(0);
+/// Whether to use TSC-deadline mode (tickless) versus periodic timer.
+static USE_TSC_DEADLINE: AtomicBool = AtomicBool::new(false);
+/// TSC ticks per scheduling slice (for TSC-deadline rearm).
+static TSC_PER_SLICE: AtomicU64 = AtomicU64::new(0);
+/// LAPIC timer initial count for one slice (for periodic mode).
+static LAPIC_COUNT_PER_SLICE: AtomicU64 = AtomicU64::new(0);
 
-/// Masks the PICs, enables the LAPIC, and routes the keyboard IRQ.
+/// Masks the PICs, enables the BSP LAPIC, routes the keyboard IRQ, and
+/// calibrates the scheduling timer. Call once on the bootstrap CPU.
 pub fn init(info: ApicInfo) {
     mask_legacy_pic();
 
-    paging::map_mmio(info.lapic_base, 0x1000);
-    paging::map_mmio(info.ioapic_base, 0x1000);
-
-    let lapic = phys::phys_to_virt(info.lapic_base);
-    LAPIC_VIRT.store(lapic, Ordering::Relaxed);
-
-    // Enable the LAPIC: set the spurious-vector register's enable bit (8).
-    lapic_write(LAPIC_SVR, 0x100 | u32::from(SPURIOUS_VECTOR));
+    let lapic_va = paging::map_mmio(info.lapic_base, 0x1000);
+    let ioapic_va = paging::map_mmio(info.ioapic_base, 0x1000);
+    LAPIC_VIRT.store(lapic_va, Ordering::Release);
+    IOAPIC_VIRT.store(ioapic_va, Ordering::Release);
+    enable_lapic();
 
     let apic_id = (lapic_read(LAPIC_ID) >> 24) & 0xFF;
     route_ioapic(&info, apic_id);
+    calibrate();
 
     crate::log::info!(
-        "apic: lapic@{:#x} ioapic@{:#x} kbd gsi {} -> vector {:#x}",
+        "apic: lapic@{:#x} ioapic@{:#x} kbd gsi {} -> vector {:#x}; timer {} ({} ms slice)",
         info.lapic_base,
         info.ioapic_base,
         info.keyboard_gsi,
         KEYBOARD_VECTOR,
+        if USE_TSC_DEADLINE.load(Ordering::Relaxed) { "TSC-deadline" } else { "periodic" },
+        SLICE_MS,
     );
 }
 
-/// Signals end-of-interrupt to the LAPIC. Called at the tail of every handled
-/// device IRQ.
+/// Enables this CPU's Local APIC via the spurious-vector register.
+pub fn enable_lapic() {
+    lapic_write(LAPIC_SVR, 0x100 | u32::from(SPURIOUS_VECTOR));
+}
+
+/// Signals end-of-interrupt to the LAPIC.
 pub fn eoi() {
     lapic_write(LAPIC_EOI, 0);
+}
+
+/// Reads the current CPU's LAPIC id.
+#[allow(dead_code)] // accessor kept for diagnostics
+pub fn lapic_id() -> u32 {
+    (lapic_read(LAPIC_ID) >> 24) & 0xFF
+}
+
+/// Whether the CPU supports TSC-deadline timer mode.
+fn has_tsc_deadline() -> bool {
+    // `__cpuid_count` is safe: a pure CPU-identification read.
+    let leaf = __cpuid_count(1, 0);
+    leaf.ecx & (1 << 24) != 0
+}
+
+/// Calibrates the scheduling timer against the PIT: measures TSC and LAPIC
+/// timer rates over a 50 ms window and derives per-slice counts.
+fn calibrate() {
+    // LAPIC timer one-shot, divide-by-16, counting down from max.
+    lapic_write(TIMER_DIVIDE, 0x3);
+    lapic_write(LVT_TIMER, 1 << 16); // masked, one-shot
+    lapic_write(TIMER_INIT_COUNT, u32::MAX);
+
+    // SAFETY: `_rdtsc` reads the timestamp counter.
+    let tsc_start = unsafe { _rdtsc() };
+    pit_wait_ms(50);
+    let tsc_elapsed = unsafe { _rdtsc() } - tsc_start;
+    let lapic_elapsed = u64::from(u32::MAX - lapic_read(TIMER_CUR_COUNT));
+    lapic_write(TIMER_INIT_COUNT, 0); // stop
+
+    let tsc_per_ms = tsc_elapsed / 50;
+    let lapic_per_ms = lapic_elapsed / 50;
+
+    let use_deadline = has_tsc_deadline() && tsc_per_ms > 0;
+    USE_TSC_DEADLINE.store(use_deadline, Ordering::Release);
+    TSC_PER_SLICE.store(tsc_per_ms * SLICE_MS, Ordering::Release);
+    // Fall back to a sane count if calibration produced nothing usable.
+    let count = (lapic_per_ms * SLICE_MS).max(1).min(u64::from(u32::MAX));
+    LAPIC_COUNT_PER_SLICE.store(count, Ordering::Release);
+}
+
+/// Starts this CPU's scheduling timer. Call after the scheduler is ready on
+/// each CPU.
+pub fn start_timer() {
+    if USE_TSC_DEADLINE.load(Ordering::Acquire) {
+        // TSC-deadline mode: LVT bits [18:17] = 10b.
+        lapic_write(LVT_TIMER, u32::from(TIMER_VECTOR) | (0b10 << 17));
+        rearm_timer();
+    } else {
+        // Periodic mode: LVT bits [18:17] = 01b.
+        lapic_write(TIMER_DIVIDE, 0x3);
+        lapic_write(LVT_TIMER, u32::from(TIMER_VECTOR) | (0b01 << 17));
+        let count = LAPIC_COUNT_PER_SLICE.load(Ordering::Acquire) as u32;
+        lapic_write(TIMER_INIT_COUNT, count);
+    }
+}
+
+/// Reprograms the next TSC-deadline interrupt (no-op in periodic mode). Called
+/// from the timer handler.
+pub fn rearm_timer() {
+    if USE_TSC_DEADLINE.load(Ordering::Relaxed) {
+        let interval = TSC_PER_SLICE.load(Ordering::Relaxed);
+        // SAFETY: `_rdtsc` reads the TSC; the MSR write arms the next deadline.
+        let deadline = unsafe { _rdtsc() } + interval;
+        // SAFETY: IA32_TSC_DEADLINE is a valid MSR when TSC-deadline is enabled.
+        unsafe { Msr::new(IA32_TSC_DEADLINE).write(deadline) };
+    }
+}
+
+/// Stops this CPU's scheduling timer (used when leaving the scheduler).
+pub fn stop_timer() {
+    lapic_write(LVT_TIMER, 1 << 16); // masked
+    if !USE_TSC_DEADLINE.load(Ordering::Relaxed) {
+        lapic_write(TIMER_INIT_COUNT, 0);
+    }
+}
+
+/// Sends a fixed-delivery IPI with `vector` to the CPU with `dest_apic_id`.
+fn send_ipi(dest_apic_id: u32, vector: u8) {
+    lapic_write(LAPIC_ICR_HIGH, dest_apic_id << 24);
+    // Fixed delivery, physical dest, assert, edge.
+    lapic_write(LAPIC_ICR_LOW, u32::from(vector) | (1 << 14));
+}
+
+/// Sends a reschedule IPI to a CPU by its LAPIC id.
+pub fn send_reschedule(dest_apic_id: u32) {
+    send_ipi(dest_apic_id, RESCHED_VECTOR);
+}
+
+/// Sends a TLB-shootdown IPI to a CPU by its LAPIC id.
+pub fn send_tlb_shootdown(dest_apic_id: u32) {
+    send_ipi(dest_apic_id, TLB_VECTOR);
 }
 
 fn lapic_read(offset: u64) -> u32 {
@@ -69,86 +194,99 @@ fn lapic_write(offset: u64, value: u32) {
 
 /// Programs the I/O APIC redirection entry for the keyboard's GSI.
 fn route_ioapic(info: &ApicInfo, dest_apic_id: u32) {
-    let base = phys::phys_to_virt(info.ioapic_base);
+    let base = IOAPIC_VIRT.load(Ordering::Acquire);
     let index = info.keyboard_gsi - info.ioapic_gsi_base;
     let redtbl_lo = 0x10 + index * 2;
 
-    // Decode polarity/trigger from the MADT flags (0 => ISA edge/active-high).
     let polarity = info.keyboard_flags & 0b11;
     let trigger = (info.keyboard_flags >> 2) & 0b11;
-    let active_low = polarity == 0b11;
-    let level = trigger == 0b11;
-
-    let mut low = u32::from(KEYBOARD_VECTOR); // fixed delivery, physical dest, unmasked
-    if active_low {
-        low |= 1 << 13;
+    let mut low = u32::from(KEYBOARD_VECTOR);
+    if polarity == 0b11 {
+        low |= 1 << 13; // active low
     }
-    if level {
-        low |= 1 << 15;
+    if trigger == 0b11 {
+        low |= 1 << 15; // level triggered
     }
-    let high = dest_apic_id << 24;
-
-    ioapic_write(base, redtbl_lo + 1, high);
+    ioapic_write(base, redtbl_lo + 1, dest_apic_id << 24);
     ioapic_write(base, redtbl_lo, low);
 }
 
 fn ioapic_write(base: u64, reg: u32, value: u32) {
-    // SAFETY: `base` points at the mapped I/O APIC window: a 32-bit index
-    // register at +0x00 selects which 32-bit data register appears at +0x10.
+    // SAFETY: `base` points at the mapped I/O APIC window.
     unsafe {
         (base as *mut u32).write_volatile(reg);
         ((base + 0x10) as *mut u32).write_volatile(value);
     }
 }
 
-/// Remaps the master/slave 8259 PICs out of the CPU exception range and masks
-/// every line, so all device IRQs come exclusively through the I/O APIC.
+/// Remaps the 8259 PICs out of the exception range and masks every line.
 fn mask_legacy_pic() {
     const M_CMD: u16 = 0x20;
     const M_DATA: u16 = 0x21;
     const S_CMD: u16 = 0xA0;
     const S_DATA: u16 = 0xA1;
-
-    // SAFETY: the standard 8259 ICW initialisation sequence, followed by a full
-    // mask. These ports exist on every PC and masking them is always safe.
+    // SAFETY: standard 8259 init sequence followed by a full mask.
     unsafe {
-        // ICW1: begin init (cascade, ICW4 present).
         outb(M_CMD, 0x11);
         io_wait();
         outb(S_CMD, 0x11);
         io_wait();
-        // ICW2: vector offsets (0x20 and 0x28) out of the exception range.
         outb(M_DATA, 0x20);
         io_wait();
         outb(S_DATA, 0x28);
         io_wait();
-        // ICW3: master/slave cascade on IRQ2.
         outb(M_DATA, 0x04);
         io_wait();
         outb(S_DATA, 0x02);
         io_wait();
-        // ICW4: 8086 mode.
         outb(M_DATA, 0x01);
         io_wait();
         outb(S_DATA, 0x01);
         io_wait();
-        // Mask all lines on both PICs.
         outb(M_DATA, 0xFF);
         outb(S_DATA, 0xFF);
     }
 }
 
-/// Brief I/O delay by touching an unused port, letting the PIC latch each write.
+/// Busy-waits `ms` milliseconds using PIT channel 2 (mode 0, terminal count).
+fn pit_wait_ms(ms: u64) {
+    const PIT_HZ: u64 = 1_193_182;
+    // Channel 2 counts at most 65535; cap each wait window accordingly.
+    let mut remaining = ms;
+    while remaining > 0 {
+        let chunk = remaining.min(50); // <= 50 ms keeps count < 65536
+        let count = (PIT_HZ * chunk / 1000) as u16;
+        // SAFETY: programming PIT channel 2 and its gate via ports 0x61/0x42/0x43.
+        unsafe {
+            // Disable speaker (bit1=0), enable gate (bit0=1).
+            let p = inb(0x61) & 0xFC;
+            outb(0x61, p | 0x01);
+            // Channel 2, lobyte/hibyte, mode 0, binary.
+            outb(0x43, 0xB0);
+            outb(0x42, (count & 0xFF) as u8);
+            outb(0x42, (count >> 8) as u8);
+            // Reload the gate to start the count.
+            let g = inb(0x61) & 0xFE;
+            outb(0x61, g);
+            outb(0x61, g | 0x01);
+            // Wait until OUT (bit 5) goes high at terminal count.
+            while inb(0x61) & 0x20 == 0 {
+                core::hint::spin_loop();
+            }
+        }
+        remaining -= chunk;
+    }
+}
+
+/// Brief I/O delay by touching an unused port.
 unsafe fn io_wait() {
-    // SAFETY: port 0x80 is the conventional POST/debug port; writing it is inert.
+    // SAFETY: port 0x80 is the conventional inert POST port.
     unsafe { outb(0x80, 0) };
 }
 
-/// Drains and discards any byte sitting in the i8042 output buffer, so a
-/// keypress that occurred before routing does not block further IRQs.
+/// Drains any byte in the i8042 output buffer.
 pub fn drain_ps2() {
-    // SAFETY: reading the i8042 data port is side-effect-free beyond clearing
-    // the output buffer.
+    // SAFETY: reading the i8042 ports only clears the output buffer.
     while unsafe { inb(0x64) } & 1 != 0 {
         let _ = unsafe { inb(0x60) };
     }

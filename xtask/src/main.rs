@@ -1,6 +1,7 @@
 //! Build orchestration for FluOS: `cargo xtask <command>`.
 
 mod image;
+mod ksyms;
 mod limine;
 mod qemu;
 
@@ -56,11 +57,36 @@ pub fn root() -> PathBuf {
 }
 
 /// Compiles the kernel and returns the path to its ELF.
+///
+/// Builds twice so panic backtraces can be symbolized: the first pass yields an
+/// ELF whose function symbols are extracted into a blob; the second embeds that
+/// blob (see `kernel/src/ksyms.rs`). Because the blob lands in `.rodata`, after
+/// `.text`, the recorded function addresses stay valid. Symbol generation is
+/// best-effort: on failure the first-pass ELF is used with raw-address traces.
 pub fn build_kernel(profile: Profile) -> Result<PathBuf> {
+    let elf = compile_kernel(profile, None)?;
+    let blob = root().join("target").join("ksyms.bin");
+    match ksyms::generate(&elf, &blob) {
+        Ok(count) => {
+            eprintln!("xtask: embedding {count} kernel symbols for backtraces");
+            compile_kernel(profile, Some(&blob))
+        }
+        Err(e) => {
+            eprintln!("xtask: symbol table generation failed ({e:#}); backtraces will show raw addresses");
+            Ok(elf)
+        }
+    }
+}
+
+/// Runs one `cargo build` of the kernel, optionally embedding a symbol blob.
+fn compile_kernel(profile: Profile, ksyms_blob: Option<&Path>) -> Result<PathBuf> {
     let mut cmd = Command::new(env!("CARGO"));
     cmd.current_dir(root()).args(["build", "--package", "kernel", "--target", "x86_64-unknown-none"]);
     if let Profile::Release = profile {
         cmd.arg("--release");
+    }
+    if let Some(blob) = ksyms_blob {
+        cmd.env("FLUOS_KSYMS", blob);
     }
     run_cmd(&mut cmd)?;
     Ok(root().join("target/x86_64-unknown-none").join(profile.dir()).join("kernel"))

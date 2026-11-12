@@ -68,15 +68,9 @@ pub fn starship_prompt() {
 /// the console. Only reached on a real (non-test) boot, after the prompt is on
 /// screen.
 pub fn input_echo_loop() -> ! {
-    use crate::arch::x86_64::{acpi, apic, input};
+    use crate::arch::x86_64::{apic, input};
     use x86_64::instructions::{hlt, interrupts};
 
-    let Some(info) = acpi::parse() else {
-        crate::log::warning!("no ACPI MADT; keyboard input unavailable");
-        crate::arch::x86_64::halt_forever();
-    };
-
-    apic::init(info);
     apic::drain_ps2();
     interrupts::enable();
     crate::log::info!("keyboard ready — type to echo");

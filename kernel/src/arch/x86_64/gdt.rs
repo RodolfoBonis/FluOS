@@ -87,3 +87,36 @@ pub fn init() {
         load_tss(GDT.1.tss);
     }
 }
+
+/// Per-CPU GDT/TSS setup for application processors. Each AP needs its own TSS
+/// (the TSS busy bit forbids loading one TSS on two CPUs) and its own IST
+/// stacks, so they are heap-allocated here (the heap is up by AP bring-up time).
+pub fn init_ap() {
+    use alloc::boxed::Box;
+
+    let tss = Box::leak(Box::new(TaskStateSegment::new()));
+    tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = ap_stack_top();
+    tss.interrupt_stack_table[NMI_IST_INDEX as usize] = ap_stack_top();
+    tss.interrupt_stack_table[MACHINE_CHECK_IST_INDEX as usize] = ap_stack_top();
+
+    let gdt = Box::leak(Box::new(GlobalDescriptorTable::new()));
+    let code = gdt.append(Descriptor::kernel_code_segment());
+    let data = gdt.append(Descriptor::kernel_data_segment());
+    let tss_sel = gdt.append(Descriptor::tss_segment(tss));
+    gdt.load();
+    // SAFETY: selectors index descriptors just loaded into this AP's GDT.
+    unsafe {
+        CS::set_reg(code);
+        SS::set_reg(data);
+        DS::set_reg(data);
+        ES::set_reg(data);
+        load_tss(tss_sel);
+    }
+}
+
+/// Allocates one heap-backed IST stack and returns its top.
+fn ap_stack_top() -> VirtAddr {
+    let buf = alloc::vec![0u8; IST_STACK_SIZE].into_boxed_slice();
+    let leaked = alloc::boxed::Box::leak(buf);
+    VirtAddr::from_ptr(leaked.as_ptr()) + IST_STACK_SIZE as u64
+}

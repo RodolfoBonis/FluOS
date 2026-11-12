@@ -11,7 +11,7 @@ use super::phys::{self, FRAME_SIZE};
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::{self, NonNull};
 use mm::slab::{PageSource, Slab};
-use spin::Mutex;
+use crate::sync::SpinLock;
 
 /// Pages for the slab, drawn from the buddy allocator and addressed through the
 /// HHDM.
@@ -31,7 +31,7 @@ unsafe impl PageSource for BuddyPages {
     }
 }
 
-static SLAB: Mutex<Slab> = Mutex::new(Slab::new(FRAME_SIZE as usize));
+static SLAB: SpinLock<Slab> = SpinLock::new(Slab::new(FRAME_SIZE as usize));
 
 /// Number of frames a large (non-slab) allocation of this layout needs. The
 /// buddy rounds this up to a power of two, giving a block aligned to at least

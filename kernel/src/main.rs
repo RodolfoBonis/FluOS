@@ -9,9 +9,15 @@ mod boot;
 mod console;
 mod demo;
 mod font;
+mod ksyms;
 mod log;
 mod mm;
 mod panic;
+mod percpu;
+mod scheduler;
+mod smp;
+mod sync;
+mod thread;
 
 extern crate alloc;
 
@@ -36,11 +42,10 @@ extern "C" fn kmain() -> ! {
     );
 
     arch::x86_64::init_cpu();
-    log::info!("gdt + idt installed");
-
     let features = arch::x86_64::cpu::enable_protections();
+    arch::x86_64::cpu::enable_sse();
     log::info!(
-        "cpu protections: nx={} smep={} smap={} pcid={}",
+        "cpu: gdt+idt installed; nx={} smep={} smap={} pcid={}",
         features.nx,
         features.smep,
         features.smap,
@@ -58,16 +63,30 @@ extern "C" fn kmain() -> ! {
             font::CELL_W,
             font::CELL_H
         );
-        demo::starship_prompt();
     } else {
         log::warning!("no framebuffer provided by bootloader");
     }
 
+    // SMP + scheduler bring-up and self-test.
+    if let Some(apic_info) = arch::x86_64::acpi::parse() {
+        arch::x86_64::apic::init(apic_info);
+        smp::init_bsp();
+        smp::bringup();
+        arch::x86_64::apic::start_timer();
+        x86_64::instructions::interrupts::enable();
+        smp::run_selftest();
+        // Stop preempting the boot CPU so the rest of boot runs to completion.
+        arch::x86_64::apic::stop_timer();
+    } else {
+        log::warning!("no ACPI MADT; SMP and scheduler timer disabled");
+    }
+
+    demo::starship_prompt();
+
     log::info!("boot complete");
-    // Under the test harness this exits QEMU right after the prompt renders.
     arch::x86_64::qemu_exit_if_requested(boot::cmdline());
 
-    // Interactive path: bring up interrupts + keyboard and echo typed keys.
+    // Interactive: echo typed keys (APIC/keyboard already initialised).
     if console::is_ready() {
         demo::input_echo_loop();
     }

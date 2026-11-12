@@ -40,7 +40,14 @@ pub fn backtrace() {
             break;
         }
         let rel = return_addr.wrapping_sub(KERNEL_VIRT_BASE);
-        crate::log::error!("  #{frame:<2} {return_addr:#018x}  (kernel+{rel:#x})");
+        match crate::ksyms::resolve(return_addr) {
+            Some((name, off)) => {
+                crate::log::error!("  #{frame:<2} {return_addr:#018x}  {name}+{off:#x}");
+            }
+            None => {
+                crate::log::error!("  #{frame:<2} {return_addr:#018x}  (kernel+{rel:#x})");
+            }
+        }
 
         // Frame pointers grow toward higher addresses up the stack; a
         // non-increasing value means we have left the chain.

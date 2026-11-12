@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["kernel", "xtask", "crates/mm", "crates/tty", "userland/colorls"]
+members = ["kernel", "xtask", "crates/mm", "crates/tty", "crates/sched", "userland/colorls"]
 default-members = ["xtask"]
 
 [workspace.package]

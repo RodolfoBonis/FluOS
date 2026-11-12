@@ -15,6 +15,7 @@ spin = "0.10"
 x86_64 = "0.15"
 mm = { path = "../crates/mm" }
 tty = { path = "../crates/tty" }
+sched = { path = "../crates/sched" }
 
 [build-dependencies]
 fontdue = "0.9"

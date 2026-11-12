@@ -2,7 +2,7 @@
 
 use limine::request::{
     BootloaderInfoRequest, ExecutableAddressRequest, ExecutableCmdlineRequest, FramebufferRequest,
-    HhdmRequest, MemmapRequest, RsdpRequest,
+    HhdmRequest, MemmapRequest, MpRequest, RsdpRequest,
 };
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker, memmap};
 
@@ -41,6 +41,10 @@ static CMDLINE: ExecutableCmdlineRequest = ExecutableCmdlineRequest::new();
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 static RSDP: RsdpRequest = RsdpRequest::new();
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static MP: MpRequest = MpRequest::new(0);
 
 #[used]
 #[unsafe(link_section = ".limine_requests_end")]
@@ -103,6 +107,13 @@ pub fn kernel_address() -> (u64, u64) {
 pub fn rsdp_addr() -> Option<*const ()> {
     let addr = RSDP.response()?.address;
     (!addr.is_null()).then_some(addr as *const ())
+}
+
+/// Multiprocessor info: the per-CPU descriptors and the BSP's LAPIC id, if the
+/// bootloader started SMP discovery.
+pub fn mp() -> Option<(&'static [&'static limine::mp::MpInfo], u32)> {
+    let resp = MP.response()?;
+    Some((resp.cpus(), resp.bsp_lapic_id))
 }
 
 /// Kernel command line, empty when the bootloader passed none.

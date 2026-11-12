@@ -130,6 +130,29 @@ extern "x86-interrupt" fn keyboard_interrupt(_frame: InterruptStackFrame) {
 /// LAPIC spurious interrupt: by design it needs no end-of-interrupt.
 extern "x86-interrupt" fn spurious_interrupt(_frame: InterruptStackFrame) {}
 
+/// LAPIC timer: drives scheduler preemption. EOI and rearm first, because the
+/// following reschedule may not return to this handler for a long time.
+extern "x86-interrupt" fn timer_interrupt(_frame: InterruptStackFrame) {
+    apic::eoi();
+    apic::rearm_timer();
+    crate::scheduler::tick();
+}
+
+/// Reschedule IPI: another CPU asked us to re-run the scheduler.
+extern "x86-interrupt" fn reschedule_ipi(_frame: InterruptStackFrame) {
+    apic::eoi();
+    if crate::percpu::this().preempt_count.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        crate::scheduler::schedule();
+    }
+}
+
+/// TLB-shootdown IPI: flush this CPU's TLB. A full flush is a correct (if
+/// coarse) stand-in until per-page shootdown ranges are plumbed through.
+extern "x86-interrupt" fn tlb_shootdown_ipi(_frame: InterruptStackFrame) {
+    apic::eoi();
+    x86_64::instructions::tlb::flush_all();
+}
+
 static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
     idt.divide_error.set_handler_fn(divide_error);
@@ -165,6 +188,9 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     }
     idt[apic::KEYBOARD_VECTOR].set_handler_fn(keyboard_interrupt);
     idt[apic::SPURIOUS_VECTOR].set_handler_fn(spurious_interrupt);
+    idt[apic::TIMER_VECTOR].set_handler_fn(timer_interrupt);
+    idt[apic::RESCHED_VECTOR].set_handler_fn(reschedule_ipi);
+    idt[apic::TLB_VECTOR].set_handler_fn(tlb_shootdown_ipi);
     idt
 });
 

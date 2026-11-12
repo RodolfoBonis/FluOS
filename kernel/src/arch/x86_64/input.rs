@@ -6,7 +6,7 @@
 //! this with interrupts disabled (the handler already runs with them off), so
 //! the spin lock is never contended across the IRQ boundary.
 
-use spin::Mutex;
+use crate::sync::SpinLock;
 
 const CAP: usize = 256;
 
@@ -16,7 +16,7 @@ struct Ring {
     tail: usize,
 }
 
-static INPUT: Mutex<Ring> = Mutex::new(Ring { buf: [0; CAP], head: 0, tail: 0 });
+static INPUT: SpinLock<Ring> = SpinLock::new(Ring { buf: [0; CAP], head: 0, tail: 0 });
 
 /// Enqueues a byte, dropping it if the ring is full (a stalled consumer should
 /// not wedge the interrupt handler).
