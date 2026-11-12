@@ -207,6 +207,15 @@ extern "C" fn page_fault(frame: &mut TrapFrame) {
         return; // resolved — retry the faulting instruction
     }
 
+    // A kernel `copy_user` that touched a bad user address: redirect to its
+    // fixup (which returns the uncopied count → EFAULT) instead of panicking.
+    if !frame.from_user() {
+        if let Some(fixup) = crate::usercopy::extable_fixup(frame.rip) {
+            frame.rip = fixup;
+            return;
+        }
+    }
+
     crate::log::error!("CPU EXCEPTION: page fault (#PF) at {cr2:#018x}");
     let code = frame.error_code;
     crate::log::error!(

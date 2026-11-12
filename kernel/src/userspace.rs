@@ -48,7 +48,15 @@ pub fn spawn(elf_image: &[u8], argv: &[&str], envp: &[&str]) -> Result<Arc<SpinL
     let ue = Box::leak(Box::new(UserEntry { entry, user_sp }));
     let ptr = Arc::as_ptr(&proc) as u64;
 
-    let ctx = scheduler::UserContext { cr3, proc_ptr: ptr, fs_base: 0, user_gs: 0 };
+    let pid = proc.lock().pid;
+    let ctx = scheduler::UserContext {
+        cr3,
+        proc_ptr: ptr,
+        fs_base: 0,
+        user_gs: 0,
+        linux_tid: pid,
+        clear_child_tid: 0,
+    };
     let tid = scheduler::spawn_user(user_thread_start, core::ptr::from_mut(ue) as usize, 0, crate::percpu::cpu_id(), ctx)?;
     proc.lock().main_thread = tid as u64;
     Ok(proc)
@@ -76,14 +84,35 @@ pub fn spawn_fork_child(child: &Arc<SpinLock<Process>>, regs: crate::arch::x86_6
     // SAFETY: `tid` is the freshly spawned, live thread; it inherits the parent
     // thread's TLS (FS) and user GS bases so the copied TLS stays valid.
     use x86_64::registers::model_specific::{FsBase, KernelGsBase};
+    let child_pid = child.lock().pid;
     let ctx = scheduler::UserContext {
         cr3,
         proc_ptr: ptr,
         fs_base: FsBase::read().as_u64(),
         user_gs: KernelGsBase::read().as_u64(),
+        linux_tid: child_pid,
+        clear_child_tid: 0,
     };
     let tid = scheduler::spawn_user(fork_child_start, core::ptr::from_mut(entry) as usize, 0, crate::percpu::cpu_id(), ctx)?;
     child.lock().main_thread = tid as u64;
+    Ok(())
+}
+
+/// Spawns a `clone(CLONE_VM)` thread that shares `cr3`/`proc` with its creator
+/// and resumes `regs` (rax already 0) on its own stack, with its own TLS (`fs`),
+/// Linux tid, and optional clear-child-tid pointer.
+pub fn spawn_thread(
+    regs: crate::arch::x86_64::user::Regs,
+    cr3: u64,
+    proc_ptr: u64,
+    fs: u64,
+    user_gs: u64,
+    linux_tid: i32,
+    clear_child_tid: u64,
+) -> Result<(), Errno> {
+    let entry = Box::leak(Box::new(ForkEntry { regs }));
+    let ctx = scheduler::UserContext { cr3, proc_ptr, fs_base: fs, user_gs, linux_tid, clear_child_tid };
+    scheduler::spawn_user(fork_child_start, core::ptr::from_mut(entry) as usize, 0, crate::percpu::cpu_id(), ctx)?;
     Ok(())
 }
 
@@ -543,40 +572,151 @@ fn iopl_sigreturn_elf() -> Vec<u8> {
     raw_exec_elf_at(&code, entry)
 }
 
-/// Runs the IOPL-via-sigreturn self-test. The process MUST be killed by SIGSEGV
-/// (exit 139): a clean exit (0) would mean `rt_sigreturn` granted ring-3 I/O
-/// privilege, a serious escalation.
-pub fn run_iopl_selftest() {
-    let image = iopl_sigreturn_elf();
-    match spawn(&image, &["/iopl-test"], &[]) {
-        Ok(proc) => {
-            let mut spins = 0u64;
-            let code = loop {
-                if let Some(c) = proc.lock().exit_code {
-                    break Some(c);
+/// Builds a program that proves `fork` is copy-on-write: it writes 'A' to a
+/// stack byte, forks, the child overwrites it with 'B' and exits, and the
+/// parent (after reaping) checks its own byte is still 'A'. exit 0 = isolated
+/// (CoW correct); exit 1 = the child's write leaked into the parent.
+fn cow_fork_elf() -> Vec<u8> {
+    let code: Vec<u8> = vec![
+        0xC6, 0x44, 0x24, 0xF0, 0x41, // mov byte [rsp-16], 'A'
+        0xB8, 0x39, 0x00, 0x00, 0x00, // mov eax, 57 (fork)
+        0x0F, 0x05, // syscall
+        0x48, 0x85, 0xC0, // test rax, rax
+        0x74, 0x31, // jz child (+0x31)
+        0xB8, 0x3D, 0x00, 0x00, 0x00, // mov eax, 61 (wait4)
+        0xBF, 0xFF, 0xFF, 0xFF, 0xFF, // mov edi, -1
+        0x31, 0xF6, // xor esi, esi
+        0x31, 0xD2, // xor edx, edx
+        0x45, 0x31, 0xD2, // xor r10d, r10d
+        0x0F, 0x05, // syscall (wait4)
+        0x0F, 0xB6, 0x44, 0x24, 0xF0, // movzx eax, byte [rsp-16]
+        0x3C, 0x41, // cmp al, 'A'
+        0x75, 0x09, // jne fail (+0x09)
+        0xB8, 0xE7, 0x00, 0x00, 0x00, // mov eax, 231
+        0x31, 0xFF, // xor edi, edi
+        0x0F, 0x05, // syscall (exit_group 0)
+        0xB8, 0xE7, 0x00, 0x00, 0x00, // (fail:) mov eax, 231
+        0xBF, 0x01, 0x00, 0x00, 0x00, // mov edi, 1
+        0x0F, 0x05, // syscall (exit_group 1)
+        0xC6, 0x44, 0x24, 0xF0, 0x42, // (child:) mov byte [rsp-16], 'B'
+        0xB8, 0xE7, 0x00, 0x00, 0x00, // mov eax, 231
+        0x31, 0xFF, // xor edi, edi
+        0x0F, 0x05, // syscall (exit_group 0)
+    ];
+    raw_exec_elf(&code)
+}
+
+/// Builds a program that proves anonymous demand paging: `mmap` 64 KiB, write a
+/// byte to a page deep inside (faulted in lazily), read it back, exit 0 iff it
+/// round-trips.
+fn demand_mmap_elf() -> Vec<u8> {
+    let code: Vec<u8> = vec![
+        0xB8, 0x09, 0x00, 0x00, 0x00, // mov eax, 9 (mmap)
+        0x31, 0xFF, // xor edi, edi
+        0xBE, 0x00, 0x00, 0x01, 0x00, // mov esi, 0x10000
+        0xBA, 0x03, 0x00, 0x00, 0x00, // mov edx, 3
+        0x41, 0xBA, 0x22, 0x00, 0x00, 0x00, // mov r10d, 0x22
+        0x41, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, // mov r8d, -1
+        0x45, 0x31, 0xC9, // xor r9d, r9d
+        0x0F, 0x05, // syscall -> rax=base
+        0xC6, 0x80, 0x00, 0x80, 0x00, 0x00, 0x5A, // mov byte [rax+0x8000], 0x5A
+        0x0F, 0xB6, 0x88, 0x00, 0x80, 0x00, 0x00, // movzx ecx, byte [rax+0x8000]
+        0x80, 0xF9, 0x5A, // cmp cl, 0x5A
+        0x75, 0x09, // jne fail (+0x09)
+        0xB8, 0xE7, 0x00, 0x00, 0x00, // mov eax, 231
+        0x31, 0xFF, // xor edi, edi
+        0x0F, 0x05, // syscall (exit_group 0)
+        0xB8, 0xE7, 0x00, 0x00, 0x00, // (fail:) mov eax, 231
+        0xBF, 0x01, 0x00, 0x00, 0x00, // mov edi, 1
+        0x0F, 0x05, // syscall (exit_group 1)
+    ];
+    raw_exec_elf(&code)
+}
+
+/// Builds a program that proves clone(CLONE_VM) threads + futex join. It mmaps a
+/// child stack, clones a thread (CLONE_VM | CHILD_SETTID | CHILD_CLEARTID with
+/// ctid in the shared mapping), the child exits, and the kernel clears the ctid
+/// word and futex-wakes it; the parent futex-waits until the word is 0 then
+/// exits 0. Exercises clone, a shared address space, thread exit, and futex.
+fn clone_thread_elf() -> Vec<u8> {
+    let code: Vec<u8> = vec![
+        // mmap(0, 0x4000, RW, MAP_PRIVATE|ANON, -1, 0) -> rax = child stack base
+        0xB8, 0x09, 0x00, 0x00, 0x00, // mov eax, 9
+        0x31, 0xFF, // xor edi, edi
+        0xBE, 0x00, 0x40, 0x00, 0x00, // mov esi, 0x4000
+        0xBA, 0x03, 0x00, 0x00, 0x00, // mov edx, 3
+        0x41, 0xBA, 0x22, 0x00, 0x00, 0x00, // mov r10d, 0x22
+        0x41, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, // mov r8d, -1
+        0x45, 0x31, 0xC9, // xor r9d, r9d
+        0x0F, 0x05, // syscall
+        0x49, 0x89, 0xC7, // mov r15, rax  (ctid word lives at [r15])
+        0x48, 0x8D, 0xB0, 0x00, 0x40, 0x00, 0x00, // lea rsi, [rax+0x4000] (child sp)
+        0xB8, 0x38, 0x00, 0x00, 0x00, // mov eax, 56 (clone)
+        0xBF, 0x00, 0x01, 0x20, 0x01, // mov edi, 0x1200100 (VM|CHILD_SETTID|CHILD_CLEARTID)
+        0x31, 0xD2, // xor edx, edx (ptid=0)
+        0x4D, 0x89, 0xFA, // mov r10, r15 (ctid)
+        0x45, 0x31, 0xC0, // xor r8d, r8d (tls=0)
+        0x0F, 0x05, // syscall -> rax = child tid (parent) / 0 (child)
+        0x48, 0x85, 0xC0, // test rax, rax
+        0x74, 0x26, // jz child (+0x26)
+        // parent:
+        0x41, 0x89, 0xC6, // mov r14d, eax
+        // parent_loop:
+        0x41, 0x8B, 0x0F, // mov ecx, [r15] (*ctid)
+        0x85, 0xC9, // test ecx, ecx
+        0x74, 0x13, // jz done (+0x13)
+        0xB8, 0xCA, 0x00, 0x00, 0x00, // mov eax, 202 (futex)
+        0x4C, 0x89, 0xFF, // mov rdi, r15 (uaddr=ctid)
+        0x31, 0xF6, // xor esi, esi (FUTEX_WAIT)
+        0x89, 0xCA, // mov edx, ecx (val)
+        0x45, 0x31, 0xD2, // xor r10d, r10d (timeout=NULL)
+        0x0F, 0x05, // syscall
+        0xEB, 0xE6, // jmp parent_loop (-26)
+        // done:
+        0xB8, 0xE7, 0x00, 0x00, 0x00, // mov eax, 231 (exit_group)
+        0x31, 0xFF, // xor edi, edi
+        0x0F, 0x05, // syscall
+        // child:
+        0xB8, 0x3C, 0x00, 0x00, 0x00, // mov eax, 60 (exit)
+        0x31, 0xFF, // xor edi, edi
+        0x0F, 0x05, // syscall
+    ];
+    raw_exec_elf(&code)
+}
+
+/// Runs the memory-management self-tests (CoW fork, anonymous demand paging)./// Runs the memory-management self-tests (CoW fork, anonymous demand paging).
+/// Each must exit 0; anything else indicates a VM correctness bug.
+pub fn run_vm_selftests() {
+    for (name, image) in [
+        ("cow fork isolation", cow_fork_elf()),
+        ("anon demand paging", demand_mmap_elf()),
+        ("clone(CLONE_VM) thread + futex join", clone_thread_elf()),
+    ] {
+        match spawn(&image, &["/vm-test"], &[]) {
+            Ok(proc) => {
+                let mut spins = 0u64;
+                let code = loop {
+                    if let Some(c) = proc.lock().exit_code {
+                        break Some(c);
+                    }
+                    scheduler::yield_now();
+                    spins += 1;
+                    if spins > 50_000_000 {
+                        break None;
+                    }
+                };
+                match code {
+                    Some(0) => crate::log::info!("vm selftest [{name}]: OK"),
+                    Some(c) => crate::log::error!("vm selftest [{name}]: FAILED (exit {c})"),
+                    None => crate::log::error!("vm selftest [{name}]: TIMED OUT"),
                 }
-                scheduler::yield_now();
-                spins += 1;
-                if spins > 50_000_000 {
-                    break None;
-                }
-            };
-            match code {
-                Some(139) => crate::log::info!(
-                    "iopl selftest: in al,0x60 faulted -> SIGSEGV (exit 139); rt_sigreturn did not grant IOPL"
-                ),
-                Some(0) => crate::log::error!(
-                    "iopl selftest: FAILED -- process got ring-3 I/O privilege via rt_sigreturn!"
-                ),
-                Some(c) => crate::log::error!("iopl selftest: unexpected exit status {c}"),
-                None => crate::log::error!("iopl selftest: TIMED OUT"),
             }
+            Err(e) => crate::log::error!("vm selftest [{name}]: spawn failed: {e:?}"),
         }
-        Err(e) => crate::log::error!("iopl selftest: spawn failed: {e:?}"),
     }
 }
 
-/// Runs the signal self-test: a program that catches SIGUSR1, raises it on/// Runs the signal self-test: a program that catches SIGUSR1, raises it on
+/// Runs the signal self-test: a program that catches SIGUSR1, raises it on
 /// itself, and resumes after the handler. The kernel must set up and tear down
 /// the signal frame correctly; a clean exit (status 0) proves the round trip.
 pub fn run_signal_selftest() {
@@ -613,14 +753,20 @@ pub fn run_signal_selftest() {
 /// the kernel must keep running afterwards (the final "kernel alive" line and a
 /// clean boot are the proof).
 pub fn run_security_selftests() {
-    let cases: [(&str, Vec<u8>); 4] = [
-        ("ud2 (#UD -> SIGILL)", ud2_elf()),
-        ("store to unmapped (#PF -> SIGSEGV)", bad_store_elf()),
-        ("write(1, buf, 1<<40) (bounded)", huge_write_elf()),
-        ("arch_prctl(SET_FS, non-canonical) (EINVAL)", bad_setfs_elf()),
+    // Each case names the hostile program, its ELF, and the EXACT exit status
+    // that proves containment (128 + signal for a signal kill, 0 for a rejected
+    // syscall). Checking the status — not merely "exited" — is what makes the
+    // IOPL case meaningful: exiting 0 there would mean the escalation succeeded.
+    let cases: [(&str, Vec<u8>, i32); 5] = [
+        ("ud2 (#UD -> SIGILL)", ud2_elf(), 128 + abi::types::SIGILL),
+        ("store to unmapped (#PF -> SIGSEGV)", bad_store_elf(), 128 + abi::types::SIGSEGV),
+        ("write(1, buf, 1<<40) (bounded)", huge_write_elf(), 0),
+        ("arch_prctl(SET_FS, non-canonical) (EINVAL)", bad_setfs_elf(), 0),
+        ("rt_sigreturn IOPL=3 then in al,0x60 (#GP -> SIGSEGV)", iopl_sigreturn_elf(), 128 + abi::types::SIGSEGV),
     ];
-    let mut passed = 0u32;
-    for (name, image) in cases {
+    let total = cases.len();
+    let mut passed = 0usize;
+    for (name, image, expected) in cases {
         match spawn(&image, &["/sec-test"], &[]) {
             Ok(proc) => {
                 let mut spins = 0u64;
@@ -635,17 +781,20 @@ pub fn run_security_selftests() {
                     }
                 };
                 match code {
-                    Some(c) => {
+                    Some(c) if c == expected => {
                         crate::log::info!("security selftest [{name}]: contained, exit status {c}");
                         passed += 1;
                     }
+                    Some(c) => crate::log::error!(
+                        "security selftest [{name}]: FAILED -- exit status {c}, expected {expected}"
+                    ),
                     None => crate::log::error!("security selftest [{name}]: TIMED OUT"),
                 }
             }
             Err(e) => crate::log::error!("security selftest [{name}]: spawn failed: {e:?}"),
         }
     }
-    crate::log::info!("security selftests: {passed}/4 processes contained; kernel alive");
+    crate::log::info!("security selftests: {passed}/{total} processes contained; kernel alive");
 }
 
 /// Measures getpid round-trip latency by running a tight getpid loop in user

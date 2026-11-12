@@ -81,6 +81,12 @@ pub struct Thread {
     pub run_count: AtomicU64,
     /// Bitmask of CPUs this thread has executed on (self-test accounting).
     pub ran_on: AtomicU32,
+    /// Linux thread id (tid). Equals the process pid for a single-threaded
+    /// process / a fork child; distinct for `clone(CLONE_VM)` threads.
+    pub linux_tid: i32,
+    /// `clone`/`set_tid_address` clear-child-tid pointer: on thread exit the
+    /// kernel writes 0 here and futex-wakes it (how `pthread_join` completes).
+    pub clear_child_tid: u64,
 }
 
 // SAFETY: a Thread is only mutated by its owning CPU while running or under the
@@ -139,6 +145,8 @@ impl Thread {
             fs_base: 0,
             run_count: AtomicU64::new(0),
             ran_on: AtomicU32::new(0),
+            linux_tid: 0,
+            clear_child_tid: 0,
         });
         // SAFETY: `stack` owns KSTACK_SIZE bytes; the first 8 hold the canary.
         unsafe { (stack as *mut u64).write(STACK_CANARY) };
@@ -170,6 +178,8 @@ impl Thread {
             fs_base: 0,
             run_count: AtomicU64::new(1),
             ran_on: AtomicU32::new(0),
+            linux_tid: 0,
+            clear_child_tid: 0,
         })
     }
 

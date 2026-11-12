@@ -63,8 +63,10 @@ fn handle(number: u64, a: [u64; 6], regs: &mut Regs) -> SysResult {
         nr::OPEN => sys_openat(types::AT_FDCWD, a[0], a[1], a[2] as u32),
         nr::CLOSE => sys_close(a[0] as i32),
         nr::LSEEK => sys_lseek(a[0] as i32, a[1] as i64, a[2] as u32),
-        nr::EXIT | nr::EXIT_GROUP => sys_exit(a[0] as i32),
-        nr::GETPID | nr::GETTID => sys_getpid(),
+        nr::EXIT => sys_exit_thread(a[0] as i32),
+        nr::EXIT_GROUP => sys_exit_group(a[0] as i32),
+        nr::GETPID => sys_getpid(),
+        nr::GETTID => sys_gettid(),
         nr::GETPPID => Ok(1),
         nr::GETUID | nr::GETEUID | nr::GETGID | nr::GETEGID => Ok(0),
         nr::ARCH_PRCTL => sys_arch_prctl(a[0], a[1]),
@@ -101,7 +103,7 @@ fn handle(number: u64, a: [u64; 6], regs: &mut Regs) -> SysResult {
         nr::POLL | nr::PPOLL | nr::PSELECT6 | nr::SELECT => Ok(1),
         nr::NANOSLEEP => sys_nanosleep(a[0], a[1]),
         nr::CLOCK_NANOSLEEP => sys_nanosleep(a[2], a[3]),
-        nr::FUTEX => Ok(0),
+        nr::FUTEX => sys_futex(a[0], a[1] as u32, a[2] as u32),
         nr::SENDFILE => sys_sendfile(a[0] as i32, a[1] as i32, a[2], a[3] as usize),
         nr::PIPE => sys_pipe2(a[0], 0),
         nr::PIPE2 => sys_pipe2(a[0], a[1]),
@@ -110,6 +112,7 @@ fn handle(number: u64, a: [u64; 6], regs: &mut Regs) -> SysResult {
         nr::TGKILL => sys_tkill(a[1] as i32, a[2] as i32),
         nr::WAIT4 => sys_wait4(a[0] as i32, a[1], a[2] as u32),
         nr::FORK | nr::VFORK => sys_fork(regs),
+        nr::CLONE => sys_clone(a[0], a[1], a[2], a[3], a[4], regs),
         nr::EXECVE => sys_execve(a[0], a[1], a[2]),
         nr::ACCESS => sys_access(types::AT_FDCWD, a[0]),
         nr::FACCESSAT => sys_access(a[0] as i32, a[1]),
@@ -372,8 +375,8 @@ fn sys_brk(addr: u64) -> SysResult {
     let old = g.brk;
     if addr > old {
         let grow = addr - old; // addr > old: no underflow
-        g.space.map_region(old, grow, true, false);
-        flush_tlb();
+        // Reserve lazily: pages are faulted in (zeroed) on first touch.
+        g.space.reserve_region(old, grow, true, false);
     }
     g.brk = addr;
     Ok(addr)
@@ -412,22 +415,52 @@ fn sys_mmap(addr: u64, len: u64, _prot: u64, flags: u64, _fd: i32, _off: u64) ->
         g.mmap_next = next;
         b
     };
-    g.space.map_region(base, size, true, false);
-    flush_tlb();
+    // Anonymous mapping: reserve lazily (demand-paged, zero-filled).
+    g.space.reserve_region(base, size, true, false);
     Ok(base)
-}
-
-fn flush_tlb() {
-    x86_64::instructions::tlb::flush_all();
 }
 
 // --- process / misc --------------------------------------------------------
 
-fn sys_exit(code: i32) -> SysResult {
+/// `exit`: terminates only the calling thread. If it is the last thread in the
+/// group, the group's exit status is recorded and the parent notified. A
+/// clone(CLONE_CHILD_CLEARTID) thread clears its child-tid word and futex-wakes
+/// it (how `pthread_join` observes completion).
+fn sys_exit_thread(code: i32) -> SysResult {
+    // SAFETY: `current()` is this CPU's running thread.
+    let clear = unsafe { (*crate::percpu::current()).clear_child_tid };
+    if clear != 0 {
+        let _ = put_user(clear, 0u32);
+        futex_wake(clear);
+    }
+    let last = if let Some(p) = process::current() {
+        let mut g = p.lock();
+        g.thread_count = g.thread_count.saturating_sub(1);
+        let last = g.thread_count == 0;
+        if last {
+            g.exit_code = Some(code);
+        }
+        Some((last, g.ppid))
+    } else {
+        None
+    };
+    if let Some((true, ppid)) = last {
+        crate::signal::notify_parent(ppid);
+        process::notify_child_exit();
+        crate::log::info!("process exited with status {code}");
+    }
+    crate::scheduler::thread_exit();
+}
+
+/// `exit_group`: terminates the whole thread group. Records the status, notifies
+/// the parent, and exits the calling thread. (Sibling threads finish on their
+/// own next exit; a joined program has none left by here.)
+fn sys_exit_group(code: i32) -> SysResult {
     if let Some(p) = process::current() {
         let ppid = {
             let mut g = p.lock();
             g.exit_code = Some(code);
+            g.thread_count = 0;
             g.ppid
         };
         crate::signal::notify_parent(ppid);
@@ -435,6 +468,108 @@ fn sys_exit(code: i32) -> SysResult {
     process::notify_child_exit();
     crate::log::info!("process exited with status {code}");
     crate::scheduler::thread_exit();
+}
+
+fn sys_gettid() -> SysResult {
+    // SAFETY: this CPU's running thread.
+    Ok(unsafe { (*crate::percpu::current()).linux_tid } as u64)
+}
+
+// --- clone / futex ---------------------------------------------------------
+
+/// `clone`: with `CLONE_VM` creates a thread sharing this process's address
+/// space and fds (the pthread path); without it, falls back to `fork`.
+fn sys_clone(flags: u64, stack: u64, ptid: u64, ctid: u64, tls: u64, regs: &Regs) -> SysResult {
+    use x86_64::registers::model_specific::{FsBase, KernelGsBase};
+    const CLONE_VM: u64 = 0x0000_0100;
+    const CLONE_SETTLS: u64 = 0x0008_0000;
+    const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+    const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+    const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+
+    if flags & CLONE_VM == 0 {
+        // No shared address space: a fork is the correct, conservative behaviour.
+        return sys_fork(regs);
+    }
+
+    let proc = proc()?;
+    let cr3 = proc.lock().space.cr3();
+    let proc_ptr = core::ptr::from_ref(proc) as u64;
+    let tid = process::alloc_tid();
+
+    let mut child = *regs;
+    child.rax = 0;
+    if stack != 0 {
+        child.user_rsp = stack;
+    }
+    child.rflags = crate::signal::sanitize_user_rflags(child.rflags);
+
+    let fs = if flags & CLONE_SETTLS != 0 { tls } else { FsBase::read().as_u64() };
+    let user_gs = KernelGsBase::read().as_u64();
+
+    if flags & CLONE_PARENT_SETTID != 0 && ptid != 0 {
+        put_user(ptid, tid)?;
+    }
+    if flags & CLONE_CHILD_SETTID != 0 && ctid != 0 {
+        put_user(ctid, tid)?;
+    }
+    let clear = if flags & CLONE_CHILD_CLEARTID != 0 { ctid } else { 0 };
+
+    proc.lock().thread_count += 1;
+    // The address space is now shared across threads/CPUs.
+    usercopy::ADDRESS_SPACE_SHARED.store(true, Ordering::Relaxed);
+
+    crate::userspace::spawn_thread(child, cr3, proc_ptr, fs, user_gs, tid, clear)?;
+    Ok(tid as u64)
+}
+
+/// Fixed-size futex wait-queue hash (Linux-style): `(pid, uaddr)` hashes to a
+/// bucket; collisions only cause harmless spurious wakeups (callers re-check).
+static FUTEX_BUCKETS: [crate::scheduler::WaitQueue; 256] =
+    [const { crate::scheduler::WaitQueue::new() }; 256];
+
+fn futex_bucket(uaddr: u64) -> &'static crate::scheduler::WaitQueue {
+    let pid = process::current().map_or(0, |p| p.lock().pid) as u64;
+    let key = (uaddr >> 2).wrapping_add(pid.wrapping_mul(0x9e37_79b9));
+    &FUTEX_BUCKETS[(key % 256) as usize]
+}
+
+/// Wakes all futex waiters on `uaddr` (used by FUTEX_WAKE and thread-exit join).
+fn futex_wake(uaddr: u64) {
+    crate::scheduler::wake_all(futex_bucket(uaddr));
+}
+
+/// `futex`: the FUTEX_WAIT / FUTEX_WAKE subset (private or shared) that musl's
+/// locks and `pthread_join` need.
+fn sys_futex(uaddr: u64, op: u32, val: u32) -> SysResult {
+    const FUTEX_WAIT: u32 = 0;
+    const FUTEX_WAKE: u32 = 1;
+    const FUTEX_WAIT_BITSET: u32 = 9;
+    const FUTEX_WAKE_BITSET: u32 = 10;
+    let cmd = op & 0x7f;
+    let bucket = futex_bucket(uaddr);
+    match cmd {
+        FUTEX_WAIT | FUTEX_WAIT_BITSET => {
+            // Capture the wake generation BEFORE re-reading the word, so a wake
+            // in the gap refuses the block (no lost wakeup).
+            let generation = bucket.prepare();
+            let mut cur = [0u8; 4];
+            copy_from_user(uaddr, &mut cur)?;
+            if u32::from_le_bytes(cur) != val {
+                return Err(Errno::EAGAIN);
+            }
+            if proc()?.lock().sig.has_deliverable() {
+                return Err(Errno::EINTR);
+            }
+            crate::scheduler::block_with_gen(bucket, generation);
+            Ok(0)
+        }
+        FUTEX_WAKE | FUTEX_WAKE_BITSET => {
+            crate::scheduler::wake_all(bucket);
+            Ok(u64::from(val))
+        }
+        _ => Ok(0),
+    }
 }
 
 fn sys_arch_prctl(code: u64, addr: u64) -> SysResult {
@@ -484,13 +619,9 @@ fn sys_arch_prctl(code: u64, addr: u64) -> SysResult {
 }
 
 fn sys_set_tid_address(ptr: u64) -> SysResult {
-    let p = proc()?;
-    let pid = {
-        let mut g = p.lock();
-        g.clear_child_tid = ptr;
-        g.pid
-    };
-    Ok(pid as u64)
+    // SAFETY: this CPU's running thread; clear-child-tid is per-thread.
+    unsafe { (*crate::percpu::current()).clear_child_tid = ptr };
+    sys_gettid()
 }
 
 fn sys_ioctl(_fd: i32, request: u64, arg: u64) -> SysResult {
@@ -947,8 +1078,8 @@ fn sys_wait4(_pid: i32, wstatus: u64, options: u32) -> SysResult {
 fn sys_fork(regs: &Regs) -> SysResult {
     let parent = proc()?;
     let child = {
-        let p = parent.lock();
-        Process::fork_from(&p).ok_or(Errno::ENOMEM)?
+        let mut p = parent.lock();
+        Process::fork_from(&mut p).ok_or(Errno::ENOMEM)?
     };
     let child_pid = child.lock().pid;
     process::register(child.clone());

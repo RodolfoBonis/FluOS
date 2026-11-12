@@ -91,6 +91,10 @@ pub struct UserContext {
     pub proc_ptr: u64,
     pub fs_base: u64,
     pub user_gs: u64,
+    /// Linux tid for this thread (0 => default to kernel-thread/unset).
+    pub linux_tid: i32,
+    /// clear-child-tid pointer for `clone(CLONE_CHILD_CLEARTID)` (0 => none).
+    pub clear_child_tid: u64,
 }
 
 /// Spawns a kernel worker on `cpu_id`. Returns `EINVAL` if the CPU is offline.
@@ -119,6 +123,8 @@ pub fn spawn_user(
         (*t).proc_ptr = ctx.proc_ptr;
         (*t).fs_base = ctx.fs_base;
         (*t).user_gs = ctx.user_gs;
+        (*t).linux_tid = ctx.linux_tid;
+        (*t).clear_child_tid = ctx.clear_child_tid;
         (*t).tid()
     };
     THREADS.lock().push(tid);

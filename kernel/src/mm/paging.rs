@@ -22,6 +22,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// Translates a virtual address through the *currently active* page tables,
 /// returning its physical address if mapped. Used by the user-copy routines to
 /// reach user memory via the HHDM.
+#[allow(dead_code)] // general utility; usercopy now faults directly
 pub fn translate_active(vaddr: u64) -> Option<u64> {
     use x86_64::structures::paging::mapper::Translate;
     let hhdm = phys::hhdm_offset();
@@ -199,14 +200,57 @@ pub fn kernel_pml4_phys() -> u64 {
     KERNEL_PML4.load(Ordering::Acquire)
 }
 
-/// Acknowledges a TLB-shootdown IPI (incremented by the handler after flushing).
-/// The full sender-side wait protocol lands with `munmap` freeing frames.
+/// Acknowledgement counter, bumped by each CPU's TLB-shootdown IRQ after it
+/// flushes. The sender reads it before/after broadcasting to confirm every peer
+/// observed the change before the caller frees/repurposes the backing frames.
 static TLB_ACKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Called by the TLB-shootdown IRQ after flushing, so a future sender can wait
-/// for all CPUs to acknowledge before freeing the backing frames.
+/// Serialises shootdowns so the single global ack counter stays unambiguous.
+static SHOOTDOWN_LOCK: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
+
+/// Called by the TLB-shootdown IRQ after flushing this CPU's TLB.
 pub fn tlb_ack() {
     TLB_ACKS.fetch_add(1, Ordering::Release);
+}
+
+/// Broadcasts a TLB-shootdown to every other online CPU and spins until each has
+/// flushed and acknowledged, then returns. The local TLB is flushed too. Call
+/// this (not a bare local flush) after removing or downgrading a mapping in an
+/// address space that may be active on other CPUs — e.g. a shared (CLONE_VM)
+/// space — before the caller frees or reuses the affected frames (R-M3).
+///
+/// Must be called with interrupts enabled and without holding a lock a peer
+/// might need, or the peer could fail to service the IPI and the wait would
+/// stall (bounded by a timeout).
+pub fn shootdown_all() {
+    use crate::percpu;
+    x86_64::instructions::tlb::flush_all();
+    let _guard = SHOOTDOWN_LOCK.lock();
+    let me = percpu::cpu_id();
+    let n = percpu::count();
+    let base = TLB_ACKS.load(Ordering::Acquire);
+    let mut peers = 0u64;
+    for id in 0..n {
+        if id == me {
+            continue;
+        }
+        if let Some(c) = percpu::by_id(id) {
+            crate::arch::x86_64::apic::send_tlb_shootdown(c.lapic_id);
+            peers += 1;
+        }
+    }
+    if peers == 0 {
+        return;
+    }
+    let mut spins = 0u64;
+    while TLB_ACKS.load(Ordering::Acquire).wrapping_sub(base) < peers {
+        core::hint::spin_loop();
+        spins += 1;
+        if spins > 200_000_000 {
+            crate::log::warning!("tlb shootdown: timed out waiting for {peers} acks");
+            break;
+        }
+    }
 }
 
 /// Loads the kernel page tables on the calling CPU (used by APs, which start on

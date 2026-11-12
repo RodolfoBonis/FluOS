@@ -1,72 +1,101 @@
 //! Fault-safe copies between kernel and user memory.
 //!
-//! User pointers are validated (must lie in the lower, user half) and then
-//! reached through the HHDM alias of their backing frames. Because the HHDM is a
-//! supervisor mapping, these copies never touch a user (U=1) page directly, so
-//! SMAP is not engaged and no page fault can occur on a mapped address — the
-//! routines simply return `EFAULT` for any unmapped page. (Direct user-VA access
-//! with `stac`/`clac` and an exception-fixup table is a future optimization.)
+//! Copies go through [`copy_user`], a tiny assembly routine that accesses the
+//! user virtual addresses *directly* (bracketed by `stac`/`clac` so SMAP lets
+//! the kernel touch user pages). Two things make this safe:
+//!
+//! * A fault on a bad user address does not crash the kernel: the faulting
+//!   instruction is registered in an exception-fixup table ([`extable_fixup`]),
+//!   and the page-fault handler redirects it to a fixup that returns the number
+//!   of bytes left uncopied, which the wrappers turn into `EFAULT`.
+//! * Because the CPU performs the access itself, a demand-paged or copy-on-write
+//!   page faults normally and is resolved by the page-fault handler mid-copy —
+//!   no translate-then-copy window. That also makes it correct once a
+//!   `clone(CLONE_VM)` peer can mutate the address space concurrently (the old
+//!   validate-via-HHDM scheme was a TOCTOU there).
 
-use crate::mm::paging;
 use abi::Errno;
 use alloc::vec::Vec;
+use core::arch::global_asm;
 
-const PAGE: u64 = 4096;
 /// Exclusive upper bound of the user address range (canonical lower half).
 pub const USER_MAX: u64 = 0x0000_8000_0000_0000;
 
-/// Set true once `clone(CLONE_VM)` can create threads sharing an address space.
-/// While false (M4 so far) the validate-then-copy-via-HHDM scheme below is safe;
-/// once true it becomes a TOCTOU (a peer thread could `munmap` between the
-/// mapping check and the copy, after which the freed frame may be recycled), so
-/// the copy routines MUST switch to direct user-VA access with stac/clac and an
-/// exception-fixup table before that lands.
+/// Set once `clone(CLONE_VM)` threads share an address space. The direct-VA
+/// copies below are TOCTOU-safe either way, so this is now informational.
+#[allow(dead_code)] // set by clone(CLONE_VM); copies are TOCTOU-safe regardless
 pub static ADDRESS_SPACE_SHARED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-fn user_phys(vaddr: u64) -> Result<u64, Errno> {
-    debug_assert!(
-        !ADDRESS_SPACE_SHARED.load(core::sync::atomic::Ordering::Relaxed),
-        "usercopy via HHDM is a TOCTOU with shared address spaces; needs          stac/clac + exception fixup before CLONE_VM"
-    );
-    if vaddr >= USER_MAX {
+// `copy_user(dst, src, len) -> usize`: copies `len` bytes and returns the number
+// NOT copied (0 on success, the remaining count if a fault aborted it). The
+// `rep movsb` is the only faulting instruction; a fault there is redirected to
+// the `clac; mov rax,rcx; ret` tail via the exception-fixup table.
+global_asm!(
+    r#"
+.global fluos_copy_user
+.global fluos_copy_user_fault
+.global fluos_copy_user_fixup
+fluos_copy_user:
+    mov rcx, rdx
+    stac
+fluos_copy_user_fault:
+    rep movsb
+fluos_copy_user_fixup:
+    clac
+    mov rax, rcx
+    ret
+"#
+);
+
+unsafe extern "C" {
+    fn fluos_copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize;
+    fn fluos_copy_user_fault();
+    fn fluos_copy_user_fixup();
+}
+
+/// If `rip` is the faulting instruction of a user copy, returns the fixup
+/// address the page-fault handler should resume at. Called for kernel-mode
+/// faults only.
+#[must_use]
+pub fn extable_fixup(rip: u64) -> Option<u64> {
+    if rip == fluos_copy_user_fault as *const () as u64 {
+        Some(fluos_copy_user_fixup as *const () as u64)
+    } else {
+        None
+    }
+}
+
+/// Rejects a user range that is empty-safe but out of the user half or wrapping.
+fn check_range(uaddr: u64, len: usize) -> Result<(), Errno> {
+    let end = uaddr.checked_add(len as u64).ok_or(Errno::EFAULT)?;
+    if uaddr >= USER_MAX || end > USER_MAX {
         return Err(Errno::EFAULT);
     }
-    paging::translate_active(vaddr).ok_or(Errno::EFAULT)
+    Ok(())
 }
 
 /// Copies `out.len()` bytes from user address `uaddr` into `out`.
 pub fn copy_from_user(uaddr: u64, out: &mut [u8]) -> Result<(), Errno> {
-    let hhdm = crate::mm::phys::hhdm_offset();
-    let mut done = 0usize;
-    while done < out.len() {
-        let va = uaddr + done as u64;
-        let page_off = va & (PAGE - 1);
-        let chunk = ((PAGE - page_off) as usize).min(out.len() - done);
-        let phys = user_phys(va)?;
-        let src = (hhdm + phys) as *const u8;
-        // SAFETY: `phys` is a mapped frame; `chunk` stays within the page.
-        unsafe { core::ptr::copy_nonoverlapping(src, out.as_mut_ptr().add(done), chunk) };
-        done += chunk;
+    if out.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    check_range(uaddr, out.len())?;
+    // SAFETY: `copy_user` reads user memory with SMAP open and a registered
+    // fixup; a fault returns the uncopied count instead of crashing.
+    let left = unsafe { fluos_copy_user(out.as_mut_ptr(), uaddr as *const u8, out.len()) };
+    if left == 0 { Ok(()) } else { Err(Errno::EFAULT) }
 }
 
 /// Copies `data` into user memory at `uaddr`.
 pub fn copy_to_user(uaddr: u64, data: &[u8]) -> Result<(), Errno> {
-    let hhdm = crate::mm::phys::hhdm_offset();
-    let mut done = 0usize;
-    while done < data.len() {
-        let va = uaddr + done as u64;
-        let page_off = va & (PAGE - 1);
-        let chunk = ((PAGE - page_off) as usize).min(data.len() - done);
-        let phys = user_phys(va)?;
-        let dst = (hhdm + phys) as *mut u8;
-        // SAFETY: `phys` is a mapped frame; `chunk` stays within the page.
-        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr().add(done), dst, chunk) };
-        done += chunk;
+    if data.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    check_range(uaddr, data.len())?;
+    // SAFETY: as above; writing user memory (demand/CoW faults resolve mid-copy).
+    let left = unsafe { fluos_copy_user(uaddr as *mut u8, data.as_ptr(), data.len()) };
+    if left == 0 { Ok(()) } else { Err(Errno::EFAULT) }
 }
 
 /// Writes a `T` to user memory at `uaddr`.

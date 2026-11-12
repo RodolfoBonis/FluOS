@@ -16,6 +16,7 @@ use alloc::vec::Vec;
 use crate::sync::SpinLock;
 use core::sync::atomic::{AtomicI32, Ordering};
 use x86_64::structures::paging::mapper::Translate;
+use x86_64::structures::paging::page_table::PageTableEntry;
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags as Flags, PhysFrame,
     Size4KiB,
@@ -23,6 +24,7 @@ use x86_64::structures::paging::{
 use x86_64::{PhysAddr, VirtAddr};
 
 const PAGE: u64 = 4096;
+
 
 /// Frame source for user mappings; hands out zeroed frames.
 struct UserFrames;
@@ -34,10 +36,39 @@ unsafe impl FrameAllocator<Size4KiB> for UserFrames {
     }
 }
 
+/// Software PTE bit (available bit 9) marking a copy-on-write page.
+const PTE_COW: Flags = Flags::BIT_9;
+
+/// Flags for *intermediate* user page-table entries (PML4E/PDPTE/PDE). These
+/// must always be present/writable/user: x86 ANDs the R/W and U/S permissions
+/// across all levels, so a read-only parent would make every leaf beneath it
+/// effectively read-only. Actual permissions are enforced at the leaf only.
+/// (Plain `map_to` derives parent flags from the leaf, which breaks when the
+/// first leaf mapped under a table is read-only — e.g. code, or a CoW page.)
+const USER_PARENT_FLAGS: Flags =
+    Flags::PRESENT.union(Flags::WRITABLE).union(Flags::USER_ACCESSIBLE);
+
+/// A reserved-but-not-yet-populated user region (anonymous, zero-fill on first
+/// touch). Demand paging backs these lazily; the `kind` is kept minimal now but
+/// is the seam where file-backed MAP_PRIVATE mappings slot in later.
+#[derive(Clone, Copy)]
+struct Region {
+    start: u64,
+    end: u64,
+    writable: bool,
+    exec: bool,
+}
+
 /// A user virtual address space.
 pub struct AddressSpace {
     pml4_phys: u64,
     hhdm: u64,
+    /// Lazily-backed regions (brk, anonymous mmap), consulted on a page fault.
+    regions: Vec<Region>,
+    /// Pending CoW copies `(page, frame, exec)`: a write fault unmaps the shared
+    /// page and stashes the private writable copy; the retry faults non-present
+    /// and maps it.
+    pending_cow: Vec<(u64, u64, bool)>,
 }
 
 impl AddressSpace {
@@ -56,7 +87,7 @@ impl AddressSpace {
                 dst[i] = src[i].clone();
             }
         }
-        Some(Self { pml4_phys, hhdm })
+        Some(Self { pml4_phys, hhdm, regions: Vec::new(), pending_cow: Vec::new() })
     }
 
     /// Physical address of this space's PML4 (a CR3 value, PCID 0).
@@ -104,7 +135,11 @@ impl AddressSpace {
             let page = Page::<Size4KiB>::containing_address(VirtAddr::new(a));
             if let Some(frame) = frames.allocate_frame() {
                 // SAFETY: fresh user mapping into this space's inactive tables.
-                match unsafe { mapper.map_to(page, frame, flags, &mut frames) } {
+                // Intermediate entries are always writable/user (see
+                // USER_PARENT_FLAGS); permission is enforced at the leaf.
+                match unsafe {
+                    mapper.map_to_with_table_flags(page, frame, flags, USER_PARENT_FLAGS, &mut frames)
+                } {
                     Ok(flush) => flush.ignore(),
                     Err(_) => {} // already mapped — leave as is
                 }
@@ -146,72 +181,205 @@ impl AddressSpace {
         let mut mapper = self.mapper();
         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
         let frame = PhysFrame::containing_address(PhysAddr::new(phys));
-        // SAFETY: mapping an owned frame into this inactive address space.
-        if let Ok(flush) = unsafe { mapper.map_to(page, frame, flags, &mut frames) } {
+        // SAFETY: mapping an owned frame; intermediates stay writable/user.
+        if let Ok(flush) =
+            unsafe { mapper.map_to_with_table_flags(page, frame, flags, USER_PARENT_FLAGS, &mut frames) }
+        {
             flush.ignore();
         }
     }
 
-    /// Creates a child address space by eagerly copying every mapped user page
-    /// (the lower half). CoW is a future optimisation; eager copy is correct and
-    /// the fork-then-exec path discards the copy immediately anyway.
-    pub fn fork(&self) -> Option<AddressSpace> {
-        let mut child = AddressSpace::new()?;
+    /// Reserves `[vaddr, vaddr+size)` as a lazily-backed anonymous region: no
+    /// frames are mapped now; the first access faults in a zeroed page (demand
+    /// paging). Used by `brk`/anonymous `mmap`.
+    pub fn reserve_region(&mut self, vaddr: u64, size: u64, writable: bool, exec: bool) {
+        let start = vaddr & !(PAGE - 1);
+        let end = (vaddr + size + PAGE - 1) & !(PAGE - 1);
+        if end > start {
+            self.regions.push(Region { start, end, writable, exec });
+        }
+    }
+
+    /// Walks this space's tables to the leaf PTE for `vaddr`, returning a mutable
+    /// pointer if every level up to it is present (no huge pages). The space need
+    /// not be active (we go through the HHDM).
+    ///
+    /// # Safety
+    /// The returned pointer aliases this space's page tables; the caller must not
+    /// hold another reference to the same entry and must keep the space alive.
+    unsafe fn walk_pte(&self, vaddr: u64) -> Option<*mut PageTableEntry> {
         let hhdm = self.hhdm;
-        // SAFETY: the PML4 is HHDM-mapped; we only read present entries.
-        let pml4 = unsafe { &*((hhdm + self.pml4_phys) as *const PageTable) };
+        let idx = |lvl: u32| ((vaddr >> (12 + 9 * lvl)) & 0x1ff) as usize;
+        // SAFETY: each present, non-huge entry points at an HHDM-mapped table.
+        unsafe {
+            let pml4 = &mut *((hhdm + self.pml4_phys) as *mut PageTable);
+            let e4 = &mut pml4[idx(3)];
+            if !e4.flags().contains(Flags::PRESENT) {
+                return None;
+            }
+            let pdpt = &mut *((hhdm + e4.addr().as_u64()) as *mut PageTable);
+            let e3 = &mut pdpt[idx(2)];
+            if !e3.flags().contains(Flags::PRESENT) || e3.flags().contains(Flags::HUGE_PAGE) {
+                return None;
+            }
+            let pd = &mut *((hhdm + e3.addr().as_u64()) as *mut PageTable);
+            let e2 = &mut pd[idx(1)];
+            if !e2.flags().contains(Flags::PRESENT) || e2.flags().contains(Flags::HUGE_PAGE) {
+                return None;
+            }
+            let pt = &mut *((hhdm + e2.addr().as_u64()) as *mut PageTable);
+            Some(core::ptr::from_mut(&mut pt[idx(0)]))
+        }
+    }
+
+    /// Maps `phys` at `vaddr` with the exact `flags` (used to share a frame into
+    /// a child with copy-on-write flags during `fork`).
+    fn map_page_raw(&mut self, vaddr: u64, phys: u64, flags: Flags) {
+        let mut frames = UserFrames;
+        let mut mapper = self.mapper();
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
+        let frame = PhysFrame::containing_address(PhysAddr::new(phys));
+        // SAFETY: fresh mapping into this (inactive) child space; intermediate
+        // entries are forced writable/user so an RO leaf (code/CoW) does not
+        // make later writable leaves in the same subtree effectively RO.
+        if let Ok(flush) =
+            unsafe { mapper.map_to_with_table_flags(page, frame, flags, USER_PARENT_FLAGS, &mut frames) }
+        {
+            flush.ignore();
+        }
+    }
+
+    /// Creates a child via copy-on-write: every present user page is shared
+    /// read-only, writable pages are additionally marked CoW in BOTH spaces, and
+    /// the lazily-reserved regions are inherited. The actual copy happens on the
+    /// first write fault ([`handle_cow`]). The parent is the active space, so its
+    /// now-read-only pages are flushed from the local TLB before returning.
+    ///
+    /// NOTE: frames are shared without a per-frame refcount (address-space
+    /// teardown currently leaks user frames, so there is no double-free). A
+    /// refcount is required before frames are reclaimed on exit/munmap.
+    pub fn fork(&mut self) -> Option<AddressSpace> {
+        let mut child = AddressSpace::new()?;
+        child.regions = self.regions.clone();
+        let hhdm = self.hhdm;
+        // SAFETY: the PML4 is HHDM-mapped; we only touch present entries.
+        let pml4 = unsafe { &mut *((hhdm + self.pml4_phys) as *mut PageTable) };
         for i in 0..256 {
             if !pml4[i].flags().contains(Flags::PRESENT) {
                 continue;
             }
-            let pdpt = unsafe { &*((hhdm + pml4[i].addr().as_u64()) as *const PageTable) };
+            let pdpt = unsafe { &mut *((hhdm + pml4[i].addr().as_u64()) as *mut PageTable) };
             for j in 0..512 {
                 let e3 = &pdpt[j];
                 if !e3.flags().contains(Flags::PRESENT) || e3.flags().contains(Flags::HUGE_PAGE) {
                     continue;
                 }
-                let pd = unsafe { &*((hhdm + e3.addr().as_u64()) as *const PageTable) };
+                let pd = unsafe { &mut *((hhdm + e3.addr().as_u64()) as *mut PageTable) };
                 for k in 0..512 {
                     let e2 = &pd[k];
                     if !e2.flags().contains(Flags::PRESENT) || e2.flags().contains(Flags::HUGE_PAGE) {
                         continue;
                     }
-                    let pt = unsafe { &*((hhdm + e2.addr().as_u64()) as *const PageTable) };
-                    for (l, pte) in pt.iter().enumerate() {
+                    let pt = unsafe { &mut *((hhdm + e2.addr().as_u64()) as *mut PageTable) };
+                    for (l, pte) in pt.iter_mut().enumerate() {
                         let f = pte.flags();
                         if !f.contains(Flags::PRESENT) {
                             continue;
                         }
                         let vaddr = ((i as u64) << 39) | ((j as u64) << 30) | ((k as u64) << 21) | ((l as u64) << 12);
-                        let src = pte.addr().as_u64();
-                        let dst = phys::alloc_frame_zeroed()?;
-                        // SAFETY: both frames are HHDM-mapped and page-sized.
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                (hhdm + src) as *const u8,
-                                (hhdm + dst) as *mut u8,
-                                PAGE as usize,
-                            );
-                        }
-                        let writable = f.contains(Flags::WRITABLE);
-                        let exec = !f.contains(Flags::NO_EXECUTE);
-                        child.map_page_to(vaddr, dst, writable, exec);
+                        let frame = pte.addr().as_u64();
+                        let shared = if f.contains(Flags::WRITABLE) {
+                            let ro_cow = (f & !Flags::WRITABLE) | PTE_COW;
+                            pte.set_flags(ro_cow);
+                            ro_cow
+                        } else {
+                            f
+                        };
+                        child.map_page_raw(vaddr, frame, shared);
                     }
                 }
             }
         }
+        // The parent is active: flush its now-read-only entries locally.
+        x86_64::instructions::tlb::flush_all();
         Some(child)
     }
 
-    /// Resolves a demand-paging fault (not-present) at `vaddr`, if it lies in a
-    /// known region. Stub for now (returns unhandled).
-    pub fn handle_demand(&mut self, _vaddr: u64, _write: bool) -> bool {
-        false
+    /// Resolves a demand-paging fault (not-present) at `vaddr`: if it lies in a
+    /// reserved region (and the access is permitted), maps a fresh zeroed page.
+    pub fn handle_demand(&mut self, vaddr: u64, write: bool) -> bool {
+        let page = vaddr & !(PAGE - 1);
+        if let Some(i) = self.pending_cow.iter().position(|&(p, _, _)| p == page) {
+            let (_, frame, exec) = self.pending_cow.swap_remove(i);
+            self.map_page_to(page, frame, true, exec);
+            x86_64::instructions::tlb::flush(VirtAddr::new(page));
+            return true;
+        }
+        let Some(r) = self.regions.iter().find(|r| page >= r.start && page < r.end).copied() else {
+            return false;
+        };
+        if write && !r.writable {
+            return false; // write to a read-only region: genuine fault
+        }
+        // Lost the race to another fault that already mapped it? Then it's done.
+        // SAFETY: walk only reads the tables.
+        if let Some(pte) = unsafe { self.walk_pte(page) } {
+            if unsafe { (*pte).flags() }.contains(Flags::PRESENT) {
+                return true;
+            }
+        }
+        let Some(frame) = phys::alloc_frame_zeroed() else {
+            return false;
+        };
+        self.map_page_to(page, frame, r.writable, r.exec);
+        x86_64::instructions::tlb::flush(VirtAddr::new(page));
+        true
     }
 
-    /// Resolves a copy-on-write fault at `vaddr`. Stub for now.
-    pub fn handle_cow(&mut self, _vaddr: u64) -> bool {
-        false
+    /// Resolves a write fault at `vaddr`. Returns `true` if the page is (now)
+    /// writable: a copy-on-write page is copied and made writable; a page that is
+    /// already writable needs nothing; a read-only non-CoW page is a real fault.
+    pub fn handle_cow(&mut self, vaddr: u64) -> bool {
+        let page = vaddr & !(PAGE - 1);
+        // SAFETY: walk returns a pointer into this space's tables; we hold `&mut`.
+        let Some(pte) = (unsafe { self.walk_pte(page) }) else {
+            return false;
+        };
+        let f = unsafe { (*pte).flags() };
+        if !f.contains(Flags::PRESENT) {
+            return false;
+        }
+        if f.contains(Flags::WRITABLE) {
+            return true;
+        }
+        if !f.contains(PTE_COW) {
+            return false;
+        }
+        let old = unsafe { (*pte).addr().as_u64() };
+        let exec = !f.contains(Flags::NO_EXECUTE);
+        let Some(new) = phys::alloc_frame() else {
+            return false;
+        };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (self.hhdm + old) as *const u8,
+                (self.hhdm + new) as *mut u8,
+                PAGE as usize,
+            );
+        }
+        // Two-phase remap: unmap the shared page (making it non-present) and
+        // stash the private writable copy. The faulting instruction then retries
+        // and faults *non-present*, which `handle_demand` maps in. Going through
+        // the non-present state is deliberate: a protection-fault retry on a page
+        // left present (merely upgraded RO->RW) is not reliably re-checked by the
+        // TCG MMU, whereas a non-present fill always is.
+        let page_obj = Page::<Size4KiB>::containing_address(VirtAddr::new(page));
+        let mut mapper = self.mapper();
+        if let Ok((_f, flush)) = mapper.unmap(page_obj) {
+            flush.flush();
+        }
+        self.pending_cow.push((page, new, exec));
+        true
     }
 
     /// Translates a user virtual address to a physical address, if mapped.
@@ -221,8 +389,13 @@ impl AddressSpace {
     }
 }
 
-/// Monotonic PID source.
+/// Monotonic PID / TID source (Linux draws both from one id space).
 static NEXT_PID: AtomicI32 = AtomicI32::new(1);
+
+/// Allocates a fresh thread id (for `clone(CLONE_VM)` threads).
+pub fn alloc_tid() -> i32 {
+    NEXT_PID.fetch_add(1, Ordering::Relaxed)
+}
 
 /// A process: an address space plus the state syscalls mutate.
 pub struct Process {
@@ -234,8 +407,6 @@ pub struct Process {
     pub brk: u64,
     /// Start of the heap region, so `brk(0)` reports it.
     pub brk_start: u64,
-    /// `set_tid_address` clear-child-tid pointer (stored, cleared on exit).
-    pub clear_child_tid: u64,
     /// Next free address for anonymous `mmap` allocations (grows up).
     pub mmap_next: u64,
     /// Process group and session ids (job control).
@@ -248,6 +419,9 @@ pub struct Process {
     /// Scheduler tid of this process's (single) thread, for targeted wakeups
     /// (signals interrupting a blocked syscall). 0 until the thread is spawned.
     pub main_thread: u64,
+    /// Number of live threads in this thread group (1 until `clone(CLONE_VM)`
+    /// adds more). The last thread to exit reports the group's exit status.
+    pub thread_count: u32,
 }
 
 impl Process {
@@ -262,13 +436,13 @@ impl Process {
             fds: FdTable::new(),
             brk: 0,
             brk_start: 0,
-            clear_child_tid: 0,
             mmap_next: 0x6000_0000,
             pgid: pid,
             sid: pid,
             exit_code: None,
             sig: SignalState::new(),
             main_thread: 0,
+            thread_count: 1,
         })))
     }
 }
@@ -335,7 +509,7 @@ pub unsafe fn switch_mm(next: *mut crate::thread::Thread) {
 
 impl Process {
     /// Creates a child of `parent` (eager-copied address space, cloned fds).
-    pub fn fork_from(parent: &Process) -> Option<Arc<SpinLock<Process>>> {
+    pub fn fork_from(parent: &mut Process) -> Option<Arc<SpinLock<Process>>> {
         let space = parent.space.fork()?;
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
         Some(Arc::new(SpinLock::new(Process {
@@ -345,7 +519,6 @@ impl Process {
             fds: parent.fds.fork_clone(),
             brk: parent.brk,
             brk_start: parent.brk_start,
-            clear_child_tid: 0,
             mmap_next: parent.mmap_next,
             pgid: parent.pgid,
             sid: parent.sid,
@@ -354,6 +527,7 @@ impl Process {
             // does not cross `fork`.
             sig: parent.sig.forked(),
             main_thread: 0,
+            thread_count: 1,
         })))
     }
 }

@@ -183,18 +183,19 @@ pub fn run_selftest() {
     }
     let distinct = cpu_mask.count_ones();
 
-    // Exercise the IPI paths: nudge every peer to reschedule and flush its TLB.
+    // Exercise the IPI paths: nudge every peer to reschedule, then run a full
+    // TLB shootdown and wait for every peer to acknowledge (the R-M3 protocol).
     let mut peers = 0u32;
     for id in 0..ncpu {
         if id != bsp {
             if let Some(c) = percpu::by_id(id) {
                 apic::send_reschedule(c.lapic_id);
-                apic::send_tlb_shootdown(c.lapic_id);
                 peers += 1;
             }
         }
     }
-    crate::log::info!("selftest: sent reschedule + TLB-shootdown IPIs to {} peers", peers);
+    crate::mm::paging::shootdown_all();
+    crate::log::info!("selftest: reschedule IPIs to {peers} peers + TLB shootdown acked by all");
 
     // Read the aggregate stats with preemption disabled for a consistent snapshot.
     scheduler::preempt_disable();
