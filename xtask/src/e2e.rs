@@ -147,7 +147,14 @@ fn drive(con: &mut Console) -> Result<()> {
     con.send_line("cat /etc/hostname")?;
     con.wait_for_since(m, "fluos", Duration::from_secs(20))?;
 
-    // 5) Ctrl-C of a foreground job blocked in a tty read: the job must die and
+    // 5) a pipeline: echo | cat (exercises pipe2 + blocking pipe read/write and
+    // the shell's fork/dup2 plumbing). Arithmetic keeps the marker out of the
+    // typed command, so matching proves it flowed echo -> pipe -> cat -> tty.
+    let m = con.mark();
+    con.send_line("echo p$((6*7))x | cat")?;
+    con.wait_for_since(m, "p42x", Duration::from_secs(25))?;
+
+    // 6) Ctrl-C of a foreground job blocked in a tty read: the job must die and
     // the shell must survive and stay responsive. `cat` with no args blocks in
     // a (now signal-interruptible) read of the console; Ctrl-C delivers SIGINT
     // to the foreground group.

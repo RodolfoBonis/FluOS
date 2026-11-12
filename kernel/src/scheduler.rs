@@ -186,6 +186,19 @@ fn finish_switch() {
                 // the tick path can never wake a running thread (C1-B).
                 cpu.timers.lock().insert((*prev).wake_at, (*prev).tid());
             }
+            State::Blocked if (*prev).wait_queue != 0 => {
+                // Publish `prev` to its wait queue now that its context is saved.
+                // If a wake raced the block (the queue's generation advanced after
+                // `prev` captured it), publishing is refused and we make `prev`
+                // runnable again so it re-checks its condition — no lost wakeup.
+                let wq = &*((*prev).wait_queue as *const WaitQueue);
+                if !wq.publish((*prev).tid(), (*prev).block_gen) {
+                    (*prev).state = State::Ready;
+                    let weight = (*prev).weight;
+                    let vruntime = u128::from((*prev).vruntime.load(Ordering::Relaxed));
+                    cpu.runqueue.lock().insert_clamped((*prev).tid(), weight, vruntime);
+                }
+            }
             _ => {}
         }
     }
@@ -330,7 +343,195 @@ pub fn sleep_ticks(ticks: u64) {
     }
 }
 
-/// Idle-thread body: steal work if any, otherwise wait for an interrupt.
+/// A wait queue for event-driven blocking (pipes, `wait4`, ...). SMP-safe by the
+/// same discipline the sleep timer uses: a blocked thread is only *published*
+/// here by [`finish_switch`], after its context is fully saved, so no waker can
+/// run a half-saved thread. A generation counter closes the lost-wakeup window
+/// between a thread deciding to block and being published: if a wake bumps the
+/// generation in that window, publication is refused and the thread is re-run to
+/// re-check its condition.
+pub struct WaitQueue {
+    inner: SpinLock<WaitInner>,
+}
+
+struct WaitInner {
+    waiters: Vec<Tid>,
+    generation: u64,
+}
+
+impl WaitQueue {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { inner: SpinLock::new(WaitInner { waiters: Vec::new(), generation: 0 }) }
+    }
+
+    /// Current generation, captured under the *condition* lock before blocking.
+    fn generation(&self) -> u64 {
+        self.inner.lock().generation
+    }
+
+    /// Captures the current generation before a condition re-check, for the
+    /// prepare-then-check-then-block pattern (see [`block_with_gen`]).
+    #[must_use]
+    pub fn prepare(&self) -> u64 {
+        self.inner.lock().generation
+    }
+
+    /// Publishes a now-parked waiter unless its captured generation is stale.
+    /// Returns `false` if a wake raced it (caller must re-ready the thread).
+    fn publish(&self, tid: Tid, block_gen: u64) -> bool {
+        let mut g = self.inner.lock();
+        if g.generation == block_gen {
+            g.waiters.push(tid);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Bumps the generation and removes every waiter, returning them to wake.
+    fn take_all(&self) -> Vec<Tid> {
+        let mut g = self.inner.lock();
+        g.generation = g.generation.wrapping_add(1);
+        core::mem::take(&mut g.waiters)
+    }
+
+    /// Bumps the generation and removes a single waiter if present (targeted
+    /// wake, e.g. a signal). Returns whether `tid` was found in the queue.
+    fn remove_and_bump(&self, tid: Tid) -> bool {
+        let mut g = self.inner.lock();
+        g.generation = g.generation.wrapping_add(1);
+        if let Some(pos) = g.waiters.iter().position(|&t| t == tid) {
+            g.waiters.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Blocks the current thread on `wq` until [`wake_all`] runs. The caller MUST
+/// hold the lock guarding the wake condition while calling this (so the captured
+/// generation is consistent with the condition it just observed), and this
+/// releases nothing itself — the caller drops its guard via `before_block`,
+/// which runs after the state is set but before the switch.
+///
+/// `before_block` is where the caller releases the condition lock: it runs with
+/// interrupts disabled, after the thread is marked Blocked and bound to `wq`, so
+/// a concurrent waker either sees it published (and wakes it) or bumps the
+/// generation (and the publish is refused).
+pub fn block_on(wq: &WaitQueue, before_block: impl FnOnce()) {
+    let was_on = interrupts::are_enabled();
+    interrupts::disable();
+    let cpu = percpu::this();
+    let cur = percpu::current();
+    // SAFETY: `cur` is this CPU's running thread; only this CPU touches it here.
+    unsafe {
+        (*cur).block_gen = wq.generation();
+        (*cur).wait_queue = core::ptr::from_ref(wq) as u64;
+        (*cur).wake_at = 0;
+        (*cur).state = State::Blocked;
+    }
+    // Release the condition lock now that we are committed to blocking.
+    before_block();
+    schedule();
+    // Resumed: no longer parked on a queue.
+    // SAFETY: `cur` is this CPU's running thread again.
+    unsafe {
+        (*cur).wait_queue = 0;
+    }
+    let _ = cpu;
+    if was_on {
+        interrupts::enable();
+    }
+}
+
+/// Blocks the current thread on `wq` using a generation captured *before* the
+/// caller re-checked its wake condition (the prepare-then-check-then-block
+/// pattern). If a wake bumped the generation since `prepare`, the block is
+/// refused and the thread re-runs to re-check — closing the lost-wakeup window
+/// for conditions not guarded by a single lock (e.g. `wait4`).
+pub fn block_with_gen(wq: &WaitQueue, captured_gen: u64) {
+    let was_on = interrupts::are_enabled();
+    interrupts::disable();
+    let cur = percpu::current();
+    // SAFETY: `cur` is this CPU's running thread.
+    unsafe {
+        (*cur).block_gen = captured_gen;
+        (*cur).wait_queue = core::ptr::from_ref(wq) as u64;
+        (*cur).wake_at = 0;
+        (*cur).state = State::Blocked;
+    }
+    schedule();
+    // SAFETY: resumed as `cur`.
+    unsafe {
+        (*cur).wait_queue = 0;
+    }
+    if was_on {
+        interrupts::enable();
+    }
+}
+
+/// Wakes every thread blocked on `wq`, making them runnable on this CPU.
+pub fn wake_all(wq: &WaitQueue) {
+    let woken = wq.take_all();
+    if woken.is_empty() {
+        return;
+    }
+    let was_on = interrupts::are_enabled();
+    interrupts::disable();
+    let cpu = percpu::this();
+    for tid in woken {
+        // SAFETY: a tid in the wait queue is a live, fully-parked thread (it was
+        // published only by `finish_switch` after its context was saved).
+        unsafe {
+            let t = tid as *mut Thread;
+            if (*t).state == State::Blocked {
+                (*t).state = State::Ready;
+                (*t).wait_queue = 0;
+                let weight = (*t).weight;
+                let vruntime = u128::from((*t).vruntime.load(Ordering::Relaxed));
+                cpu.runqueue.lock().insert_clamped(tid, weight, vruntime);
+            }
+        }
+    }
+    if was_on {
+        interrupts::enable();
+    }
+}
+
+/// Wakes a single thread blocked on a wait queue (targeted — e.g. a signal must
+/// interrupt a blocked `read`/`wait4`). No-op if the thread is not blocked on a
+/// wait queue (a plain timed sleep is left to expire / re-check). Safe from IRQ
+/// context and from another CPU, by the same parked-thread discipline as
+/// [`wake_all`]: the thread is only touched once fully switched out.
+pub fn unblock(tid: Tid) {
+    let was_on = interrupts::are_enabled();
+    interrupts::disable();
+    let cpu = percpu::this();
+    // SAFETY: `tid` is a live thread; we only make a parked wait-queue sleeper
+    // runnable (or let the generation bump re-ready one still in the publish gap).
+    unsafe {
+        let t = tid as *mut Thread;
+        if (*t).state == State::Blocked && (*t).wait_queue != 0 {
+            let wq = &*((*t).wait_queue as *const WaitQueue);
+            if wq.remove_and_bump(tid) {
+                (*t).state = State::Ready;
+                (*t).wait_queue = 0;
+                let weight = (*t).weight;
+                let vruntime = u128::from((*t).vruntime.load(Ordering::Relaxed));
+                cpu.runqueue.lock().insert_clamped(tid, weight, vruntime);
+            }
+            // else: still in the publish gap — the generation bump makes
+            // `finish_switch` refuse to park it, so it re-checks its condition.
+        }
+    }
+    if was_on {
+        interrupts::enable();
+    }
+}
+
+/// Idle-thread body: steal work if any, otherwise wait for an interrupt./// Idle-thread body: steal work if any, otherwise wait for an interrupt.
 extern "C" fn idle_entry(_: usize) {
     run_idle();
 }

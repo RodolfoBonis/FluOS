@@ -49,7 +49,8 @@ pub fn spawn(elf_image: &[u8], argv: &[&str], envp: &[&str]) -> Result<Arc<SpinL
     let ptr = Arc::as_ptr(&proc) as u64;
 
     let ctx = scheduler::UserContext { cr3, proc_ptr: ptr, fs_base: 0, user_gs: 0 };
-    scheduler::spawn_user(user_thread_start, core::ptr::from_mut(ue) as usize, 0, crate::percpu::cpu_id(), ctx)?;
+    let tid = scheduler::spawn_user(user_thread_start, core::ptr::from_mut(ue) as usize, 0, crate::percpu::cpu_id(), ctx)?;
+    proc.lock().main_thread = tid as u64;
     Ok(proc)
 }
 
@@ -81,7 +82,8 @@ pub fn spawn_fork_child(child: &Arc<SpinLock<Process>>, regs: crate::arch::x86_6
         fs_base: FsBase::read().as_u64(),
         user_gs: KernelGsBase::read().as_u64(),
     };
-    scheduler::spawn_user(fork_child_start, core::ptr::from_mut(entry) as usize, 0, crate::percpu::cpu_id(), ctx)?;
+    let tid = scheduler::spawn_user(fork_child_start, core::ptr::from_mut(entry) as usize, 0, crate::percpu::cpu_id(), ctx)?;
+    child.lock().main_thread = tid as u64;
     Ok(())
 }
 

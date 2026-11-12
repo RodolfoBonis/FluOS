@@ -53,6 +53,13 @@ pub struct Thread {
     /// Wake deadline (local ticks) when Blocked on a sleep; 0 otherwise. Only
     /// touched by the owning CPU with interrupts off.
     pub wake_at: u64,
+    /// When Blocked on a wait queue, the `*const WaitQueue` it will be published
+    /// to (0 otherwise). Published only after the context switch completes, so
+    /// no other CPU can run a half-saved thread.
+    pub wait_queue: u64,
+    /// Wait-queue generation captured at block time, used to detect a wake that
+    /// raced the block and avoid a lost wakeup.
+    pub block_gen: u64,
     pub state: State,
     /// FXSAVE area; a raw pointer so it is reachable from the switch path.
     pub fpu: *mut u8,
@@ -120,6 +127,8 @@ impl Thread {
             weight,
             vruntime: AtomicU64::new(0),
             wake_at: 0,
+            wait_queue: 0,
+            block_gen: 0,
             state: State::Ready,
             fpu: Self::new_fpu(),
             stack,
@@ -149,6 +158,8 @@ impl Thread {
             weight,
             vruntime: AtomicU64::new(0),
             wake_at: 0,
+            wait_queue: 0,
+            block_gen: 0,
             state: State::Running,
             fpu: Self::new_fpu(),
             stack: core::ptr::null_mut(),

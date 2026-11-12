@@ -9,6 +9,7 @@
 
 use crate::fs::FdTable;
 use crate::signal::SignalState;
+use crate::scheduler::WaitQueue;
 use crate::mm::{paging, phys};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -244,6 +245,9 @@ pub struct Process {
     pub exit_code: Option<i32>,
     /// Signal dispositions, pending set, and blocked mask.
     pub sig: SignalState,
+    /// Scheduler tid of this process's (single) thread, for targeted wakeups
+    /// (signals interrupting a blocked syscall). 0 until the thread is spawned.
+    pub main_thread: u64,
 }
 
 impl Process {
@@ -264,6 +268,7 @@ impl Process {
             sid: pid,
             exit_code: None,
             sig: SignalState::new(),
+            main_thread: 0,
         })))
     }
 }
@@ -348,6 +353,7 @@ impl Process {
             // A child inherits handlers and the blocked mask; the pending set
             // does not cross `fork`.
             sig: parent.sig.forked(),
+            main_thread: 0,
         })))
     }
 }
@@ -368,6 +374,19 @@ pub fn reap_child(parent_pid: i32) -> Option<(i32, i32)> {
 /// Whether `parent_pid` has any live (unreaped) children.
 pub fn has_children(parent_pid: i32) -> bool {
     PROCS.lock().iter().any(|p| p.lock().ppid == parent_pid)
+}
+
+/// Wait queue a parent blocks on in `wait4`; woken whenever any process exits.
+static CHILD_EXIT: WaitQueue = WaitQueue::new();
+
+/// The child-exit wait queue (for `wait4` to block on).
+pub fn child_exit_wq() -> &'static WaitQueue {
+    &CHILD_EXIT
+}
+
+/// Wakes every parent blocked in `wait4` (a child changed state).
+pub fn notify_child_exit() {
+    crate::scheduler::wake_all(&CHILD_EXIT);
 }
 
 /// Runs `f` against the process with pid `pid` (under its lock), returning the

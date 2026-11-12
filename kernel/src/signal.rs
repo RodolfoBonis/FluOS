@@ -16,6 +16,7 @@ use crate::arch::x86_64::context;
 use crate::arch::x86_64::user::Regs;
 use crate::process::{self, Process};
 use abi::types;
+use alloc::vec::Vec;
 
 /// Highest supported signal number (1..=NSIG).
 pub const NSIG: usize = 64;
@@ -176,14 +177,34 @@ fn post(p: &mut Process, sig: i32) -> bool {
 /// Sends `sig` to the process with pid `pid`. Returns `true` if delivered to a
 /// live process. Safe to call from IRQ context (the process lock is IRQ-safe).
 pub fn send_to_pid(pid: i32, sig: i32) -> bool {
-    process::with_pid(pid, |p| post(p, sig)).unwrap_or(false)
+    // Post under the process lock; if the signal is now deliverable, wake the
+    // target's thread (outside the lock) so a blocked syscall is interrupted.
+    let tid = process::with_pid(pid, |p| {
+        if post(p, sig) && p.sig.has_deliverable() { p.main_thread } else { 0 }
+    });
+    match tid {
+        Some(t) => {
+            if t != 0 {
+                crate::scheduler::unblock(t);
+            }
+            true
+        }
+        None => false,
+    }
 }
 
 /// Sends `sig` to every process in group `pgid`. Returns the count reached.
 pub fn send_to_pgrp(pgid: i32, sig: i32) -> usize {
-    process::for_each_in_pgrp(pgid, |p| {
-        post(p, sig);
-    })
+    let mut wake: Vec<u64> = Vec::new();
+    let n = process::for_each_in_pgrp(pgid, |p| {
+        if post(p, sig) && p.sig.has_deliverable() && p.main_thread != 0 {
+            wake.push(p.main_thread);
+        }
+    });
+    for t in wake {
+        crate::scheduler::unblock(t);
+    }
+    n
 }
 
 /// Notifies `ppid` that a child changed state (used on exit).
@@ -381,6 +402,7 @@ fn terminate(sig: i32) -> ! {
         };
         notify_parent(ppid);
     }
+    process::notify_child_exit();
     let pid = process::current().map(|p| p.lock().pid);
     crate::log::info!("process {pid:?} terminated by signal {sig}");
     crate::scheduler::thread_exit();

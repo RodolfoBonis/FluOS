@@ -9,8 +9,10 @@
 
 use abi::types;
 use abi::{Errno, SysResult};
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use crate::scheduler::WaitQueue;
 use crate::sync::SpinLock;
 use core::sync::atomic::{AtomicI32, Ordering};
 use vfs::{Ino, Vfs};
@@ -159,6 +161,120 @@ pub enum FileKind {
     File { ino: Ino, offset: u64 },
     /// A directory open for `getdents64`.
     Dir { ino: Ino, pos: usize },
+    /// One end of an anonymous pipe. `write_end` distinguishes the two ends;
+    /// both share the same [`Pipe`].
+    Pipe { pipe: Arc<Pipe>, write_end: bool },
+}
+
+/// Maximum bytes buffered in a pipe before writers block.
+const PIPE_CAP: usize = 64 * 1024;
+
+/// An anonymous pipe: a bounded byte buffer with reader/writer end counts and
+/// two wait queues (readers waiting for data, writers waiting for space).
+pub struct Pipe {
+    inner: SpinLock<PipeInner>,
+    read_wq: WaitQueue,
+    write_wq: WaitQueue,
+}
+
+struct PipeInner {
+    buf: VecDeque<u8>,
+    readers: u32,
+    writers: u32,
+}
+
+impl Pipe {
+    fn new() -> Arc<Pipe> {
+        Arc::new(Pipe {
+            inner: SpinLock::new(PipeInner { buf: VecDeque::new(), readers: 1, writers: 1 }),
+            read_wq: WaitQueue::new(),
+            write_wq: WaitQueue::new(),
+        })
+    }
+}
+
+/// Reads from the read end, blocking while the pipe is empty and writers remain.
+/// Returns 0 at EOF (all write ends closed) and `ERESTARTSYS` if a signal is
+/// pending (so it can be delivered on the syscall-return path).
+fn pipe_read(pipe: &Arc<Pipe>, buf: &mut [u8]) -> SysResult {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    loop {
+        let inner = pipe.inner.lock();
+        if !inner.buf.is_empty() {
+            let mut g = inner;
+            let n = buf.len().min(g.buf.len());
+            for slot in buf.iter_mut().take(n) {
+                *slot = g.buf.pop_front().unwrap();
+            }
+            drop(g);
+            crate::scheduler::wake_all(&pipe.write_wq); // space freed
+            return Ok(n as u64);
+        }
+        if inner.writers == 0 {
+            return Ok(0); // EOF: no writers and buffer drained
+        }
+        if crate::signal::current_has_deliverable() {
+            return Err(Errno::ERESTARTSYS);
+        }
+        // Block until a writer adds data or closes. The pipe lock guards the
+        // condition; `block_on` captures the wait-queue generation before the
+        // closure releases it, so a wake in the gap cannot be lost.
+        crate::scheduler::block_on(&pipe.read_wq, move || drop(inner));
+    }
+}
+
+/// Writes to the write end, blocking while the pipe is full and readers remain.
+/// Returns the number of bytes written (>=1 once it makes progress), `EPIPE`
+/// (after raising SIGPIPE) if all readers have gone, or `ERESTARTSYS`.
+fn pipe_write(pipe: &Arc<Pipe>, buf: &[u8]) -> SysResult {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    loop {
+        let inner = pipe.inner.lock();
+        if inner.readers == 0 {
+            drop(inner);
+            // Writing to a pipe with no readers: SIGPIPE + EPIPE.
+            if let Some(p) = crate::process::current() {
+                let pid = p.lock().pid;
+                crate::signal::send_to_pid(pid, abi::types::SIGPIPE);
+            }
+            return Err(Errno::EPIPE);
+        }
+        let space = PIPE_CAP - inner.buf.len();
+        if space > 0 {
+            let mut g = inner;
+            let n = buf.len().min(space);
+            g.buf.extend(buf[..n].iter().copied());
+            drop(g);
+            crate::scheduler::wake_all(&pipe.read_wq); // data available
+            return Ok(n as u64);
+        }
+        if crate::signal::current_has_deliverable() {
+            return Err(Errno::ERESTARTSYS);
+        }
+        crate::scheduler::block_on(&pipe.write_wq, move || drop(inner));
+    }
+}
+
+/// Creates a pipe and returns its (read end, write end) open files.
+pub fn make_pipe(flags: u64) -> (Arc<SpinLock<OpenFile>>, Arc<SpinLock<OpenFile>>) {
+    let pipe = Pipe::new();
+    let rd = Arc::new(SpinLock::new(OpenFile {
+        kind: FileKind::Pipe { pipe: pipe.clone(), write_end: false },
+        flags,
+        readable: true,
+        writable: false,
+    }));
+    let wr = Arc::new(SpinLock::new(OpenFile {
+        kind: FileKind::Pipe { pipe, write_end: true },
+        flags,
+        readable: false,
+        writable: true,
+    }));
+    (rd, wr)
 }
 
 /// An open file (shared between descriptors via `Arc`).
@@ -168,6 +284,28 @@ pub struct OpenFile {
     pub flags: u64,
     pub readable: bool,
     pub writable: bool,
+}
+
+impl Drop for OpenFile {
+    fn drop(&mut self) {
+        // Closing a pipe end updates the end count and wakes the peer so it sees
+        // EOF (reader) or that writers remain/left (writer).
+        if let FileKind::Pipe { pipe, write_end } = &self.kind {
+            {
+                let mut inner = pipe.inner.lock();
+                if *write_end {
+                    inner.writers = inner.writers.saturating_sub(1);
+                } else {
+                    inner.readers = inner.readers.saturating_sub(1);
+                }
+            }
+            if *write_end {
+                crate::scheduler::wake_all(&pipe.read_wq);
+            } else {
+                crate::scheduler::wake_all(&pipe.write_wq);
+            }
+        }
+    }
 }
 
 impl OpenFile {
@@ -273,10 +411,24 @@ impl FdTable {
 
 /// Reads from an open file into `buf`, returning the byte count.
 pub fn read(file: &Arc<SpinLock<OpenFile>>, buf: &mut [u8]) -> SysResult {
-    let mut f = file.lock();
-    if !f.readable {
-        return Err(Errno::EBADF);
+    // A pipe read can block, so extract the shared pipe and release the
+    // (interrupt-disabling) OpenFile lock before blocking on it.
+    let pipe = {
+        let f = file.lock();
+        if !f.readable {
+            return Err(Errno::EBADF);
+        }
+        match &f.kind {
+            FileKind::Pipe { pipe, write_end: false } => Some(pipe.clone()),
+            FileKind::Pipe { .. } => return Err(Errno::EBADF),
+            _ => None,
+        }
+    };
+    if let Some(pipe) = pipe {
+        return pipe_read(&pipe, buf);
     }
+
+    let mut f = file.lock();
     match &mut f.kind {
         FileKind::Device(dev) => device_read(*dev, buf),
         FileKind::File { ino, offset } => {
@@ -285,15 +437,28 @@ pub fn read(file: &Arc<SpinLock<OpenFile>>, buf: &mut [u8]) -> SysResult {
             Ok(n as u64)
         }
         FileKind::Dir { .. } => Err(Errno::EISDIR),
+        FileKind::Pipe { .. } => unreachable!("pipe handled above"),
     }
 }
 
 /// Writes `buf` to an open file, returning the byte count.
 pub fn write(file: &Arc<SpinLock<OpenFile>>, buf: &[u8]) -> SysResult {
-    let mut f = file.lock();
-    if !f.writable {
-        return Err(Errno::EBADF);
+    let pipe = {
+        let f = file.lock();
+        if !f.writable {
+            return Err(Errno::EBADF);
+        }
+        match &f.kind {
+            FileKind::Pipe { pipe, write_end: true } => Some(pipe.clone()),
+            FileKind::Pipe { .. } => return Err(Errno::EBADF),
+            _ => None,
+        }
+    };
+    if let Some(pipe) = pipe {
+        return pipe_write(&pipe, buf);
     }
+
+    let mut f = file.lock();
     match &mut f.kind {
         FileKind::Device(dev) => device_write(*dev, buf),
         FileKind::File { ino, offset } => {
@@ -302,6 +467,7 @@ pub fn write(file: &Arc<SpinLock<OpenFile>>, buf: &[u8]) -> SysResult {
             Ok(n as u64)
         }
         FileKind::Dir { .. } => Err(Errno::EISDIR),
+        FileKind::Pipe { .. } => unreachable!("pipe handled above"),
     }
 }
 

@@ -67,6 +67,7 @@ impl Errno {
     pub const EAGAIN: Errno = Errno(EAGAIN);
     pub const EINTR: Errno = Errno(EINTR);
     pub const ERESTARTSYS: Errno = Errno(ERESTARTSYS);
+    pub const EPIPE: Errno = Errno(EPIPE);
 
     /// The value a syscall returns for this error: the negated errno.
     #[must_use]

@@ -119,6 +119,7 @@ fn kill_current(signal: i32, name: &str, f: &TrapFrame) -> ! {
         crate::signal::notify_parent(ppid);
         pid
     });
+    crate::process::notify_child_exit();
     crate::log::error!(
         "user fault: {name} at rip={:#018x} (pid={pid:?}) -> killed by signal {signal}",
         f.rip,

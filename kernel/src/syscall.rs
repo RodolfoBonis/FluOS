@@ -103,6 +103,8 @@ fn handle(number: u64, a: [u64; 6], regs: &mut Regs) -> SysResult {
         nr::CLOCK_NANOSLEEP => sys_nanosleep(a[2], a[3]),
         nr::FUTEX => Ok(0),
         nr::SENDFILE => sys_sendfile(a[0] as i32, a[1] as i32, a[2], a[3] as usize),
+        nr::PIPE => sys_pipe2(a[0], 0),
+        nr::PIPE2 => sys_pipe2(a[0], a[1]),
         nr::KILL => sys_kill(a[0] as i32, a[1] as i32),
         nr::TKILL => sys_tkill(a[0] as i32, a[1] as i32),
         nr::TGKILL => sys_tkill(a[1] as i32, a[2] as i32),
@@ -430,6 +432,7 @@ fn sys_exit(code: i32) -> SysResult {
         };
         crate::signal::notify_parent(ppid);
     }
+    process::notify_child_exit();
     crate::log::info!("process exited with status {code}");
     crate::scheduler::thread_exit();
 }
@@ -595,6 +598,11 @@ fn sys_fstat(fd_num: i32, statbuf: u64) -> SysResult {
                 s.st_rdev = 0;
                 s
             }
+            fs::FileKind::Pipe { .. } => {
+                let mut s = types::Stat::default();
+                s.st_mode = types::S_IFIFO | 0o600;
+                s
+            }
         }
     };
     write_stat(statbuf, &st)
@@ -747,6 +755,24 @@ fn sys_sendfile(out_fd: i32, in_fd: i32, offset_ptr: u64, count: usize) -> SysRe
 /// `kill`: post `sig` to a pid (`pid > 0`), a process group (`pid < -1` or
 /// `pid == 0` for the caller's group), or broadcast (`pid == -1`, best-effort).
 /// `sig == 0` is an existence/permission probe.
+/// `pipe2(pipefd[2], flags)` (and `pipe` with flags=0): creates a pipe and
+/// installs its read/write ends at the two lowest free descriptors.
+fn sys_pipe2(uaddr: u64, flags: u64) -> SysResult {
+    let (rd, wr) = fs::make_pipe(flags);
+    let p = proc()?;
+    let (rfd, wfd) = {
+        let mut g = p.lock();
+        let rfd = g.fds.alloc(rd);
+        let wfd = g.fds.alloc(wr);
+        (rfd, wfd)
+    };
+    let mut raw = [0u8; 8];
+    raw[0..4].copy_from_slice(&rfd.to_le_bytes());
+    raw[4..8].copy_from_slice(&wfd.to_le_bytes());
+    copy_to_user(uaddr, &raw)?;
+    Ok(0)
+}
+
 fn sys_kill(pid: i32, sig: i32) -> SysResult {
     if !(0..=crate::signal::NSIG as i32).contains(&sig) {
         return Err(Errno::EINVAL);
@@ -822,7 +848,10 @@ fn sys_nanosleep(req: u64, rem: u64) -> SysResult {
                 return Err(Errno::ERESTARTSYS);
             }
         }
-        crate::scheduler::yield_now();
+        // Really sleep (descheduled) rather than busy-yield, in short chunks so
+        // a signal is noticed within a tick or so.
+        let remaining = deadline - now;
+        crate::scheduler::sleep_ticks(remaining.min(4));
     }
 }
 
@@ -886,6 +915,11 @@ fn sys_wait4(_pid: i32, wstatus: u64, options: u32) -> SysResult {
     const WNOHANG: u32 = 1;
     let parent = cur_pid()?;
     loop {
+        // Capture the wait-queue generation BEFORE re-checking for an exited
+        // child, so a child that exits in the gap before we block either is
+        // reaped now or bumps the generation and refuses our block (no lost
+        // wakeup, even though the condition spans multiple locks).
+        let wq_gen = process::child_exit_wq().prepare();
         if let Some((child_pid, code)) = process::reap_child(parent) {
             if wstatus != 0 {
                 // W_EXITCODE(code, 0): low 8 bits signal, next 8 exit code.
@@ -904,7 +938,7 @@ fn sys_wait4(_pid: i32, wstatus: u64, options: u32) -> SysResult {
                 return Err(Errno::ERESTARTSYS);
             }
         }
-        crate::scheduler::yield_now();
+        crate::scheduler::block_with_gen(process::child_exit_wq(), wq_gen);
     }
 }
 

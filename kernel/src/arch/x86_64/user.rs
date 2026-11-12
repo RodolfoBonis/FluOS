@@ -160,6 +160,7 @@ extern "C" fn bad_sysret(regs: &Regs) -> ! {
         };
         crate::signal::notify_parent(ppid);
     }
+    crate::process::notify_child_exit();
     crate::scheduler::thread_exit();
 }
 
