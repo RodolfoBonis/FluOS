@@ -176,6 +176,48 @@ where
     }
 }
 
+/// Reconstructs an `OffsetPageTable` over the *currently active* PML4, so we
+/// can add mappings after the initial switch (e.g. for device MMIO).
+fn active_mapper(hhdm: u64) -> OffsetPageTable<'static> {
+    let (frame, _) = Cr3::read();
+    // SAFETY: CR3 holds our PML4; it is mapped through the HHDM and owned by
+    // the kernel, so forming a mutable reference to it is sound in the
+    // single-threaded bring-up path.
+    unsafe {
+        let pml4 = &mut *((hhdm + frame.start_address().as_u64()) as *mut PageTable);
+        OffsetPageTable::new(pml4, VirtAddr::new(hhdm))
+    }
+}
+
+/// Maps a device MMIO region at `phys_base..phys_base+size` into the HHDM as
+/// uncacheable, writable, non-executable pages, so the kernel can reach APIC and
+/// similar registers that live above RAM (outside the initial direct map).
+pub fn map_mmio(phys_base: u64, size: u64) {
+    let hhdm = phys::hhdm_offset();
+    let mut mapper = active_mapper(hhdm);
+    let mut frames = Frames;
+    let flags = Flags::PRESENT | Flags::WRITABLE | Flags::NO_EXECUTE | Flags::NO_CACHE;
+
+    let start = phys_base & !(KIB4 - 1);
+    let end = (phys_base + size).div_ceil(KIB4) * KIB4;
+    let mut p = start;
+    while p < end {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(hhdm + p));
+        let frame = PhysFrame::containing_address(PhysAddr::new(p));
+        // SAFETY: mapping a device page to its own physical frame in the active
+        // tables; the region is MMIO, so no RAM is aliased.
+        match unsafe { mapper.map_to(page, frame, flags, &mut frames) } {
+            Ok(flush) => flush.flush(),
+            // Already reachable: either an explicit 4 KiB mapping or, more
+            // commonly, covered by a 1 GiB HHDM huge page (APIC MMIO sits in the
+            // high direct-mapped range). Both are fine — we can touch it as-is.
+            Err(MapToError::PageAlreadyMapped(_)) | Err(MapToError::ParentEntryHugePage) => {}
+            Err(e) => panic!("MMIO mapping failed: {e:?}"),
+        }
+        p += KIB4;
+    }
+}
+
 /// Whether the CPU supports 1 GiB pages (CPUID 8000_0001h EDX bit 26).
 fn supports_1gib_pages() -> bool {
     // `__cpuid_count` is safe: it only reads CPU identification data.

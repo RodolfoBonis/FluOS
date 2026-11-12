@@ -1,9 +1,13 @@
 //! x86_64 architecture support.
 
+pub mod acpi;
+pub mod apic;
 pub mod cpu;
 pub mod gdt;
 pub mod idt;
+pub mod input;
 pub mod port;
+pub mod ps2;
 pub mod serial;
 
 /// Installs the GDT/TSS and IDT on the bootstrap processor. After this call the

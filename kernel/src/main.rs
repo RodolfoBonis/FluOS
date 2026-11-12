@@ -6,10 +6,12 @@
 
 mod arch;
 mod boot;
+mod console;
+mod demo;
+mod font;
 mod log;
 mod mm;
 mod panic;
-mod video;
 
 extern crate alloc;
 
@@ -48,13 +50,26 @@ extern "C" fn kmain() -> ! {
     mm::init(info.hhdm_offset);
 
     if let Some(fb) = boot::framebuffer() {
-        video::splash(&fb);
-        log::info!("framebuffer: {}x{} {}bpp", fb.width, fb.height, fb.bpp);
+        console::init(&fb);
+        log::info!(
+            "console: {}x{} framebuffer, {}x{} px cells",
+            fb.width,
+            fb.height,
+            font::CELL_W,
+            font::CELL_H
+        );
+        demo::starship_prompt();
     } else {
         log::warning!("no framebuffer provided by bootloader");
     }
 
     log::info!("boot complete");
+    // Under the test harness this exits QEMU right after the prompt renders.
     arch::x86_64::qemu_exit_if_requested(boot::cmdline());
+
+    // Interactive path: bring up interrupts + keyboard and echo typed keys.
+    if console::is_ready() {
+        demo::input_echo_loop();
+    }
     arch::x86_64::halt_forever()
 }

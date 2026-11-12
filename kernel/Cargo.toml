@@ -14,3 +14,7 @@ limine = "0.6.5"
 spin = "0.10"
 x86_64 = "0.15"
 mm = { path = "../crates/mm" }
+tty = { path = "../crates/tty" }
+
+[build-dependencies]
+fontdue = "0.9"

@@ -9,8 +9,8 @@
 //! Double-fault, NMI, and machine-check run on private IST stacks (see
 //! [`super::gdt`]) because they can fire when the current stack is unusable.
 
-use super::gdt;
-use spin::Lazy;
+use super::{apic, gdt, input, ps2};
+use spin::{Lazy, Mutex};
 use x86_64::registers::control::{Cr0, Cr2, Cr3, Cr4};
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
@@ -115,6 +115,21 @@ extern "x86-interrupt" fn machine_check(frame: InterruptStackFrame) -> ! {
     panic!("machine check");
 }
 
+/// Decoder state shared between successive keyboard IRQs.
+static KEYBOARD: Mutex<ps2::Keyboard> = Mutex::new(ps2::Keyboard::new());
+
+/// PS/2 keyboard IRQ: read the scancode, decode it, queue the bytes, ack.
+extern "x86-interrupt" fn keyboard_interrupt(_frame: InterruptStackFrame) {
+    // SAFETY: reading the i8042 data port fetches the scancode and clears the
+    // controller's output-buffer-full condition that raised this IRQ.
+    let code = unsafe { super::port::inb(0x60) };
+    KEYBOARD.lock().feed(code, input::push);
+    apic::eoi();
+}
+
+/// LAPIC spurious interrupt: by design it needs no end-of-interrupt.
+extern "x86-interrupt" fn spurious_interrupt(_frame: InterruptStackFrame) {}
+
 static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
     idt.divide_error.set_handler_fn(divide_error);
@@ -148,6 +163,8 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
             .set_handler_fn(machine_check)
             .set_stack_index(gdt::MACHINE_CHECK_IST_INDEX);
     }
+    idt[apic::KEYBOARD_VECTOR].set_handler_fn(keyboard_interrupt);
+    idt[apic::SPURIOUS_VECTOR].set_handler_fn(spurious_interrupt);
     idt
 });
 

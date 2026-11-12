@@ -2,7 +2,7 @@
 
 use limine::request::{
     BootloaderInfoRequest, ExecutableAddressRequest, ExecutableCmdlineRequest, FramebufferRequest,
-    HhdmRequest, MemmapRequest,
+    HhdmRequest, MemmapRequest, RsdpRequest,
 };
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker, memmap};
 
@@ -37,6 +37,10 @@ static FRAMEBUFFER: FramebufferRequest = FramebufferRequest::new();
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 static CMDLINE: ExecutableCmdlineRequest = ExecutableCmdlineRequest::new();
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static RSDP: RsdpRequest = RsdpRequest::new();
 
 #[used]
 #[unsafe(link_section = ".limine_requests_end")]
@@ -94,6 +98,13 @@ pub fn kernel_address() -> (u64, u64) {
     (resp.physical_base, resp.virtual_base)
 }
 
+/// ACPI RSDP pointer (a higher-half address under base revision >= 1), if the
+/// firmware provided one.
+pub fn rsdp_addr() -> Option<*const ()> {
+    let addr = RSDP.response()?.address;
+    (!addr.is_null()).then_some(addr as *const ())
+}
+
 /// Kernel command line, empty when the bootloader passed none.
 pub fn cmdline() -> &'static str {
     CMDLINE.response().map_or("", |r| r.cmdline())
@@ -106,6 +117,7 @@ pub struct Framebuffer {
     pub height: usize,
     /// Bytes per scanline.
     pub pitch: usize,
+    #[allow(dead_code)] // reported for diagnostics; render path assumes 32bpp
     pub bpp: u16,
 }
 
