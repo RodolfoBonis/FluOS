@@ -70,6 +70,7 @@ pub const TKILL: u64 = 200;
 pub const GETTID: u64 = 186;
 pub const TGKILL: u64 = 234;
 pub const FUTEX: u64 = 202;
+pub const SCHED_SETAFFINITY: u64 = 203;
 pub const SCHED_GETAFFINITY: u64 = 204;
 pub const GETDENTS64: u64 = 217;
 pub const SET_TID_ADDRESS: u64 = 218;
@@ -160,6 +161,7 @@ pub fn name(nr: u64) -> Option<&'static str> {
         TGKILL => "tgkill",
         GETTID => "gettid",
         FUTEX => "futex",
+        SCHED_SETAFFINITY => "sched_setaffinity",
         SCHED_GETAFFINITY => "sched_getaffinity",
         GETDENTS64 => "getdents64",
         SET_TID_ADDRESS => "set_tid_address",

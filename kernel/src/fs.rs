@@ -109,6 +109,7 @@ mod dev {
     pub const URANDOM: u64 = (1 << 8) | 9;
     pub const CONSOLE: u64 = (5 << 8) | 1;
     pub const TTY: u64 = 5 << 8; // /dev/tty
+    pub const PTMX: u64 = (5 << 8) | 2; // /dev/ptmx
 }
 
 /// Builds the root filesystem: unpacks the initramfs (if any) and creates the
@@ -131,6 +132,9 @@ pub fn init(initramfs: Option<&[u8]>) {
     let _ = fs.mknod_char(dev, "urandom", 0o444, dev::URANDOM);
     let _ = fs.mknod_char(dev, "console", 0o600, dev::CONSOLE);
     let _ = fs.mknod_char(dev, "tty", 0o666, dev::TTY);
+    let _ = fs.mknod_char(dev, "ptmx", 0o666, dev::PTMX);
+    // /dev/pts: slave PTY nodes are resolved dynamically by number (see open()).
+    let _ = fs.mkdir(dev, "pts", 0o755);
     *VFS.lock() = Some(fs);
 }
 
@@ -164,6 +168,10 @@ pub enum FileKind {
     /// One end of an anonymous pipe. `write_end` distinguishes the two ends;
     /// both share the same [`Pipe`].
     Pipe { pipe: Arc<Pipe>, write_end: bool },
+    /// The master side of a pseudo-terminal (/dev/ptmx).
+    PtyMaster(Arc<Pty>),
+    /// A slave side of a pseudo-terminal (/dev/pts/N).
+    PtySlave(Arc<Pty>),
 }
 
 /// Maximum bytes buffered in a pipe before writers block.
@@ -259,6 +267,189 @@ fn pipe_write(pipe: &Arc<Pipe>, buf: &[u8]) -> SysResult {
     }
 }
 
+/// A pseudo-terminal: a master/slave pair of bounded byte streams plus the
+/// slave-side terminal state (termios, window size, foreground group). The
+/// master write stream feeds the slave's read; the slave write stream feeds the
+/// master's read. Transfer is raw (no canonical line discipline) — the programs
+/// that need PTYs (zsh/fzf/starship) drive the slave in raw mode; cooked echo on
+/// a PTY can layer on later. Blocking reuses the same wait-queue discipline as
+/// pipes.
+pub struct Pty {
+    inner: SpinLock<PtyInner>,
+    /// Readers waiting for master-readable data (slave->master).
+    master_wq: WaitQueue,
+    /// Readers waiting for slave-readable data (master->slave).
+    slave_wq: WaitQueue,
+    /// This PTY's slave number N (/dev/pts/N).
+    pub ptn: u32,
+}
+
+struct PtyInner {
+    to_slave: VecDeque<u8>,
+    to_master: VecDeque<u8>,
+    termios: types::Termios,
+    winsize: types::Winsize,
+    fg_pgrp: i32,
+    masters: u32,
+    slaves: u32,
+}
+
+const PTY_CAP: usize = 16 * 1024;
+
+/// Live PTYs keyed by their slave number, kept alive while open.
+static PTYS: SpinLock<Vec<Arc<Pty>>> = SpinLock::new(Vec::new());
+static NEXT_PTN: AtomicI32 = AtomicI32::new(0);
+
+/// Opens /dev/ptmx: allocates a PTY and returns the master open file. The slave
+/// is reachable at /dev/pts/N (N = [`Pty::ptn`]).
+pub fn open_ptmx(flags: u64) -> Arc<SpinLock<OpenFile>> {
+    let ptn = NEXT_PTN.fetch_add(1, Ordering::Relaxed) as u32;
+    let pty = Arc::new(Pty {
+        inner: SpinLock::new(PtyInner {
+            to_slave: VecDeque::new(),
+            to_master: VecDeque::new(),
+            termios: default_termios(),
+            winsize: types::Winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 },
+            fg_pgrp: 0,
+            masters: 1,
+            slaves: 0,
+        }),
+        master_wq: WaitQueue::new(),
+        slave_wq: WaitQueue::new(),
+        ptn,
+    });
+    PTYS.lock().push(pty.clone());
+    Arc::new(SpinLock::new(OpenFile {
+        kind: FileKind::PtyMaster(pty),
+        flags,
+        readable: true,
+        writable: true,
+    }))
+}
+
+/// Opens /dev/pts/N: the slave end of an existing PTY.
+pub fn open_pts(ptn: u32, flags: u64) -> Result<Arc<SpinLock<OpenFile>>, Errno> {
+    let pty = PTYS.lock().iter().find(|p| p.ptn == ptn).cloned().ok_or(Errno::ENOENT)?;
+    pty.inner.lock().slaves += 1;
+    Ok(Arc::new(SpinLock::new(OpenFile {
+        kind: FileKind::PtySlave(pty),
+        flags,
+        readable: true,
+        writable: true,
+    })))
+}
+
+/// Per-PTY terminal state accessors (used by ioctl).
+impl Pty {
+    pub fn termios(&self) -> types::Termios {
+        self.inner.lock().termios
+    }
+    pub fn set_termios(&self, t: types::Termios) {
+        self.inner.lock().termios = t;
+    }
+    pub fn winsize(&self) -> types::Winsize {
+        self.inner.lock().winsize
+    }
+    pub fn set_winsize(&self, ws: types::Winsize) -> i32 {
+        let mut g = self.inner.lock();
+        g.winsize = ws;
+        g.fg_pgrp
+    }
+    pub fn set_fg_pgrp(&self, pgid: i32) {
+        self.inner.lock().fg_pgrp = pgid;
+    }
+    pub fn fg_pgrp(&self) -> i32 {
+        self.inner.lock().fg_pgrp
+    }
+}
+
+/// Reads from a PTY end into `buf`. `from_master` selects the stream (master
+/// reads slave->master output; slave reads master->slave input). Blocks until
+/// data is available unless `nonblock`; returns 0 at EOF (peer fully closed).
+fn pty_read(pty: &Arc<Pty>, from_master: bool, buf: &mut [u8], nonblock: bool) -> SysResult {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    loop {
+        let inner = pty.inner.lock();
+        let (have, peer_gone) = if from_master {
+            (!inner.to_master.is_empty(), inner.slaves == 0)
+        } else {
+            (!inner.to_slave.is_empty(), inner.masters == 0)
+        };
+        if have {
+            let mut g = inner;
+            let q = if from_master { &mut g.to_master } else { &mut g.to_slave };
+            let n = buf.len().min(q.len());
+            for slot in buf.iter_mut().take(n) {
+                *slot = q.pop_front().unwrap();
+            }
+            drop(g);
+            // Space freed on the written-to stream: wake its writers.
+            crate::scheduler::wake_all(if from_master { &pty.slave_wq } else { &pty.master_wq });
+            return Ok(n as u64);
+        }
+        if peer_gone {
+            return Ok(0); // EOF
+        }
+        if nonblock {
+            return Err(Errno::EAGAIN);
+        }
+        if crate::signal::current_has_deliverable() {
+            return Err(Errno::ERESTARTSYS);
+        }
+        let wq = if from_master { &pty.master_wq } else { &pty.slave_wq };
+        crate::scheduler::block_on(wq, move || drop(inner));
+    }
+}
+
+/// Writes `buf` into a PTY end. Master writes feed the slave's input; slave
+/// writes feed the master's output. Blocks while the target buffer is full
+/// unless `nonblock`.
+fn pty_write(pty: &Arc<Pty>, from_master: bool, buf: &[u8], nonblock: bool) -> SysResult {
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    loop {
+        let inner = pty.inner.lock();
+        let peer_gone = if from_master { inner.slaves == 0 } else { inner.masters == 0 };
+        if peer_gone {
+            // Writing to a PTY whose other end is gone: EIO (and SIGPIPE-ish).
+            drop(inner);
+            return Err(Errno::EIO);
+        }
+        let used = if from_master { inner.to_slave.len() } else { inner.to_master.len() };
+        let space = PTY_CAP - used;
+        if space > 0 {
+            let mut g = inner;
+            let n = buf.len().min(space);
+            let q = if from_master { &mut g.to_slave } else { &mut g.to_master };
+            q.extend(buf[..n].iter().copied());
+            drop(g);
+            crate::scheduler::wake_all(if from_master { &pty.slave_wq } else { &pty.master_wq });
+            return Ok(n as u64);
+        }
+        if nonblock {
+            return Err(Errno::EAGAIN);
+        }
+        if crate::signal::current_has_deliverable() {
+            return Err(Errno::ERESTARTSYS);
+        }
+        let wq = if from_master { &pty.master_wq } else { &pty.slave_wq };
+        crate::scheduler::block_on(wq, move || drop(inner));
+    }
+}
+
+/// Whether a PTY end currently has data to read (for poll/select).
+pub fn pty_readable(pty: &Pty, from_master: bool) -> bool {
+    let g = pty.inner.lock();
+    if from_master {
+        !g.to_master.is_empty() || g.slaves == 0
+    } else {
+        !g.to_slave.is_empty() || g.masters == 0
+    }
+}
+
 /// Creates a pipe and returns its (read end, write end) open files.
 pub fn make_pipe(flags: u64) -> (Arc<SpinLock<OpenFile>>, Arc<SpinLock<OpenFile>>) {
     let pipe = Pipe::new();
@@ -290,20 +481,40 @@ impl Drop for OpenFile {
     fn drop(&mut self) {
         // Closing a pipe end updates the end count and wakes the peer so it sees
         // EOF (reader) or that writers remain/left (writer).
-        if let FileKind::Pipe { pipe, write_end } = &self.kind {
-            {
-                let mut inner = pipe.inner.lock();
+        match &self.kind {
+            FileKind::Pipe { pipe, write_end } => {
+                {
+                    let mut inner = pipe.inner.lock();
+                    if *write_end {
+                        inner.writers = inner.writers.saturating_sub(1);
+                    } else {
+                        inner.readers = inner.readers.saturating_sub(1);
+                    }
+                }
                 if *write_end {
-                    inner.writers = inner.writers.saturating_sub(1);
+                    crate::scheduler::wake_all(&pipe.read_wq);
                 } else {
-                    inner.readers = inner.readers.saturating_sub(1);
+                    crate::scheduler::wake_all(&pipe.write_wq);
                 }
             }
-            if *write_end {
-                crate::scheduler::wake_all(&pipe.read_wq);
-            } else {
-                crate::scheduler::wake_all(&pipe.write_wq);
+            FileKind::PtyMaster(pty) => {
+                {
+                    let mut g = pty.inner.lock();
+                    g.masters = g.masters.saturating_sub(1);
+                }
+                // Wake both sides so a blocked slave observes EOF.
+                crate::scheduler::wake_all(&pty.slave_wq);
+                crate::scheduler::wake_all(&pty.master_wq);
             }
+            FileKind::PtySlave(pty) => {
+                {
+                    let mut g = pty.inner.lock();
+                    g.slaves = g.slaves.saturating_sub(1);
+                }
+                crate::scheduler::wake_all(&pty.master_wq);
+                crate::scheduler::wake_all(&pty.slave_wq);
+            }
+            _ => {}
         }
     }
 }
@@ -413,19 +624,27 @@ impl FdTable {
 pub fn read(file: &Arc<SpinLock<OpenFile>>, buf: &mut [u8]) -> SysResult {
     // A pipe read can block, so extract the shared pipe and release the
     // (interrupt-disabling) OpenFile lock before blocking on it.
-    let pipe = {
+    enum Blk { Pipe(Arc<Pipe>), PtyM(Arc<Pty>), PtyS(Arc<Pty>) }
+    let (blk, nonblock) = {
         let f = file.lock();
         if !f.readable {
             return Err(Errno::EBADF);
         }
-        match &f.kind {
-            FileKind::Pipe { pipe, write_end: false } => Some(pipe.clone()),
+        let nb = f.flags & types::O_NONBLOCK != 0;
+        let blk = match &f.kind {
+            FileKind::Pipe { pipe, write_end: false } => Some(Blk::Pipe(pipe.clone())),
             FileKind::Pipe { .. } => return Err(Errno::EBADF),
+            FileKind::PtyMaster(pty) => Some(Blk::PtyM(pty.clone())),
+            FileKind::PtySlave(pty) => Some(Blk::PtyS(pty.clone())),
             _ => None,
-        }
+        };
+        (blk, nb)
     };
-    if let Some(pipe) = pipe {
-        return pipe_read(&pipe, buf);
+    match blk {
+        Some(Blk::Pipe(pipe)) => return pipe_read(&pipe, buf),
+        Some(Blk::PtyM(pty)) => return pty_read(&pty, true, buf, nonblock),
+        Some(Blk::PtyS(pty)) => return pty_read(&pty, false, buf, nonblock),
+        None => {}
     }
 
     let mut f = file.lock();
@@ -437,25 +656,35 @@ pub fn read(file: &Arc<SpinLock<OpenFile>>, buf: &mut [u8]) -> SysResult {
             Ok(n as u64)
         }
         FileKind::Dir { .. } => Err(Errno::EISDIR),
-        FileKind::Pipe { .. } => unreachable!("pipe handled above"),
+        FileKind::Pipe { .. } | FileKind::PtyMaster(_) | FileKind::PtySlave(_) => {
+            unreachable!("handled above")
+        }
     }
 }
 
 /// Writes `buf` to an open file, returning the byte count.
 pub fn write(file: &Arc<SpinLock<OpenFile>>, buf: &[u8]) -> SysResult {
-    let pipe = {
+    enum Blk { Pipe(Arc<Pipe>), PtyM(Arc<Pty>), PtyS(Arc<Pty>) }
+    let (blk, nonblock) = {
         let f = file.lock();
         if !f.writable {
             return Err(Errno::EBADF);
         }
-        match &f.kind {
-            FileKind::Pipe { pipe, write_end: true } => Some(pipe.clone()),
+        let nb = f.flags & types::O_NONBLOCK != 0;
+        let blk = match &f.kind {
+            FileKind::Pipe { pipe, write_end: true } => Some(Blk::Pipe(pipe.clone())),
             FileKind::Pipe { .. } => return Err(Errno::EBADF),
+            FileKind::PtyMaster(pty) => Some(Blk::PtyM(pty.clone())),
+            FileKind::PtySlave(pty) => Some(Blk::PtyS(pty.clone())),
             _ => None,
-        }
+        };
+        (blk, nb)
     };
-    if let Some(pipe) = pipe {
-        return pipe_write(&pipe, buf);
+    match blk {
+        Some(Blk::Pipe(pipe)) => return pipe_write(&pipe, buf),
+        Some(Blk::PtyM(pty)) => return pty_write(&pty, true, buf, nonblock),
+        Some(Blk::PtyS(pty)) => return pty_write(&pty, false, buf, nonblock),
+        None => {}
     }
 
     let mut f = file.lock();
@@ -467,7 +696,9 @@ pub fn write(file: &Arc<SpinLock<OpenFile>>, buf: &[u8]) -> SysResult {
             Ok(n as u64)
         }
         FileKind::Dir { .. } => Err(Errno::EISDIR),
-        FileKind::Pipe { .. } => unreachable!("pipe handled above"),
+        FileKind::Pipe { .. } | FileKind::PtyMaster(_) | FileKind::PtySlave(_) => {
+            unreachable!("handled above")
+        }
     }
 }
 
@@ -486,7 +717,14 @@ pub fn open(cwd: Ino, path: &str, flags: u64, mode: u32) -> Result<Arc<SpinLock<
         };
         let kind = match v.kind(ino)? {
             vfs::Kind::Dir => FileKind::Dir { ino, pos: 0 },
-            vfs::Kind::CharDev => FileKind::Device(v.rdev(ino)?),
+            vfs::Kind::CharDev => {
+                let rdev = v.rdev(ino)?;
+                if rdev == dev::PTMX {
+                    // Opening the PTY multiplexor allocates a fresh master.
+                    return Ok(open_ptmx(flags));
+                }
+                FileKind::Device(rdev)
+            }
             _ => FileKind::File { ino, offset: 0 },
         };
         Ok(Arc::new(SpinLock::new(OpenFile { kind, flags, readable, writable })))

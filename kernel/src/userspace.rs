@@ -771,16 +771,20 @@ fn cow_regression_elf() -> Vec<u8> {
 }
 
 /// Builds a program exercising shared-address-space CoW READER coherence: after
-/// a fork makes a page CoW, the parent spawns a CLONE_VM reader thread that
-/// spins reading the page; the main thread writes it (CoW-copies into a private
-/// frame and shoots down peers). The reader must observe the new value, and the
-/// join must complete. NOTE: this verifies the end-to-end coherence requirement,
-/// not the shootdown in isolation — the scheduler can migrate the spinning
-/// reader (flushing its TLB incidentally), so it is not a strict negative guard;
-/// a strict guard needs CPU pinning (sched_setaffinity, not yet implemented).
-/// The shootdown remains required for guaranteed coherence in all schedules.
+/// a fork makes a page CoW, the parent pins itself to CPU 0 and spawns a
+/// CLONE_VM reader pinned to CPU 1 (sched_setaffinity) that caches a read-only
+/// mapping of the page then spins reading it; after a handshake the main thread
+/// writes the page (CoW-copies + shoots down peers). The reader must observe the
+/// new value and the join must complete. NOTE: this is a coherence/functional
+/// check, not a strict negative guard for the shootdown: this kernel reloads CR3
+/// on every context switch, so a preemption flushes a stale entry within one
+/// timeslice — a stale reader reads old data only briefly, it never hangs. The
+/// shootdown's hard necessity is munmap/free (use-after-free through a stale
+/// entry), which the frame-reclamation work will guard directly.
 fn clone_cow_reader_elf() -> Vec<u8> {
-    // r15 = shared page P (mmap); r14 = reader thread stack base; join word @[r15+64].
+    // r15 = shared page P (mmap); r14 = reader stack base; join word @[r15+64];
+    // "reader cached" handshake flag @[r14+128] (on the stack mapping, demand-
+    // paged and NOT CoW, so setting it does not itself copy P).
     let mmap_p: &[u8] = &[
         0xB8, 0x09, 0, 0, 0, 0x31, 0xFF, 0xBE, 0x00, 0x10, 0x00, 0x00, 0xBA, 0x03, 0, 0, 0,
         0x41, 0xBA, 0x22, 0, 0, 0, 0x41, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0x45, 0x31, 0xC9, 0x0F, 0x05,
@@ -789,16 +793,26 @@ fn clone_cow_reader_elf() -> Vec<u8> {
         0xB8, 0x09, 0, 0, 0, 0x31, 0xFF, 0xBE, 0x00, 0x40, 0x00, 0x00, 0xBA, 0x03, 0, 0, 0,
         0x41, 0xBA, 0x22, 0, 0, 0, 0x41, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0x45, 0x31, 0xC9, 0x0F, 0x05,
     ];
+    // sched_setaffinity(0, 8, &mask@[rsp-8]) with the given 1-byte mask.
+    let setaffinity = |mask: u8| -> [u8; 25] {
+        [
+            0xC7, 0x44, 0x24, 0xF8, mask, 0x00, 0x00, 0x00, // mov dword [rsp-8], mask
+            0xB8, 0xCB, 0x00, 0x00, 0x00,                   // mov eax, 203
+            0x31, 0xFF,                                     // xor edi, edi (pid=0)
+            0xBE, 0x08, 0x00, 0x00, 0x00,                   // mov esi, 8 (len)
+            0x48, 0x8D, 0x54, 0x24, 0xF8,                   // lea rdx, [rsp-8]
+        ]
+    };
     let mut c: Vec<u8> = Vec::new();
     c.extend_from_slice(mmap_p);
-    c.extend_from_slice(&[0x49, 0x89, 0xC7]); // mov r15, rax (P)
+    c.extend_from_slice(&[0x49, 0x89, 0xC7]); // mov r15, rax
     c.extend_from_slice(mmap_s);
-    c.extend_from_slice(&[0x49, 0x89, 0xC6]); // mov r14, rax (stack)
+    c.extend_from_slice(&[0x49, 0x89, 0xC6]); // mov r14, rax
     c.extend_from_slice(&[0x41, 0xC6, 0x07, 0x41]); // mov byte [r15], 'A'
     c.extend_from_slice(&[0xB8, 0x39, 0, 0, 0, 0x0F, 0x05]); // fork
     c.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
     c.extend_from_slice(&[0x74, 0x00]);
-    let jz_fork = c.len() - 1; // jz forkchild
+    let jz_fork = c.len() - 1;
     // parent: wait4(-1,0,0,0)
     c.extend_from_slice(&[
         0xB8, 0x3D, 0, 0, 0, 0xBF, 0xFF, 0xFF, 0xFF, 0xFF, 0x31, 0xF6, 0x31, 0xD2, 0x45, 0x31, 0xD2,
@@ -810,41 +824,62 @@ fn clone_cow_reader_elf() -> Vec<u8> {
         0x31, 0xC0, 0x0F, 0x05,
     ]); // clone(VM|SETTID|CLEARTID, rsi, 0, [r15+64], 0)
     c.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+    c.extend_from_slice(&[0x0F, 0x84, 0, 0, 0, 0]);
+    let jz_reader = c.len() - 4; // jz reader (rel32)
+    // writer (parent-main): pin to CPU0, wait for reader-cached, then write 'B'
+    c.extend_from_slice(&setaffinity(0x01)); // CPU 0
+    c.extend_from_slice(&[0x0F, 0x05]);       // syscall (setaffinity)
+    let wait_cached = c.len();
+    c.extend_from_slice(&[0x41, 0x0F, 0xB6, 0x86, 0x80, 0x00, 0x00, 0x00]); // movzx eax, byte [r14+128]
+    c.extend_from_slice(&[0x84, 0xC0]); // test al, al
     c.extend_from_slice(&[0x74, 0x00]);
-    let jz_reader = c.len() - 1; // jz reader
-    c.extend_from_slice(&[0x41, 0xC6, 0x07, 0x42]); // mov byte [r15], 'B'  (CoW copy + shootdown)
+    let jz_waitcached = c.len() - 1; // jz wait_cached (back)
+    c.extend_from_slice(&[0x41, 0xC6, 0x07, 0x42]); // mov byte [r15], 'B'  (CoW + shootdown)
     let joinloop = c.len();
     c.extend_from_slice(&[0x41, 0x8B, 0x4F, 0x40]); // mov ecx, [r15+64]
     c.extend_from_slice(&[0x85, 0xC9]); // test ecx, ecx
     c.extend_from_slice(&[0x74, 0x00]);
-    let jz_done = c.len() - 1; // jz done
+    let jz_done = c.len() - 1;
     c.extend_from_slice(&[
         0xB8, 0xCA, 0, 0, 0, 0x49, 0x8D, 0x7F, 0x40, 0x31, 0xF6, 0x89, 0xCA, 0x45, 0x31, 0xD2, 0x0F,
         0x05,
-    ]); // futex(uaddr=[r15+64], WAIT, ecx, 0)
+    ]); // futex wait on [r15+64]
     c.extend_from_slice(&[0xEB, 0x00]);
-    let jmp_join = c.len() - 1; // jmp joinloop
+    let jmp_join = c.len() - 1;
     let done = c.len();
     c.extend_from_slice(&[0xB8, 0xE7, 0, 0, 0, 0x31, 0xFF, 0x0F, 0x05]); // exit_group 0
+    // reader (rel32 target)
     let reader = c.len();
+    c.extend_from_slice(&setaffinity(0x02)); // CPU 1 (EINVAL at smp1 -> ignored)
+    c.extend_from_slice(&[0x0F, 0x05]);       // syscall
+    c.extend_from_slice(&[0x41, 0x0F, 0xB6, 0x07]); // movzx eax, byte [r15]  (cache P RO on CPU1)
+    c.extend_from_slice(&[0x41, 0xC6, 0x86, 0x80, 0x00, 0x00, 0x00, 0x01]); // mov byte [r14+128], 1 (signal cached)
     let readloop = c.len();
     c.extend_from_slice(&[0x41, 0x0F, 0xB6, 0x07]); // movzx eax, byte [r15]
     c.extend_from_slice(&[0x3C, 0x41]); // cmp al, 'A'
     c.extend_from_slice(&[0x74, 0x00]);
     let je_read = c.len() - 1; // je readloop (still stale)
-    c.extend_from_slice(&[0xB8, 0x3C, 0, 0, 0, 0x31, 0xFF, 0x0F, 0x05]); // exit (thread) 60
+    c.extend_from_slice(&[0xB8, 0x3C, 0, 0, 0, 0x31, 0xFF, 0x0F, 0x05]); // exit (thread)
     let forkchild = c.len();
     c.extend_from_slice(&[0xB8, 0xE7, 0, 0, 0, 0x31, 0xFF, 0x0F, 0x05]); // exit_group 0
 
-    let patch = |c: &mut Vec<u8>, pos: usize, target: usize| {
+    // patch rel8 jumps
+    let patch8 = |c: &mut Vec<u8>, pos: usize, target: usize| {
         let rel = target as i64 - (pos as i64 + 1);
         c[pos] = (rel as i8) as u8;
     };
-    patch(&mut c, jz_fork, forkchild);
-    patch(&mut c, jz_reader, reader);
-    patch(&mut c, jz_done, done);
-    patch(&mut c, jmp_join, joinloop);
-    patch(&mut c, je_read, readloop);
+    patch8(&mut c, jz_fork, forkchild);
+    patch8(&mut c, jz_waitcached, wait_cached);
+    patch8(&mut c, jz_done, done);
+    patch8(&mut c, jmp_join, joinloop);
+    patch8(&mut c, je_read, readloop);
+    // patch rel32 (jz reader)
+    let rel = reader as i64 - (jz_reader as i64 + 4);
+    let rb = (rel as i32).to_le_bytes();
+    c[jz_reader] = rb[0];
+    c[jz_reader + 1] = rb[1];
+    c[jz_reader + 2] = rb[2];
+    c[jz_reader + 3] = rb[3];
     raw_exec_elf(&c)
 }
 

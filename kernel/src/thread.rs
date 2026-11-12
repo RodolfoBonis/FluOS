@@ -87,6 +87,13 @@ pub struct Thread {
     /// `clone`/`set_tid_address` clear-child-tid pointer: on thread exit the
     /// kernel writes 0 here and futex-wakes it (how `pthread_join` completes).
     pub clear_child_tid: u64,
+    /// CPU affinity mask (bit i => may run on CPU i); all-ones by default.
+    pub affinity: u64,
+    /// Pending migration target CPU set by `sched_setaffinity` when the current
+    /// CPU is no longer allowed; `finish_switch` requeues the thread there after
+    /// the switch (-1 = none), reusing the post-switch requeue point so no
+    /// half-saved thread is ever made runnable elsewhere.
+    pub migrate_to: i32,
 }
 
 // SAFETY: a Thread is only mutated by its owning CPU while running or under the
@@ -147,6 +154,8 @@ impl Thread {
             ran_on: AtomicU32::new(0),
             linux_tid: 0,
             clear_child_tid: 0,
+            affinity: u64::MAX,
+            migrate_to: -1,
         });
         // SAFETY: `stack` owns KSTACK_SIZE bytes; the first 8 hold the canary.
         unsafe { (stack as *mut u64).write(STACK_CANARY) };
@@ -180,6 +189,8 @@ impl Thread {
             ran_on: AtomicU32::new(0),
             linux_tid: 0,
             clear_child_tid: 0,
+            affinity: u64::MAX,
+            migrate_to: -1,
         })
     }
 

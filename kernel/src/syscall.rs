@@ -94,6 +94,7 @@ fn handle(number: u64, a: [u64; 6], regs: &mut Regs) -> SysResult {
             Ok(0)
         }
         nr::SCHED_GETAFFINITY => sys_sched_getaffinity(a[2], a[1] as usize),
+        nr::SCHED_SETAFFINITY => sys_sched_setaffinity(a[0] as i32, a[1] as usize, a[2]),
         nr::SET_ROBUST_LIST | nr::RSEQ => Ok(0),
         nr::RT_SIGACTION => sys_rt_sigaction(a[0] as i32, a[1], a[2], a[3] as usize),
         nr::RT_SIGPROCMASK => sys_rt_sigprocmask(a[0] as i32, a[1], a[2], a[3] as usize),
@@ -809,6 +810,32 @@ fn sys_getcwd(buf: u64, size: usize) -> SysResult {
 fn sys_access(_dirfd: i32, path: u64) -> SysResult {
     let path = read_path(path)?;
     fs::with_vfs(|v| v.resolve(vfs::ROOT, &path, true))?;
+    Ok(0)
+}
+
+/// `sched_setaffinity(pid, cpusetsize, mask)`. Only the calling thread (pid 0
+/// or the caller's own tid) is honored; the mask is intersected with the online
+/// CPUs and must be non-empty. zsh/Go/starship call this; FluOS also uses it to
+/// pin threads for the CoW-coherence regression test.
+fn sys_sched_setaffinity(pid: i32, len: usize, maskptr: u64) -> SysResult {
+    if len == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let mut raw = [0u8; 8];
+    let n = len.min(8);
+    copy_from_user(maskptr, &mut raw[..n])?;
+    let requested = u64::from_le_bytes(raw);
+    let online = crate::percpu::count();
+    let online_mask = if online >= 64 { u64::MAX } else { (1u64 << online) - 1 };
+    let mask = requested & online_mask;
+    if mask == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let self_tid = unsafe { (*crate::percpu::current()).linux_tid };
+    if pid == 0 || pid == self_tid {
+        crate::scheduler::set_affinity_current(mask);
+    }
+    // Setting another thread's affinity is accepted but not enforced here.
     Ok(0)
 }
 

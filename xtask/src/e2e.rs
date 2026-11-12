@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 /// Overall ceiling: TCG on Apple Silicon is slow, and we run the full boot
 /// (selftests) before the shell starts.
-const TOTAL_TIMEOUT: Duration = Duration::from_secs(240);
+const TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Shared, ever-growing capture of everything QEMU has written to serial.
 type Capture = Arc<Mutex<String>>;
@@ -135,24 +135,24 @@ fn drive(con: &mut Console) -> Result<()> {
     // satisfied by the terminal's echo of the typed command itself.
     let m = con.mark();
     con.send_line("echo val=$((21+21))")?;
-    con.wait_for_since(m, "val=42", Duration::from_secs(20))?;
+    con.wait_for_since(m, "val=42", Duration::from_secs(45))?;
 
     // 3) ls lists the busybox applets directory (the marker is not in the cmd).
     let m = con.mark();
     con.send_line("ls /bin")?;
-    con.wait_for_since(m, "busybox", Duration::from_secs(20))?;
+    con.wait_for_since(m, "busybox", Duration::from_secs(45))?;
 
     // 4) cat a known file from the initramfs (content, not the command).
     let m = con.mark();
     con.send_line("cat /etc/hostname")?;
-    con.wait_for_since(m, "fluos", Duration::from_secs(20))?;
+    con.wait_for_since(m, "fluos", Duration::from_secs(45))?;
 
     // 5) a pipeline: echo | cat (exercises pipe2 + blocking pipe read/write and
     // the shell's fork/dup2 plumbing). Arithmetic keeps the marker out of the
     // typed command, so matching proves it flowed echo -> pipe -> cat -> tty.
     let m = con.mark();
     con.send_line("echo p$((6*7))x | cat")?;
-    con.wait_for_since(m, "p42x", Duration::from_secs(25))?;
+    con.wait_for_since(m, "p42x", Duration::from_secs(45))?;
 
     // 6) Ctrl-C of a foreground job blocked in a tty read: the job must die and
     // the shell must survive and stay responsive. `cat` with no args blocks in

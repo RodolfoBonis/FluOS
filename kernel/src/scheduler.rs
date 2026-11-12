@@ -184,7 +184,22 @@ fn finish_switch() {
             State::Ready => {
                 let weight = (*prev).weight;
                 let vruntime = u128::from((*prev).vruntime.load(Ordering::Relaxed));
-                cpu.runqueue.lock().insert_clamped((*prev).tid(), weight, vruntime);
+                let tid = (*prev).tid();
+                let mt = (*prev).migrate_to;
+                // A `sched_setaffinity` that moved us off this CPU requeues us on
+                // the target CPU here (post-switch), the same safe point used for
+                // ordinary re-queues — never before the context is saved.
+                if mt >= 0 {
+                    (*prev).migrate_to = -1;
+                    if let Some(target) = percpu::by_id(mt as u32) {
+                        target.runqueue.lock().insert_clamped(tid, weight, vruntime);
+                        crate::arch::x86_64::apic::send_reschedule(target.lapic_id);
+                    } else {
+                        cpu.runqueue.lock().insert_clamped(tid, weight, vruntime);
+                    }
+                } else {
+                    cpu.runqueue.lock().insert_clamped(tid, weight, vruntime);
+                }
             }
             State::Blocked if (*prev).wake_at != 0 => {
                 // Arm the sleep timer now that `prev` is fully parked. Because the
@@ -279,6 +294,37 @@ pub fn schedule() {
 /// Voluntarily yields the CPU to the scheduler.
 pub fn yield_now() {
     schedule();
+}
+
+/// Sets the current thread's CPU-affinity mask. If the current CPU is no longer
+/// permitted, the thread is migrated to the lowest permitted online CPU (via the
+/// post-switch requeue in `finish_switch`). A zero or unsatisfiable mask is
+/// ignored by the caller before this point.
+pub fn set_affinity_current(mask: u64) {
+    let was_on = interrupts::are_enabled();
+    interrupts::disable();
+    let me = percpu::this().cpu_id;
+    let cur = percpu::current();
+    // SAFETY: `cur` is this CPU's running thread.
+    unsafe { (*cur).affinity = mask };
+    if mask & (1u64 << me) == 0 {
+        let n = percpu::count();
+        let mut target = -1i32;
+        for id in 0..n {
+            if mask & (1u64 << id) != 0 && percpu::by_id(id).is_some() {
+                target = id as i32;
+                break;
+            }
+        }
+        if target >= 0 {
+            // SAFETY: migrate on the next switch via finish_switch.
+            unsafe { (*cur).migrate_to = target };
+            schedule();
+        }
+    }
+    if was_on {
+        interrupts::enable();
+    }
 }
 
 /// Whether this CPU still has threads parked on its sleep/timer queue. Used
@@ -583,7 +629,12 @@ pub fn try_steal() -> bool {
     for _ in 0..count {
         let stolen = {
             let mut rq = victim.runqueue.lock();
-            let cand = rq.tids().into_iter().find(|&t| t != victim_current);
+            let my_bit = 1u64 << me.cpu_id;
+            // SAFETY: each tid is a live Thread; read its affinity mask.
+            let cand = rq.tids().into_iter().find(|&t| {
+                t != victim_current
+                    && (unsafe { (*(t as *const Thread)).affinity } & my_bit) != 0
+            });
             match cand {
                 Some(t) => {
                     rq.remove(t);
