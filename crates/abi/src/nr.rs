@@ -88,6 +88,10 @@ pub const OPENAT: u64 = 257;
 pub const MKDIRAT: u64 = 258;
 pub const NEWFSTATAT: u64 = 262;
 pub const UNLINKAT: u64 = 263;
+pub const RENAMEAT: u64 = 264;
+pub const LINKAT: u64 = 265;
+pub const SYMLINKAT: u64 = 266;
+pub const FCHMODAT: u64 = 268;
 pub const READLINKAT: u64 = 267;
 pub const FACCESSAT: u64 = 269;
 pub const PSELECT6: u64 = 270;
@@ -97,6 +101,7 @@ pub const DUP3: u64 = 292;
 pub const PIPE2: u64 = 293;
 pub const PRLIMIT64: u64 = 302;
 pub const GETRANDOM: u64 = 318;
+pub const RENAMEAT2: u64 = 316;
 pub const RSEQ: u64 = 334;
 
 /// Returns a static name for a syscall number, for the "unimplemented syscall"

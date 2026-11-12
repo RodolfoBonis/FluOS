@@ -236,6 +236,51 @@ impl Vfs {
         Ok(())
     }
 
+    /// Renames `old_name` under `old_dir` to `new_name` under `new_dir`, moving
+    /// the inode (and reparenting it). An existing target is replaced if it is a
+    /// non-directory or an empty directory; a non-empty target dir is `ENOTEMPTY`.
+    pub fn rename(&mut self, old_dir: Ino, old_name: &str, new_dir: Ino, new_name: &str) -> Result<(), Errno> {
+        let ino = self.lookup(old_dir, old_name)?;
+        if let Ok(existing) = self.lookup(new_dir, new_name) {
+            if existing == ino {
+                return Ok(());
+            }
+            if self.get(existing)?.kind == Kind::Dir && !self.get(existing)?.children.is_empty() {
+                return Err(Errno(abi::errno::ENOTEMPTY));
+            }
+            self.get_mut(new_dir)?.children.remove(new_name);
+        }
+        self.get_mut(old_dir)?.children.remove(old_name);
+        self.get_mut(new_dir)?.children.insert(new_name.to_string(), ino);
+        self.get_mut(ino)?.parent = new_dir;
+        Ok(())
+    }
+
+    /// Sets the permission bits (low 12) of `ino`, preserving the type bits.
+    pub fn chmod(&mut self, ino: Ino, mode: u32) -> Result<(), Errno> {
+        let node = self.get_mut(ino)?;
+        node.mode = (node.mode & !0o7777) | (mode & 0o7777);
+        Ok(())
+    }
+
+    /// Creates a hard link `new_name` under `new_dir` to the existing non-dir
+    /// inode `ino` (bumps its link count). The inode keeps its original parent
+    /// (adequate for `path_of`, which reports the first link's path).
+    pub fn link(&mut self, ino: Ino, new_dir: Ino, new_name: &str) -> Result<Ino, Errno> {
+        if self.get(ino)?.kind == Kind::Dir {
+            return Err(Errno(abi::errno::EPERM));
+        }
+        if self.get(new_dir)?.kind != Kind::Dir {
+            return Err(Errno::ENOTDIR);
+        }
+        if self.get(new_dir)?.children.contains_key(new_name) {
+            return Err(Errno::EEXIST);
+        }
+        self.get_mut(ino)?.nlink += 1;
+        self.get_mut(new_dir)?.children.insert(new_name.to_string(), ino);
+        Ok(ino)
+    }
+
     /// Creates `path` and any missing parent directories, returning the final
     /// inode. Intermediate components become directories.
     pub fn mkpath(&mut self, path: &str, kind: Kind, mode: u32, rdev: u64, data: &[u8]) -> Result<Ino, Errno> {
@@ -380,6 +425,31 @@ impl Vfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rename_chmod_link() {
+        let mut fs = Vfs::new();
+        let d = fs.mkdir(ROOT, "d", 0o755).unwrap();
+        let f = fs.create(d, "a", 0o644).unwrap();
+        fs.write_at(f, 0, b"hi").unwrap();
+        // rename within the same dir
+        fs.rename(d, "a", d, "b").unwrap();
+        assert!(fs.lookup(d, "a").is_err());
+        assert_eq!(fs.resolve(ROOT, "/d/b", true).unwrap(), f);
+        // rename across dirs reparents (path_of follows)
+        let e = fs.mkdir(ROOT, "e", 0o755).unwrap();
+        fs.rename(d, "b", e, "c").unwrap();
+        assert_eq!(fs.path_of(f).unwrap(), "/e/c");
+        // chmod sets perms, keeps type
+        fs.chmod(f, 0o600).unwrap();
+        assert_eq!(fs.stat(f).unwrap().st_mode & 0o7777, 0o600);
+        // hard link: second name, same inode, nlink bumped
+        let l = fs.link(f, ROOT, "hard").unwrap();
+        assert_eq!(l, f);
+        assert_eq!(fs.resolve(ROOT, "/hard", true).unwrap(), f);
+        // cannot hard-link a directory
+        assert!(fs.link(e, ROOT, "nope").is_err());
+    }
 
     #[test]
     fn path_of_walks_parents() {

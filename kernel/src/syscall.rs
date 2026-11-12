@@ -91,6 +91,17 @@ fn handle(number: u64, a: [u64; 6], regs: &mut Regs) -> SysResult {
         nr::CHDIR => sys_chdir(a[0]),
         nr::MKDIR => sys_mkdirat(types::AT_FDCWD, a[0], a[1] as u32),
         nr::MKDIRAT => sys_mkdirat(a[0] as i32, a[1], a[2] as u32),
+        nr::RENAME => sys_renameat(types::AT_FDCWD, a[0], types::AT_FDCWD, a[1]),
+        nr::RENAMEAT => sys_renameat(a[0] as i32, a[1], a[2] as i32, a[3]),
+        nr::RENAMEAT2 => sys_renameat(a[0] as i32, a[1], a[2] as i32, a[3]),
+        nr::LINK => sys_linkat(types::AT_FDCWD, a[0], types::AT_FDCWD, a[1]),
+        nr::LINKAT => sys_linkat(a[0] as i32, a[1], a[2] as i32, a[3]),
+        nr::SYMLINK => sys_symlinkat(a[0], types::AT_FDCWD, a[1]),
+        nr::SYMLINKAT => sys_symlinkat(a[0], a[1] as i32, a[2]),
+        nr::UNLINK => sys_unlinkat(types::AT_FDCWD, a[0]),
+        nr::UNLINKAT => sys_unlinkat(a[0] as i32, a[1]),
+        nr::CHMOD => sys_fchmodat(types::AT_FDCWD, a[0], a[1] as u32),
+        nr::FCHMODAT => sys_fchmodat(a[0] as i32, a[1], a[2] as u32),
         nr::READLINK => sys_readlinkat(types::AT_FDCWD, a[0], a[1], a[2] as usize),
         nr::READLINKAT => sys_readlinkat(a[0] as i32, a[1], a[2], a[3] as usize),
         nr::UMASK => sys_umask(a[0] as u32),
@@ -1062,6 +1073,85 @@ fn sys_mkdirat(dirfd: i32, path: u64, mode: u32) -> SysResult {
     Ok(0)
 }
 
+/// `rename`/`renameat`/`renameat2`: move an entry, reparenting the inode. Flags
+/// (renameat2) are ignored — the common `RENAME_NOREPLACE`/exchange cases that
+/// zsh/coreutils rely on at startup are not used.
+fn sys_renameat(olddirfd: i32, oldpath: u64, newdirfd: i32, newpath: u64) -> SysResult {
+    let oldp = read_path(oldpath)?;
+    let newp = read_path(newpath)?;
+    let (ob, nb) = {
+        let g = proc()?.lock();
+        (dirfd_base(&g, olddirfd, &oldp)?, dirfd_base(&g, newdirfd, &newp)?)
+    };
+    fs::with_vfs(|v| {
+        let (od, on) = v.split_parent(ob, &oldp)?;
+        let (nd, nn) = v.split_parent(nb, &newp)?;
+        v.rename(od, on, nd, nn)
+    })?;
+    Ok(0)
+}
+
+/// `link`/`linkat`: create a hard link. The final component of the source is
+/// not dereferenced (AT_SYMLINK_FOLLOW is not requested by our callers).
+fn sys_linkat(olddirfd: i32, oldpath: u64, newdirfd: i32, newpath: u64) -> SysResult {
+    let oldp = read_path(oldpath)?;
+    let newp = read_path(newpath)?;
+    let (ob, nb) = {
+        let g = proc()?.lock();
+        (dirfd_base(&g, olddirfd, &oldp)?, dirfd_base(&g, newdirfd, &newp)?)
+    };
+    fs::with_vfs(|v| {
+        let ino = v.resolve(ob, &oldp, false)?;
+        let (nd, nn) = v.split_parent(nb, &newp)?;
+        v.link(ino, nd, nn).map(|_| ())
+    })?;
+    Ok(0)
+}
+
+/// `symlink`/`symlinkat`: create a symlink `linkpath` -> `target`.
+fn sys_symlinkat(target: u64, newdirfd: i32, linkpath: u64) -> SysResult {
+    let target = read_path(target)?;
+    let linkp = read_path(linkpath)?;
+    let nb = {
+        let g = proc()?.lock();
+        dirfd_base(&g, newdirfd, &linkp)?
+    };
+    fs::with_vfs(|v| {
+        let (nd, nn) = v.split_parent(nb, &linkp)?;
+        v.symlink(nd, nn, &target).map(|_| ())
+    })?;
+    Ok(0)
+}
+
+/// `unlink`/`unlinkat`: remove a non-directory (or empty directory). The
+/// `AT_REMOVEDIR` flag is implicit — `vfs::unlink` already accepts empty dirs.
+fn sys_unlinkat(dirfd: i32, path: u64) -> SysResult {
+    let path = read_path(path)?;
+    let base = {
+        let g = proc()?.lock();
+        dirfd_base(&g, dirfd, &path)?
+    };
+    fs::with_vfs(|v| {
+        let (d, n) = v.split_parent(base, &path)?;
+        v.unlink(d, n)
+    })?;
+    Ok(0)
+}
+
+/// `chmod`/`fchmodat`: set the permission bits of the resolved inode.
+fn sys_fchmodat(dirfd: i32, path: u64, mode: u32) -> SysResult {
+    let path = read_path(path)?;
+    let base = {
+        let g = proc()?.lock();
+        dirfd_base(&g, dirfd, &path)?
+    };
+    fs::with_vfs(|v| {
+        let ino = v.resolve(base, &path, true)?;
+        v.chmod(ino, mode)
+    })?;
+    Ok(0)
+}
+
 /// `readlink`/`readlinkat`: copy a symlink's target (not NUL-terminated) into
 /// the caller's buffer, truncated to its length; `EINVAL` if not a symlink.
 fn sys_readlinkat(dirfd: i32, path: u64, buf: u64, bufsize: usize) -> SysResult {
@@ -1140,16 +1230,33 @@ fn sys_rt_sigsuspend(set_ptr: u64, sigsetsize: usize) -> SysResult {
     copy_from_user(set_ptr, &mut tmp)?;
     let newmask = u64::from_le_bytes(tmp);
     let p = proc()?;
-    let old = p.lock().sig.set_mask(newmask);
-    // Bounded wait: break early once something is deliverable, but never spin
-    // forever. Each yield lets other threads (and exiting children) run.
-    for _ in 0..64 {
+    // Install the temporary mask and arm a post-handler restore of the caller's
+    // mask. The temp mask stays in effect as we return, so `on_syscall_return`
+    // delivers a now-unblocked signal (e.g. SIGCHLD): its handler runs, and
+    // `sigreturn` restores the pre-suspend mask from the armed value.
+    let old = {
+        let mut g = p.lock();
+        let old = g.sig.set_mask(newmask);
+        g.sig.arm_restore_mask(old);
+        old
+    };
+    // Wait (bounded, yielding) until a signal is deliverable under the temp mask.
+    // We must NOT restore the mask here on the common path — delivery happens
+    // after we return. Only a spurious timeout path undoes the arming.
+    let mut delivered = false;
+    for _ in 0..1024 {
         if p.lock().sig.has_deliverable() {
+            delivered = true;
             break;
         }
         crate::scheduler::yield_now();
     }
-    p.lock().sig.set_mask(old);
+    if !delivered {
+        // Nothing arrived: undo the temporary mask and disarm, then report EINTR.
+        let mut g = p.lock();
+        let _ = g.sig.take_restore_mask();
+        g.sig.set_mask(old);
+    }
     Err(Errno::EINTR)
 }
 

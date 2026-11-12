@@ -53,12 +53,17 @@ pub struct SignalState {
     pending: u64,
     /// Blocked signals (bit `n-1`).
     mask: u64,
+    /// Set by `sigsuspend` to the mask that must be restored *after* the next
+    /// signal handler returns (Linux's `TIF_RESTORE_SIGMASK`). While waiting,
+    /// `mask` holds the caller's temporary suspend mask; on delivery the handler
+    /// frame saves this value so `sigreturn` restores the pre-suspend mask.
+    restore_mask: Option<u64>,
 }
 
 impl SignalState {
     #[must_use]
     pub fn new() -> Self {
-        Self { actions: [SigAction::DFL; NSIG + 1], pending: 0, mask: 0 }
+        Self { actions: [SigAction::DFL; NSIG + 1], pending: 0, mask: 0, restore_mask: None }
     }
 
     /// `execve` keeps the mask but resets every *caught* signal to its default
@@ -74,6 +79,7 @@ impl SignalState {
             }
         }
         self.pending = 0;
+        self.restore_mask = None;
     }
 
     /// Whether a signal is pending that is not currently blocked.
@@ -101,6 +107,16 @@ impl SignalState {
     #[must_use]
     pub fn mask(&self) -> u64 {
         self.mask
+    }
+
+    /// Arms a post-handler mask restore (see [`SignalState::restore_mask`]).
+    pub fn arm_restore_mask(&mut self, old: u64) {
+        self.restore_mask = Some(old);
+    }
+
+    /// Takes the armed restore mask, if any (clearing it).
+    pub fn take_restore_mask(&mut self) -> Option<u64> {
+        self.restore_mask.take()
     }
 
     /// Installs a disposition for `sig`, returning the previous one. Ignores
@@ -472,7 +488,9 @@ fn setup_handler(regs: &mut Regs, sig: i32, act: &SigAction) -> bool {
             None => return false,
         };
         let mut g = proc.lock();
-        let old = g.sig.mask;
+        // If sigsuspend armed a restore mask, that (the pre-suspend mask) is what
+        // `sigreturn` must restore — not the temporary suspend mask now in effect.
+        let old = g.sig.take_restore_mask().unwrap_or(g.sig.mask);
         frame.uc.uc_sigmask[0] = old;
         g.sig.mask |= act.mask | bit(sig);
         (
