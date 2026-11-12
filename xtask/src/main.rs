@@ -5,6 +5,7 @@ mod image;
 mod ksyms;
 mod limine;
 mod qemu;
+mod rootfs;
 
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
@@ -19,6 +20,7 @@ commands:
   run     boot the ISO in QEMU (graphical window + serial on stdio)
   test    boot headless and assert the kernel reaches `boot complete`
   e2e     boot and drive the busybox shell over serial, asserting output
+  rootfs  build the userland ports + assemble initramfs.cpio and disk.img
 ";
 
 #[derive(Clone, Copy)]
@@ -54,6 +56,7 @@ fn main() -> Result<()> {
         // `qemu-exit` makes the kernel signal QEMU's debug-exit device once boot completes.
         Some("test") => qemu::run(&image::build(profile, "qemu-exit")?, qemu::Mode::Test, smp),
         Some("e2e") => e2e::run(&image::build(profile, "")?, smp),
+        Some("rootfs") => rootfs::build(),
         _ => {
             eprint!("{USAGE}");
             bail!("missing or unknown command")

@@ -1,0 +1,19 @@
+# syntax=docker/dockerfile:1
+#
+# FluOS colorls port — built from the in-repo crate at userland/colorls.
+# Build context is that crate directory; output merges into build/sysroot/.
+# Invoked by ports/build.sh only when userland/colorls/Cargo.toml exists.
+# No --locked: colorls is developed concurrently and may not ship a Cargo.lock.
+ARG RUST=rust:1.95.0-alpine3.22
+FROM ${RUST} AS build
+RUN apk add --no-cache musl-dev make file
+ENV RUSTFLAGS="-C strip=symbols"
+WORKDIR /src
+COPY . .
+RUN cargo build --release \
+  && mkdir -p /out/usr/bin \
+  && cp "$(find target -maxdepth 2 -name colorls -type f -perm -u+x | head -1)" /out/usr/bin/colorls \
+  && file /out/usr/bin/colorls
+
+FROM scratch AS sysroot
+COPY --from=build /out/ /

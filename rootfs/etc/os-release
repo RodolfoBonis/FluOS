@@ -1,0 +1,7 @@
+NAME=FluOS
+PRETTY_NAME="FluOS"
+ID=fluos
+VERSION="0.1"
+VERSION_ID=0.1
+HOME_URL="https://github.com/rodolfodebonis/FluOs"
+BUG_REPORT_URL="https://github.com/rodolfodebonis/FluOs/issues"

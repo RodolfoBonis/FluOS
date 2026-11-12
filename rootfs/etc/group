@@ -1,0 +1,5 @@
+root:x:0:
+tty:x:5:
+wheel:x:10:rodolfo
+nobody:x:65534:
+rodolfo:x:1000:

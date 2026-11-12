@@ -1,0 +1,20 @@
+# System-wide zsh environment — sourced for every zsh invocation, first.
+# Keep this minimal; interactive config lives in each user's ~/.zshrc.
+
+# Locale: the whole environment assumes UTF-8.
+export LANG=${LANG:-en_US.UTF-8}
+export LC_ALL=${LC_ALL:-en_US.UTF-8}
+
+# Terminal + terminfo shipped by the ncurses port.
+export TERMINFO=/usr/share/terminfo
+export TERM=${TERM:-fluos}
+
+# Starship reads these; keep the cache on the persistent /home.
+export STARSHIP_CONFIG=${STARSHIP_CONFIG:-$HOME/.config/starship.toml}
+export STARSHIP_CACHE=${STARSHIP_CACHE:-$HOME/.cache/starship}
+
+# Static curl/git honor the system CA bundle shipped by the ports build.
+export SSL_CERT_FILE=${SSL_CERT_FILE:-/etc/ssl/certs/ca-certificates.crt}
+export CURL_CA_BUNDLE=${CURL_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}
+
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin

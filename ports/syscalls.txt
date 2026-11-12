@@ -1,0 +1,68 @@
+# FluOS userland syscall footprint
+#
+# Captured by ports/smoke-test.sh with qemu-x86_64 -strace, tracing the
+# actual static musl binaries: zsh 5.9 + its modules, starship, git
+# (version + init + add), curl, colorls, and uutils coreutils applets.
+# 56 distinct syscalls — the set the FluOS kernel must implement (M4).
+# Generated 2026-11-12T19:03Z.
+#
+# --- distinct syscalls (sorted) ---
+access
+arch_prctl
+brk
+chdir
+chmod
+clock_gettime
+clone
+close
+dup
+dup2
+exit
+exit_group
+fcntl
+fstat
+futex
+getcwd
+getdents64
+getegid
+geteuid
+getgid
+getpid
+getppid
+getrandom
+getrusage
+gettid
+getuid
+ioctl
+link
+lseek
+lstat
+mkdir
+mmap
+mprotect
+mremap
+munmap
+open
+pipe
+poll
+prctl
+prlimit64
+read
+readlink
+readv
+rename
+rt_sigaction
+rt_sigprocmask
+sched_getaffinity
+sched_yield
+set_tid_address
+sigaltstack
+stat
+symlink
+uname
+unlink
+write
+writev
+
+# --- one-line list ---
+access arch_prctl brk chdir chmod clock_gettime clone close dup dup2 exit exit_group fcntl fstat futex getcwd getdents64 getegid geteuid getgid getpid getppid getrandom getrusage gettid getuid ioctl link lseek lstat mkdir mmap mprotect mremap munmap open pipe poll prctl prlimit64 read readlink readv rename rt_sigaction rt_sigprocmask sched_getaffinity sched_yield set_tid_address sigaltstack stat symlink uname unlink write writev

@@ -1,0 +1,13 @@
+# System-wide profile for login shells (sh and zsh).
+export LANG=${LANG:-en_US.UTF-8}
+export LC_ALL=${LC_ALL:-en_US.UTF-8}
+export TERMINFO=/usr/share/terminfo
+export TERM=${TERM:-fluos}
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PAGER=less
+umask 022
+
+# A friendly default prompt for /bin/sh; zsh gets starship from ~/.zshrc.
+if [ -n "${PS1-}" ]; then
+  PS1='\u@\h:\w\$ '
+fi
