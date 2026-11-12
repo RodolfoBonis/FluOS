@@ -59,6 +59,17 @@ struct Region {
     exec: bool,
 }
 
+/// Outcome of a copy-on-write write fault.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Cow {
+    /// A shared page was copied into a private writable one.
+    Copied,
+    /// The page was already writable; nothing copied (this CPU's TLB flushed).
+    NoChange,
+    /// A genuine read-only violation (not a CoW page).
+    Fault,
+}
+
 /// A user virtual address space.
 pub struct AddressSpace {
     pml4_phys: u64,
@@ -326,28 +337,34 @@ impl AddressSpace {
         true
     }
 
-    /// Resolves a write fault at `vaddr`. Returns `true` if the page is (now)
-    /// writable: a copy-on-write page is copied and made writable; a page that is
-    /// already writable needs nothing; a read-only non-CoW page is a real fault.
-    pub fn handle_cow(&mut self, vaddr: u64) -> bool {
+    /// Resolves a write fault at `vaddr`. Returns [`Cow::Copied`] if it copied a
+    /// shared page into a private writable one (callers must then shoot down
+    /// peer CPUs for a shared address space), [`Cow::NoChange`] if the page was
+    /// already writable (this CPU's stale read-only entry is flushed locally so
+    /// the retry succeeds — the self-heal for a concurrent writer), or
+    /// [`Cow::Fault`] for a genuine read-only violation.
+    pub fn handle_cow(&mut self, vaddr: u64) -> Cow {
         let page = vaddr & !(PAGE - 1);
         // SAFETY: walk returns a pointer into this space's tables; we hold `&mut`.
         let Some(pte) = (unsafe { self.walk_pte(page) }) else {
-            return false;
+            return Cow::Fault;
         };
         let f = unsafe { (*pte).flags() };
         if !f.contains(Flags::PRESENT) {
-            return false;
+            return Cow::Fault;
         }
         if f.contains(Flags::WRITABLE) {
-            return true;
+            // Already writable (another thread CoW'd it first): flush this CPU's
+            // stale read-only entry so the faulting write retries successfully.
+            x86_64::instructions::tlb::flush(VirtAddr::new(page));
+            return Cow::NoChange;
         }
         if !f.contains(PTE_COW) {
-            return false;
+            return Cow::Fault;
         }
         let old = unsafe { (*pte).addr().as_u64() };
         let Some(new) = phys::alloc_frame() else {
-            return false;
+            return Cow::Fault;
         };
         // SAFETY: both frames are HHDM-mapped and page-sized.
         unsafe {
@@ -364,7 +381,7 @@ impl AddressSpace {
         // SAFETY: re-point this leaf at the private copy, now writable.
         unsafe { (*pte).set_addr(PhysAddr::new(new), new_flags) };
         x86_64::instructions::tlb::flush(VirtAddr::new(page));
-        true
+        Cow::Copied
     }
 
     /// Translates a user virtual address to a physical address, if mapped.

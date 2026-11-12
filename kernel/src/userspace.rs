@@ -770,14 +770,93 @@ fn cow_regression_elf() -> Vec<u8> {
     elf
 }
 
+/// Builds a program validating the shared-address-space CoW shootdown's READER
+/// coherence: after a fork makes a page CoW, the parent spawns a CLONE_VM reader
+/// thread that spins reading the page; the main thread writes it (CoW-copies +
+/// shoots down peers). The reader must observe the new value — without the
+/// shootdown its cached read-only entry would read the stale pre-copy frame
+/// forever and the join would hang. Exits 0 on success.
+fn clone_cow_reader_elf() -> Vec<u8> {
+    // r15 = shared page P (mmap); r14 = reader thread stack base; join word @[r15+64].
+    let mmap_p: &[u8] = &[
+        0xB8, 0x09, 0, 0, 0, 0x31, 0xFF, 0xBE, 0x00, 0x10, 0x00, 0x00, 0xBA, 0x03, 0, 0, 0,
+        0x41, 0xBA, 0x22, 0, 0, 0, 0x41, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0x45, 0x31, 0xC9, 0x0F, 0x05,
+    ];
+    let mmap_s: &[u8] = &[
+        0xB8, 0x09, 0, 0, 0, 0x31, 0xFF, 0xBE, 0x00, 0x40, 0x00, 0x00, 0xBA, 0x03, 0, 0, 0,
+        0x41, 0xBA, 0x22, 0, 0, 0, 0x41, 0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0x45, 0x31, 0xC9, 0x0F, 0x05,
+    ];
+    let mut c: Vec<u8> = Vec::new();
+    c.extend_from_slice(mmap_p);
+    c.extend_from_slice(&[0x49, 0x89, 0xC7]); // mov r15, rax (P)
+    c.extend_from_slice(mmap_s);
+    c.extend_from_slice(&[0x49, 0x89, 0xC6]); // mov r14, rax (stack)
+    c.extend_from_slice(&[0x41, 0xC6, 0x07, 0x41]); // mov byte [r15], 'A'
+    c.extend_from_slice(&[0xB8, 0x39, 0, 0, 0, 0x0F, 0x05]); // fork
+    c.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+    c.extend_from_slice(&[0x74, 0x00]);
+    let jz_fork = c.len() - 1; // jz forkchild
+    // parent: wait4(-1,0,0,0)
+    c.extend_from_slice(&[
+        0xB8, 0x3D, 0, 0, 0, 0xBF, 0xFF, 0xFF, 0xFF, 0xFF, 0x31, 0xF6, 0x31, 0xD2, 0x45, 0x31, 0xD2,
+        0x0F, 0x05,
+    ]);
+    c.extend_from_slice(&[0x49, 0x8D, 0xB6, 0x00, 0x40, 0x00, 0x00]); // lea rsi, [r14+0x4000]
+    c.extend_from_slice(&[
+        0xB8, 0x38, 0, 0, 0, 0xBF, 0x00, 0x01, 0x20, 0x01, 0x31, 0xD2, 0x4D, 0x8D, 0x57, 0x40, 0x45,
+        0x31, 0xC0, 0x0F, 0x05,
+    ]); // clone(VM|SETTID|CLEARTID, rsi, 0, [r15+64], 0)
+    c.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+    c.extend_from_slice(&[0x74, 0x00]);
+    let jz_reader = c.len() - 1; // jz reader
+    c.extend_from_slice(&[0x41, 0xC6, 0x07, 0x42]); // mov byte [r15], 'B'  (CoW copy + shootdown)
+    let joinloop = c.len();
+    c.extend_from_slice(&[0x41, 0x8B, 0x4F, 0x40]); // mov ecx, [r15+64]
+    c.extend_from_slice(&[0x85, 0xC9]); // test ecx, ecx
+    c.extend_from_slice(&[0x74, 0x00]);
+    let jz_done = c.len() - 1; // jz done
+    c.extend_from_slice(&[
+        0xB8, 0xCA, 0, 0, 0, 0x49, 0x8D, 0x7F, 0x40, 0x31, 0xF6, 0x89, 0xCA, 0x45, 0x31, 0xD2, 0x0F,
+        0x05,
+    ]); // futex(uaddr=[r15+64], WAIT, ecx, 0)
+    c.extend_from_slice(&[0xEB, 0x00]);
+    let jmp_join = c.len() - 1; // jmp joinloop
+    let done = c.len();
+    c.extend_from_slice(&[0xB8, 0xE7, 0, 0, 0, 0x31, 0xFF, 0x0F, 0x05]); // exit_group 0
+    let reader = c.len();
+    let readloop = c.len();
+    c.extend_from_slice(&[0x41, 0x0F, 0xB6, 0x07]); // movzx eax, byte [r15]
+    c.extend_from_slice(&[0x3C, 0x41]); // cmp al, 'A'
+    c.extend_from_slice(&[0x74, 0x00]);
+    let je_read = c.len() - 1; // je readloop (still stale)
+    c.extend_from_slice(&[0xB8, 0x3C, 0, 0, 0, 0x31, 0xFF, 0x0F, 0x05]); // exit (thread) 60
+    let forkchild = c.len();
+    c.extend_from_slice(&[0xB8, 0xE7, 0, 0, 0, 0x31, 0xFF, 0x0F, 0x05]); // exit_group 0
+
+    let patch = |c: &mut Vec<u8>, pos: usize, target: usize| {
+        let rel = target as i64 - (pos as i64 + 1);
+        c[pos] = (rel as i8) as u8;
+    };
+    patch(&mut c, jz_fork, forkchild);
+    patch(&mut c, jz_reader, reader);
+    patch(&mut c, jz_done, done);
+    patch(&mut c, jmp_join, joinloop);
+    patch(&mut c, je_read, readloop);
+    raw_exec_elf(&c)
+}
+
 /// Runs the memory-management self-tests (CoW fork, anonymous demand paging).
 /// Each must exit 0; anything else indicates a VM correctness bug.
 pub fn run_vm_selftests() {
+    // Order matters: the clone test runs first so ADDRESS_SPACE_SHARED is set,
+    // making the subsequent CoW faults exercise the shared-space TLB shootdown
+    // (cross-CPU at smp > 1).
     for (name, image) in [
+        ("clone(CLONE_VM) thread + futex join", clone_thread_elf()),
         ("cow fork isolation", cow_fork_elf()),
         ("anon demand paging", demand_mmap_elf()),
-        ("clone(CLONE_VM) thread + futex join", clone_thread_elf()),
-        ("cow RO-code + RW-data same PT", cow_regression_elf()),
+        ("cow RO-code + RW-data same PT (shared-space shootdown)", cow_regression_elf()),
+        ("clone(CLONE_VM) reader sees CoW write (shootdown)", clone_cow_reader_elf()),
     ] {
         match spawn(&image, &["/vm-test"], &[]) {
             Ok(proc) => {
