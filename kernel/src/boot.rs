@@ -1,8 +1,8 @@
 //! Limine boot protocol requests and typed accessors over their responses.
 
 use limine::request::{
-    BootloaderInfoRequest, ExecutableAddressRequest, ExecutableCmdlineRequest, FramebufferRequest,
-    HhdmRequest, MemmapRequest, ModulesRequest, MpRequest, RsdpRequest,
+    BootloaderInfoRequest, DateAtBootRequest, ExecutableAddressRequest, ExecutableCmdlineRequest,
+    FramebufferRequest, HhdmRequest, MemmapRequest, ModulesRequest, MpRequest, RsdpRequest,
 };
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker, memmap};
 
@@ -37,6 +37,10 @@ static FRAMEBUFFER: FramebufferRequest = FramebufferRequest::new();
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 static CMDLINE: ExecutableCmdlineRequest = ExecutableCmdlineRequest::new();
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static DATE_AT_BOOT: DateAtBootRequest = DateAtBootRequest::new();
 
 #[used]
 #[unsafe(link_section = ".limine_requests")]
@@ -134,6 +138,12 @@ pub fn mp() -> Option<(&'static [&'static limine::mp::MpInfo], u32)> {
 /// Kernel command line, empty when the bootloader passed none.
 pub fn cmdline() -> &'static str {
     CMDLINE.response().map_or("", |r| r.cmdline())
+}
+
+/// Wall-clock UNIX time (seconds) at boot, read by the firmware from the RTC.
+/// `None` if the bootloader did not provide it.
+pub fn unix_time_at_boot() -> Option<u64> {
+    DATE_AT_BOOT.response().and_then(|r| u64::try_from(r.timestamp).ok())
 }
 
 /// Linear 32-bit RGB framebuffer.

@@ -159,6 +159,8 @@ fn handle(number: u64, a: [u64; 6], regs: &mut Regs) -> SysResult {
         nr::UNAME => sys_uname(a[0]),
         nr::GETRANDOM => sys_getrandom(a[0], a[1] as usize),
         nr::CLOCK_GETTIME => sys_clock_gettime(a[0], a[1]),
+        nr::GETTIMEOFDAY => sys_gettimeofday(a[0]),
+        nr::TIME => sys_time(a[0]),
         nr::FSTAT => sys_fstat(a[0] as i32, a[1]),
         nr::NEWFSTATAT => sys_newfstatat(a[0] as i32, a[1], a[2], a[3] as i32),
         nr::STAT => sys_stat(a[0], a[1], true),
@@ -1145,24 +1147,71 @@ fn sys_getrandom(buf: u64, len: usize) -> SysResult {
     Ok(len as u64)
 }
 
-fn sys_clock_gettime(_clk: u64, ts: u64) -> SysResult {
-    // A monotonic clock derived from the TSC and the APIC's calibrated
-    // cycles-per-ms. It must be non-zero and advancing: the Go runtime panics
-    // ("nanotime returning zero") otherwise, which crashed fzf under zinit.
+/// Fallback wall-clock base when the bootloader reports no boot date, so
+/// CLOCK_REALTIME still looks like a real post-2000 date (zinit's timing and
+/// `$EPOCHREALTIME` assume one) rather than seconds since boot.
+const FALLBACK_REALTIME_BASE_SECS: u64 = 1_762_000_000; // 2025-11-01
+
+/// UNIX time at boot: the firmware RTC value Limine reports, else the fallback.
+fn realtime_base_secs() -> u64 {
+    crate::boot::unix_time_at_boot().unwrap_or(FALLBACK_REALTIME_BASE_SECS)
+}
+
+/// Seconds + nanoseconds of monotonic uptime, from the TSC and calibrated
+/// cycles-per-ms. Always advancing and non-zero.
+fn uptime_sec_nsec() -> (u64, u64) {
     let tpms = crate::arch::x86_64::apic::tsc_per_ms();
     // SAFETY: `_rdtsc` reads the timestamp counter.
     let tsc = unsafe { core::arch::x86_64::_rdtsc() };
     let ms = tsc / tpms;
     let sub = tsc % tpms; // leftover cycles within the current ms
-    let t = types::Timespec {
-        tv_sec: (ms / 1000) as i64,
-        tv_nsec: ((ms % 1000) * 1_000_000 + sub * 1_000_000 / tpms) as i64,
-    };
+    (ms / 1000, (ms % 1000) * 1_000_000 + sub * 1_000_000 / tpms)
+}
+
+/// `(sec, nsec)` for a clock id: CLOCK_REALTIME (0) and its coarse variant add
+/// the epoch base; everything else is treated as monotonic uptime.
+fn clock_sec_nsec(clk: u64) -> (u64, u64) {
+    const CLOCK_REALTIME: u64 = 0;
+    const CLOCK_REALTIME_COARSE: u64 = 5;
+    let (sec, nsec) = uptime_sec_nsec();
+    if clk == CLOCK_REALTIME || clk == CLOCK_REALTIME_COARSE {
+        (sec + realtime_base_secs(), nsec)
+    } else {
+        (sec, nsec)
+    }
+}
+
+fn sys_clock_gettime(clk: u64, ts: u64) -> SysResult {
+    let (sec, nsec) = clock_sec_nsec(clk);
+    let t = types::Timespec { tv_sec: sec as i64, tv_nsec: nsec as i64 };
     let bytes = unsafe {
         core::slice::from_raw_parts(core::ptr::from_ref(&t).cast::<u8>(), size_of::<types::Timespec>())
     };
     copy_to_user(ts, bytes)?;
     Ok(0)
+}
+
+/// `gettimeofday(tv, tz)`: wall-clock `struct timeval { i64 tv_sec; i64 tv_usec }`
+/// (16 bytes). zsh's datetime module backs `$EPOCHREALTIME` with this; a missing
+/// or non-advancing value stalls zinit's async timing loops.
+fn sys_gettimeofday(tv: u64) -> SysResult {
+    if tv != 0 {
+        let (sec, nsec) = clock_sec_nsec(0);
+        let mut buf = [0u8; 16];
+        buf[0..8].copy_from_slice(&(sec as i64).to_le_bytes());
+        buf[8..16].copy_from_slice(&((nsec / 1000) as i64).to_le_bytes());
+        copy_to_user(tv, &buf)?;
+    }
+    Ok(0)
+}
+
+/// `time(tloc)`: wall-clock seconds, also written to `*tloc` if non-NULL.
+fn sys_time(tloc: u64) -> SysResult {
+    let (sec, _) = clock_sec_nsec(0);
+    if tloc != 0 {
+        put_user(tloc, sec)?;
+    }
+    Ok(sec)
 }
 
 fn sys_fstat(fd_num: i32, statbuf: u64) -> SysResult {

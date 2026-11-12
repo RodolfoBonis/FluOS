@@ -58,6 +58,7 @@ pub const READLINK: u64 = 89;
 pub const CHMOD: u64 = 90;
 pub const UMASK: u64 = 95;
 pub const GETTIMEOFDAY: u64 = 96;
+pub const TIME: u64 = 201;
 pub const GETRUSAGE: u64 = 98;
 pub const GETRLIMIT: u64 = 97;
 pub const GETUID: u64 = 102;
