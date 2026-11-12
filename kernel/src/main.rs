@@ -93,6 +93,7 @@ extern "C" fn kmain() -> ! {
         userspace::run_syscall_bench();
         userspace::run_security_selftests();
         userspace::run_signal_selftest();
+        userspace::run_iopl_selftest();
     } else {
         log::warning!("no ACPI MADT; SMP and scheduler timer disabled");
     }

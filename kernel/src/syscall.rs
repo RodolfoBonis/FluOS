@@ -954,6 +954,9 @@ fn sys_fork(regs: &Regs) -> SysResult {
     process::register(child.clone());
     let mut child_regs = *regs;
     child_regs.rax = 0;
+    // Defense in depth: never let a child resume with privileged RFLAGS bits
+    // (IOPL/NT/...) inherited from a frame, matching the sigreturn sanitiser.
+    child_regs.rflags = crate::signal::sanitize_user_rflags(child_regs.rflags);
     crate::userspace::spawn_fork_child(&child, child_regs)?;
     Ok(child_pid as u64)
 }

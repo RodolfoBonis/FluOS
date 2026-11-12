@@ -175,7 +175,10 @@ fn drive(con: &mut Console) -> Result<()> {
     // kernel-side facts we can assert on deterministically, without racing the
     // shell's post-signal prompt handling under slow TCG.
     con.wait_for_since(mkill, "terminated by signal 2", Duration::from_secs(40))?;
-    con.wait_for_since(mkill, "foreground pgrp -> 8", Duration::from_secs(40))?;
+    // The shell (in a different process group) survives and reclaims the
+    // terminal foreground. Its steady-state pgroup varies by boot, so assert the
+    // reclaim happened (any group), not a specific number.
+    con.wait_for_since(mkill, "foreground pgrp ->", Duration::from_secs(40))?;
 
     // NOTE: a `cmd | cmd` pipeline is deferred to step 3 (pipe2 + blocking
     // reads with real wakeups); it is added here once pipes land.

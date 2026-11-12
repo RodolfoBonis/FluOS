@@ -306,8 +306,10 @@ const USER_RFLAGS_MASK: u64 = 0x0004_0dd5;
 /// IF set plus the always-one reserved bit 1.
 const USER_RFLAGS_FIXED: u64 = 0x0000_0202;
 
-/// Sanitizes RFLAGS loaded from a user-controlled sigframe.
-fn sanitize_user_rflags(user: u64) -> u64 {
+/// Sanitizes RFLAGS loaded from any user-controlled source (sigframe, a
+/// fork child's inherited frame): keep the condition/arith/TF/DF/AC bits, force
+/// IF and reserved bit 1, and drop privileged bits (IOPL, NT, VM, ...).
+pub fn sanitize_user_rflags(user: u64) -> u64 {
     (user & USER_RFLAGS_MASK) | USER_RFLAGS_FIXED
 }
 

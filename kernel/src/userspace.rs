@@ -485,7 +485,98 @@ fn signal_handler_elf() -> Vec<u8> {
     raw_exec_elf_at(&code, entry)
 }
 
-/// Runs the signal self-test: a program that catches SIGUSR1, raises it on
+/// Builds a program that proves `rt_sigreturn` cannot grant I/O privilege. Its
+/// SIGUSR1 handler sets IOPL=3 in the signal frame's saved RFLAGS (uc_mcontext),
+/// then after the kernel restores the (sanitised) context it executes
+/// `in al, 0x60`. With IOPL left at 0 that faults (#GP -> SIGSEGV); if the
+/// sanitiser regressed, the `in` would succeed and the process would exit 0.
+fn iopl_sigreturn_elf() -> Vec<u8> {
+    const V: u64 = 0x40_0000;
+    let headers = 64 + 56u64;
+
+    // handler(sig, info, uc): rdx = &uc. Set IOPL (bits 12-13) in
+    // uc.uc_mcontext.eflags (offset 176 in UContext), then return.
+    let handler: Vec<u8> = vec![
+        0x48, 0x81, 0x8A, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00, // or qword [rdx+0xB0],0x3000
+        0xC3, // ret
+    ];
+    let restorer: Vec<u8> = vec![0xB8, 0x0F, 0, 0, 0, 0x0F, 0x05];
+
+    let handler_addr = V + headers;
+    let restorer_addr = handler_addr + handler.len() as u64;
+    let entry = restorer_addr + restorer.len() as u64;
+
+    let mut main: Vec<u8> = Vec::new();
+    main.extend_from_slice(&[0x48, 0x83, 0xEC, 0x40]); // sub rsp, 64
+    main.extend_from_slice(&[0x48, 0xB8]);
+    main.extend_from_slice(&handler_addr.to_le_bytes()); // movabs rax, handler
+    main.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]); // mov [rsp], rax
+    main.extend_from_slice(&[0xC7, 0x44, 0x24, 0x08, 0x00, 0x00, 0x00, 0x14]); // flags lo = SA_RESTORER|SA_RESTART
+    main.extend_from_slice(&[0xC7, 0x44, 0x24, 0x0C, 0x00, 0x00, 0x00, 0x00]); // flags hi = 0
+    main.extend_from_slice(&[0x48, 0xB8]);
+    main.extend_from_slice(&restorer_addr.to_le_bytes()); // movabs rax, restorer
+    main.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x10]); // mov [rsp+16], rax
+    main.extend_from_slice(&[0x31, 0xC0]); // xor eax,eax
+    main.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x18]); // mov [rsp+24], rax (mask=0)
+    main.extend_from_slice(&[0xB8, 13, 0, 0, 0]); // mov eax,13 (rt_sigaction)
+    main.extend_from_slice(&[0xBF, 10, 0, 0, 0]); // mov edi,10 (SIGUSR1)
+    main.extend_from_slice(&[0x48, 0x89, 0xE6]); // mov rsi, rsp
+    main.extend_from_slice(&[0x31, 0xD2]); // xor edx,edx
+    main.extend_from_slice(&[0x41, 0xBA, 8, 0, 0, 0]); // mov r10d,8
+    main.extend_from_slice(&[0x0F, 0x05]); // syscall
+    main.extend_from_slice(&[0x48, 0x83, 0xC4, 0x40]); // add rsp,64
+    main.extend_from_slice(&[0xB8, 39, 0, 0, 0]); // mov eax,39 (getpid)
+    main.extend_from_slice(&[0x0F, 0x05]); // syscall
+    main.extend_from_slice(&[0x89, 0xC7]); // mov edi,eax
+    main.extend_from_slice(&[0xB8, 62, 0, 0, 0]); // mov eax,62 (kill)
+    main.extend_from_slice(&[0xBE, 10, 0, 0, 0]); // mov esi,10
+    main.extend_from_slice(&[0x0F, 0x05]); // syscall -> handler sets IOPL, sigreturn restores sanitised flags
+    main.extend_from_slice(&[0xE4, 0x60]); // in al, 0x60  -> #GP if IOPL<3
+    main.extend_from_slice(&[0xB8, 0xE7, 0, 0, 0]); // mov eax,231 (exit_group) -- only if NOT faulted
+    main.extend_from_slice(&[0x31, 0xFF]); // xor edi,edi
+    main.extend_from_slice(&[0x0F, 0x05]); // syscall
+
+    let mut code = Vec::new();
+    code.extend_from_slice(&handler);
+    code.extend_from_slice(&restorer);
+    code.extend_from_slice(&main);
+    raw_exec_elf_at(&code, entry)
+}
+
+/// Runs the IOPL-via-sigreturn self-test. The process MUST be killed by SIGSEGV
+/// (exit 139): a clean exit (0) would mean `rt_sigreturn` granted ring-3 I/O
+/// privilege, a serious escalation.
+pub fn run_iopl_selftest() {
+    let image = iopl_sigreturn_elf();
+    match spawn(&image, &["/iopl-test"], &[]) {
+        Ok(proc) => {
+            let mut spins = 0u64;
+            let code = loop {
+                if let Some(c) = proc.lock().exit_code {
+                    break Some(c);
+                }
+                scheduler::yield_now();
+                spins += 1;
+                if spins > 50_000_000 {
+                    break None;
+                }
+            };
+            match code {
+                Some(139) => crate::log::info!(
+                    "iopl selftest: in al,0x60 faulted -> SIGSEGV (exit 139); rt_sigreturn did not grant IOPL"
+                ),
+                Some(0) => crate::log::error!(
+                    "iopl selftest: FAILED -- process got ring-3 I/O privilege via rt_sigreturn!"
+                ),
+                Some(c) => crate::log::error!("iopl selftest: unexpected exit status {c}"),
+                None => crate::log::error!("iopl selftest: TIMED OUT"),
+            }
+        }
+        Err(e) => crate::log::error!("iopl selftest: spawn failed: {e:?}"),
+    }
+}
+
+/// Runs the signal self-test: a program that catches SIGUSR1, raises it on/// Runs the signal self-test: a program that catches SIGUSR1, raises it on
 /// itself, and resumes after the handler. The kernel must set up and tear down
 /// the signal frame correctly; a clean exit (status 0) proves the round trip.
 pub fn run_signal_selftest() {
