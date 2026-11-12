@@ -199,6 +199,16 @@ pub fn kernel_pml4_phys() -> u64 {
     KERNEL_PML4.load(Ordering::Acquire)
 }
 
+/// Acknowledges a TLB-shootdown IPI (incremented by the handler after flushing).
+/// The full sender-side wait protocol lands with `munmap` freeing frames.
+static TLB_ACKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Called by the TLB-shootdown IRQ after flushing, so a future sender can wait
+/// for all CPUs to acknowledge before freeing the backing frames.
+pub fn tlb_ack() {
+    TLB_ACKS.fetch_add(1, Ordering::Release);
+}
+
 /// Loads the kernel page tables on the calling CPU (used by APs, which start on
 /// the bootloader's tables and must adopt ours before touching kernel-only
 /// mappings such as device MMIO).

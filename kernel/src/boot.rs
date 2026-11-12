@@ -2,7 +2,7 @@
 
 use limine::request::{
     BootloaderInfoRequest, ExecutableAddressRequest, ExecutableCmdlineRequest, FramebufferRequest,
-    HhdmRequest, MemmapRequest, MpRequest, RsdpRequest,
+    HhdmRequest, MemmapRequest, ModulesRequest, MpRequest, RsdpRequest,
 };
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker, memmap};
 
@@ -45,6 +45,10 @@ static RSDP: RsdpRequest = RsdpRequest::new();
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 static MP: MpRequest = MpRequest::new(0);
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static MODULES: ModulesRequest = ModulesRequest::new();
 
 #[used]
 #[unsafe(link_section = ".limine_requests_end")]
@@ -107,6 +111,17 @@ pub fn kernel_address() -> (u64, u64) {
 pub fn rsdp_addr() -> Option<*const ()> {
     let addr = RSDP.response()?.address;
     (!addr.is_null()).then_some(addr as *const ())
+}
+
+/// The initramfs module (newc cpio) the bootloader loaded, if any.
+pub fn initramfs() -> Option<&'static [u8]> {
+    let resp = MODULES.response()?;
+    let module = resp
+        .modules()
+        .iter()
+        .find(|f| f.path().contains("initramfs"))
+        .or_else(|| resp.modules().first())?;
+    Some(module.data())
 }
 
 /// Multiprocessor info: the per-CPU descriptors and the BSP's LAPIC id, if the

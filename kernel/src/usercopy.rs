@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 
 const PAGE: u64 = 4096;
 /// Exclusive upper bound of the user address range (canonical lower half).
-const USER_MAX: u64 = 0x0000_8000_0000_0000;
+pub const USER_MAX: u64 = 0x0000_8000_0000_0000;
 
 /// Set true once `clone(CLONE_VM)` can create threads sharing an address space.
 /// While false (M4 so far) the validate-then-copy-via-HHDM scheme below is safe;

@@ -189,25 +189,29 @@ pub fn write_bytes(bytes: &[u8]) {
     }
 }
 
-/// Cooked line read from the keyboard into `buf`, with echo and backspace
-/// handling, blocking until Enter. Returns the number of bytes (including the
-/// trailing newline). This is the minimal line discipline for M4.
-pub fn read_line(buf: &mut [u8]) -> usize {
+/// Blocks for the next keyboard byte, waiting on interrupts.
+fn next_byte() -> u8 {
     use crate::arch::x86_64::input;
     use x86_64::instructions::interrupts;
+    loop {
+        if let Some(b) = interrupts::without_interrupts(input::pop) {
+            return b;
+        }
+        // SAFETY: wait for the next keyboard/timer IRQ.
+        unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)) };
+    }
+}
 
+/// Cooked line read (ICANON): line-buffered with optional echo and backspace
+/// editing, blocking until Enter. Returns bytes incl. the trailing newline.
+pub fn read_line(buf: &mut [u8], echo: bool) -> usize {
     let mut n = 0usize;
     loop {
-        let byte = loop {
-            if let Some(b) = interrupts::without_interrupts(input::pop) {
-                break b;
-            }
-            // SAFETY: wait for the next keyboard IRQ.
-            unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)) };
-        };
-        match byte {
+        match next_byte() {
             b'\r' | b'\n' => {
-                write_bytes(b"\n");
+                if echo {
+                    write_bytes(b"\n");
+                }
                 if n < buf.len() {
                     buf[n] = b'\n';
                     n += 1;
@@ -217,18 +221,53 @@ pub fn read_line(buf: &mut [u8]) -> usize {
             0x08 | 0x7f => {
                 if n > 0 {
                     n -= 1;
-                    write_bytes(b"\x08 \x08");
+                    if echo {
+                        write_bytes(b"\x08 \x08");
+                    }
                 }
             }
             b => {
                 if n < buf.len() {
                     buf[n] = b;
                     n += 1;
-                    write_bytes(&[b]);
+                    if echo {
+                        write_bytes(&[b]);
+                    }
                 }
             }
         }
     }
+}
+
+/// Raw read (non-canonical): blocks for one byte, then drains what is already
+/// queued, with no line editing. Echo is honoured if `echo` is set. This is what
+/// an interactive shell's own line editor uses.
+pub fn read_raw(buf: &mut [u8], echo: bool) -> usize {
+    use crate::arch::x86_64::input;
+    use x86_64::instructions::interrupts;
+    if buf.is_empty() {
+        return 0;
+    }
+    let mut n = 0usize;
+    let first = next_byte();
+    if echo {
+        write_bytes(&[first]);
+    }
+    buf[0] = first;
+    n += 1;
+    while n < buf.len() {
+        match interrupts::without_interrupts(input::pop) {
+            Some(b) => {
+                if echo {
+                    write_bytes(&[b]);
+                }
+                buf[n] = b;
+                n += 1;
+            }
+            None => break,
+        }
+    }
+    n
 }
 
 /// Log sink: a plain function pointer so `log` stays decoupled from the console.

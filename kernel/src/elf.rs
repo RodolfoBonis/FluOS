@@ -56,10 +56,24 @@ pub fn load(space: &mut AddressSpace, data: &[u8]) -> Result<Loaded, Errno> {
     let e_phentsize = u16_at(data, 54).ok_or(Errno(abi::errno::ENOEXEC))? as usize;
     let e_phnum = u16_at(data, 56).ok_or(Errno(abi::errno::ENOEXEC))? as usize;
 
-    let mut phdr_vaddr = base + e_phoff; // fallback AT_PHDR
+    // Every user virtual address the loader produces must land in the user half.
+    // All address math is checked: a hostile or corrupt ELF must never wrap or
+    // alias into the kernel range.
+    let user_max = crate::usercopy::USER_MAX;
+    let check_vaddr = |v: u64| -> Result<u64, Errno> {
+        if v >= user_max { Err(Errno(abi::errno::ENOEXEC)) } else { Ok(v) }
+    };
+
+    // AT_PHDR must be the *virtual* address where the program headers are
+    // loaded. Default to the PT_LOAD that covers `e_phoff` (set below); fall
+    // back to base+e_phoff only if nothing covers it.
+    let mut phdr_vaddr = base.checked_add(e_phoff).ok_or(Errno(abi::errno::ENOEXEC))?;
 
     for i in 0..e_phnum {
-        let ph = e_phoff as usize + i * e_phentsize;
+        // ph = e_phoff + i * e_phentsize, all checked against overflow.
+        let ph = e_phoff
+            .checked_add((i as u64).checked_mul(e_phentsize as u64).ok_or(Errno(abi::errno::ENOEXEC))?)
+            .ok_or(Errno(abi::errno::ENOEXEC))? as usize;
         let p_type = u32_at(data, ph).ok_or(Errno(abi::errno::ENOEXEC))?;
         let p_flags = u32_at(data, ph + 4).ok_or(Errno(abi::errno::ENOEXEC))?;
         let p_offset = u64_at(data, ph + 8).ok_or(Errno(abi::errno::ENOEXEC))?;
@@ -68,18 +82,34 @@ pub fn load(space: &mut AddressSpace, data: &[u8]) -> Result<Loaded, Errno> {
         let p_memsz = u64_at(data, ph + 40).ok_or(Errno(abi::errno::ENOEXEC))?;
 
         match p_type {
-            PT_PHDR => phdr_vaddr = base + p_vaddr,
+            PT_PHDR => {
+                phdr_vaddr = check_vaddr(base.checked_add(p_vaddr).ok_or(Errno(abi::errno::ENOEXEC))?)?;
+            }
             PT_LOAD => {
-                let vaddr = base + p_vaddr;
+                let vaddr = check_vaddr(base.checked_add(p_vaddr).ok_or(Errno(abi::errno::ENOEXEC))?)?;
+                // The mapped span [vaddr, vaddr + p_memsz) must stay in-range.
+                let vend = vaddr.checked_add(p_memsz).ok_or(Errno(abi::errno::ENOEXEC))?;
+                if vend > user_max {
+                    return Err(Errno(abi::errno::ENOEXEC));
+                }
+                // File-backed span [p_offset, p_offset + p_filesz) must fit the
+                // image, with no overflow and filesz <= memsz.
+                let fend = p_offset.checked_add(p_filesz).ok_or(Errno(abi::errno::ENOEXEC))?;
+                if p_filesz > p_memsz || fend as usize > data.len() {
+                    return Err(Errno(abi::errno::ENOEXEC));
+                }
+                // If this segment contains the program headers, derive AT_PHDR
+                // from where they land in memory.
+                if p_offset <= e_phoff && e_phoff < fend {
+                    phdr_vaddr = check_vaddr(vaddr + (e_phoff - p_offset))?;
+                }
                 let writable = p_flags & 2 != 0;
                 let exec = p_flags & 1 != 0;
                 // Real permissions (W^X): the kernel writes segment contents
                 // through the HHDM below, bypassing the user mapping, so a
                 // read-only text segment stays non-writable from user mode.
                 space.map_region(vaddr, p_memsz, writable, exec);
-                let fsz = p_filesz as usize;
-                let start = p_offset as usize;
-                if let Some(bytes) = data.get(start..start + fsz) {
+                if let Some(bytes) = data.get(p_offset as usize..fend as usize) {
                     space.write(vaddr, bytes);
                 }
             }
@@ -88,7 +118,7 @@ pub fn load(space: &mut AddressSpace, data: &[u8]) -> Result<Loaded, Errno> {
     }
 
     Ok(Loaded {
-        entry: base + e_entry,
+        entry: check_vaddr(base.checked_add(e_entry).ok_or(Errno(abi::errno::ENOEXEC))?)?,
         phdr: phdr_vaddr,
         phent: e_phentsize as u64,
         phnum: e_phnum as u64,

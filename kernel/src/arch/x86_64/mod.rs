@@ -10,6 +10,7 @@ pub mod input;
 pub mod port;
 pub mod ps2;
 pub mod serial;
+pub mod trap;
 pub mod user;
 
 /// Installs the GDT/TSS and IDT on the bootstrap processor and returns the TSS

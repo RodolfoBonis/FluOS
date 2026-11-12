@@ -1,10 +1,13 @@
 //! User-mode entry, the `syscall` fast path, and the saved-register frame.
 //!
-//! We keep the GS base pointed at per-CPU state in both ring 0 and ring 3 (user
-//! TLS uses FS via `arch_prctl`, as musl does), so no `swapgs` is needed: every
-//! interrupt and syscall sees the correct GS. The `syscall` entry parks the user
+//! Ring 3 runs with the user's GS base; the kernel's per-CPU GS lives in
+//! `KERNEL_GS_BASE`, so every user-reachable entry (`syscall` and the interrupt
+//! stubs) `swapgs`es on the way in and out. User TLS uses FS via `arch_prctl`,
+//! as musl does. The `syscall` entry swaps to the per-CPU GS, parks the user
 //! stack pointer, switches to the current thread's kernel stack (reached through
-//! `gs:[0]`), builds a [`Regs`] frame, dispatches, then restores and `sysretq`s.
+//! `gs:[0]`), builds a [`Regs`] frame, dispatches, then restores and `sysretq`s
+//! — unless the user RIP to resume is non-canonical, in which case it kills the
+//! process rather than executing a `sysretq` that would #GP in ring 0.
 
 use super::gdt::{self, KERNEL_CODE, KERNEL_DATA, USER_CODE, USER_DATA};
 use core::arch::naked_asm;
@@ -18,7 +21,7 @@ use x86_64::structures::gdt::SegmentSelector;
 /// matches the push sequence). The dispatcher reads syscall args from it and
 /// writes the result into `rax`.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct Regs {
     pub r15: u64,
     pub r14: u64,
@@ -100,6 +103,18 @@ pub unsafe extern "C" fn syscall_entry() {
         "push r15",
         "mov rdi, rsp",          // &mut Regs
         "call {dispatch}",
+        // L1/CVE-2012-0217: the value we are about to load into RCX for
+        // `sysretq` is the user RIP. A non-canonical RCX makes `sysretq` #GP
+        // *in ring 0* with a user-controlled stack. Validate canonicality
+        // (bits [63:47] all equal) first; if it fails, kill the process on the
+        // kernel stack instead of ever executing the vulnerable `sysretq`.
+        // RAX/RCX are scratch here — the pops below reload them from the frame.
+        "mov rax, [rsp + {o_rip}]",
+        "mov rcx, rax",
+        "shl rcx, 16",
+        "sar rcx, 16",
+        "cmp rcx, rax",
+        "jne 2f",
         "pop r15",
         "pop r14",
         "pop r13",
@@ -118,8 +133,29 @@ pub unsafe extern "C" fn syscall_entry() {
         "pop rsp",               // restore user rsp
         "swapgs",                // GS_BASE <- user GS before returning to ring 3
         "sysretq",
+        "2:",                    // non-canonical user rip: never sysretq
+        "mov rdi, rsp",          // &Regs (frame base is 16-aligned here)
+        "call {bad_sysret}",
         dispatch = sym crate::syscall::dispatch,
+        bad_sysret = sym bad_sysret,
+        o_rip = const core::mem::offset_of!(Regs, rip),
     );
+}
+
+/// Called from the `syscall` return path when the user RIP to load into RCX is
+/// non-canonical. Executing `sysretq` with such an RCX would #GP in ring 0 with
+/// a user-controlled stack (CVE-2012-0217), so we never run it: the offending
+/// process is killed with SIGSEGV. GS is still the kernel's per-CPU GS here, so
+/// per-CPU and process state are reachable. Never returns.
+extern "C" fn bad_sysret(regs: &Regs) -> ! {
+    crate::log::error!(
+        "syscall return with non-canonical rip {:#018x} -> killing process (SIGSEGV)",
+        regs.rip,
+    );
+    if let Some(p) = crate::process::current() {
+        p.lock().exit_code = Some(128 + abi::types::SIGSEGV);
+    }
+    crate::scheduler::thread_exit();
 }
 
 /// Enters user mode at `entry` with stack `user_sp`, never returning. GS stays
@@ -153,6 +189,65 @@ pub unsafe fn enter_user(entry: u64, user_sp: u64) -> ! {
             flags = in(reg) 0x202u64, // IF set + reserved bit 1
             cs = in(reg) u64::from(USER_CODE),
             ip = in(reg) entry,
+            options(noreturn),
+        )
+    }
+}
+
+/// Enters user mode with a full saved register set (used by a `fork` child,
+/// which resumes exactly where the parent was with `rax = 0`). Never returns.
+///
+/// # Safety
+/// `regs` must describe a valid user context in the active address space, and
+/// the per-CPU kernel stack / GS must be set up for this thread.
+pub unsafe fn enter_user_regs(regs: &Regs) -> ! {
+    use core::mem::offset_of;
+    // SAFETY: builds an iretq frame from `regs`, restores the GPRs (loading the
+    // pointer register r15 last), flips to the user GS, and returns to ring 3.
+    unsafe {
+        core::arch::asm!(
+            "cli",
+            "swapgs",
+            "push {ss}",
+            "push qword ptr [r15 + {o_rsp}]",
+            "push qword ptr [r15 + {o_rflags}]",
+            "push {cs}",
+            "push qword ptr [r15 + {o_rip}]",
+            "mov rax, [r15 + {o_rax}]",
+            "mov rbx, [r15 + {o_rbx}]",
+            "xor rcx, rcx",
+            "mov rdx, [r15 + {o_rdx}]",
+            "mov rsi, [r15 + {o_rsi}]",
+            "mov rdi, [r15 + {o_rdi}]",
+            "mov rbp, [r15 + {o_rbp}]",
+            "mov r8,  [r15 + {o_r8}]",
+            "mov r9,  [r15 + {o_r9}]",
+            "mov r10, [r15 + {o_r10}]",
+            "xor r11, r11",
+            "mov r12, [r15 + {o_r12}]",
+            "mov r13, [r15 + {o_r13}]",
+            "mov r14, [r15 + {o_r14}]",
+            "mov r15, [r15 + {o_r15}]",
+            "iretq",
+            in("r15") regs,
+            ss = const USER_DATA as u64,
+            cs = const USER_CODE as u64,
+            o_rsp = const offset_of!(Regs, user_rsp),
+            o_rflags = const offset_of!(Regs, rflags),
+            o_rip = const offset_of!(Regs, rip),
+            o_rax = const offset_of!(Regs, rax),
+            o_rbx = const offset_of!(Regs, rbx),
+            o_rdx = const offset_of!(Regs, rdx),
+            o_rsi = const offset_of!(Regs, rsi),
+            o_rdi = const offset_of!(Regs, rdi),
+            o_rbp = const offset_of!(Regs, rbp),
+            o_r8 = const offset_of!(Regs, r8),
+            o_r9 = const offset_of!(Regs, r9),
+            o_r10 = const offset_of!(Regs, r10),
+            o_r12 = const offset_of!(Regs, r12),
+            o_r13 = const offset_of!(Regs, r13),
+            o_r14 = const offset_of!(Regs, r14),
+            o_r15 = const offset_of!(Regs, r15),
             options(noreturn),
         )
     }

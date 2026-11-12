@@ -66,6 +66,8 @@ pub struct Thread {
     /// User GS base (the value KERNEL_GS_BASE holds while this thread runs in
     /// the kernel; swapped to GS on return to ring 3). Supports arch_prctl GS.
     pub user_gs: u64,
+    /// User FS base (TLS), saved/restored per thread on context switch.
+    pub fs_base: u64,
     /// Raw pointer to the owning process (`*const SpinLock<Process>`), 0 if none.
     pub proc_ptr: u64,
     /// Times this thread was scheduled (self-test accounting).
@@ -125,6 +127,7 @@ impl Thread {
             cr3: 0,
             proc_ptr: 0,
             user_gs: 0,
+            fs_base: 0,
             run_count: AtomicU64::new(0),
             ran_on: AtomicU32::new(0),
         });
@@ -153,6 +156,7 @@ impl Thread {
             cr3: 0,
             proc_ptr: 0,
             user_gs: 0,
+            fs_base: 0,
             run_count: AtomicU64::new(1),
             ran_on: AtomicU32::new(0),
         })
@@ -210,7 +214,7 @@ pub fn check_canary(t: *const Thread) {
 /// running thread on this CPU.
 pub unsafe fn switch(old: *mut Thread, new: *mut Thread) {
     use x86_64::VirtAddr;
-    use x86_64::registers::model_specific::KernelGsBase;
+    use x86_64::registers::model_specific::{FsBase, KernelGsBase};
     // SAFETY: caller guarantees both are live; the FPU areas are owned and
     // correctly sized, and `rsp` fields are valid stacks.
     unsafe {
@@ -219,6 +223,9 @@ pub unsafe fn switch(old: *mut Thread, new: *mut Thread) {
         // saved/restored here (swapgs restores it to GS on return to ring 3).
         (*old).user_gs = KernelGsBase::read().as_u64();
         KernelGsBase::write(VirtAddr::new((*new).user_gs));
+        // FS base holds the user TLS pointer; it is per-thread too.
+        (*old).fs_base = FsBase::read().as_u64();
+        FsBase::write(VirtAddr::new((*new).fs_base));
 
         context::fxsave((*old).fpu);
         context::fxrstor((*new).fpu);

@@ -17,6 +17,36 @@ use vfs::{Ino, Vfs};
 /// The system-wide root filesystem (tmpfs + devfs), set up at boot.
 static VFS: SpinLock<Option<Vfs>> = SpinLock::new(None);
 
+/// The console/tty line-discipline settings (termios).
+static TERMIOS: SpinLock<types::Termios> = SpinLock::new(default_termios());
+
+/// Default cooked termios: canonical mode, echo, signals, CR→NL in, NL→CRNL out.
+const fn default_termios() -> types::Termios {
+    let mut cc = [0u8; types::NCCS];
+    cc[types::VERASE] = 0x7f;
+    cc[types::VINTR] = 3;
+    cc[types::VEOF] = 4;
+    cc[types::VMIN] = 1;
+    types::Termios {
+        c_iflag: types::ICRNL,
+        c_oflag: types::OPOST | types::ONLCR,
+        c_cflag: 0,
+        c_lflag: types::ICANON | types::ECHO | types::ISIG,
+        c_line: 0,
+        c_cc: cc,
+    }
+}
+
+/// Current console termios (for ioctl TCGETS/TCSETS).
+pub fn termios() -> types::Termios {
+    *TERMIOS.lock()
+}
+
+/// Updates the console termios (ioctl TCSETS).
+pub fn set_termios(t: types::Termios) {
+    *TERMIOS.lock() = t;
+}
+
 /// Device numbers we recognise (`(major << 8) | minor`, Linux-ish).
 mod dev {
     pub const NULL: u64 = (1 << 8) | 3;
@@ -48,6 +78,18 @@ pub fn init(initramfs: Option<&[u8]>) {
     let _ = fs.mknod_char(dev, "console", 0o600, dev::CONSOLE);
     let _ = fs.mknod_char(dev, "tty", 0o666, dev::TTY);
     *VFS.lock() = Some(fs);
+}
+
+/// Reads an entire regular file from the VFS into a Vec.
+pub fn read_file(path: &str) -> Result<alloc::vec::Vec<u8>, Errno> {
+    with_vfs(|v| {
+        let ino = v.resolve(vfs::ROOT, path, true)?;
+        let size = v.size(ino)? as usize;
+        let mut buf = alloc::vec![0u8; size];
+        let n = v.read_at(ino, 0, &mut buf)?;
+        buf.truncate(n);
+        Ok(buf)
+    })
 }
 
 /// Runs `f` with the global VFS, or returns `ENOENT` if it is not initialised.
@@ -160,6 +202,14 @@ impl FdTable {
         Ok(self.alloc(file))
     }
 
+    /// Duplicates `old` into the lowest free descriptor >= `min` (F_DUPFD).
+    pub fn dup_from(&mut self, old: i32, min: i32) -> Result<u64, Errno> {
+        let file = self.get(old)?;
+        let slot = self.free_slot(min.max(0) as usize);
+        self.fds[slot] = Some(file);
+        Ok(slot as u64)
+    }
+
     /// Deep-clones the table for `fork` (shares the underlying open files).
     #[allow(dead_code)] // used by fork
     pub fn fork_clone(&self) -> FdTable {
@@ -228,8 +278,10 @@ pub fn open(cwd: Ino, path: &str, flags: u64, mode: u32) -> Result<Arc<SpinLock<
 fn device_write(dev: u64, buf: &[u8]) -> SysResult {
     match dev {
         dev::CONSOLE | dev::TTY => {
-            crate::console::write_bytes(buf);
+            // Serial first, then console — same order the logger uses, so the two
+            // never invert lock order under SMP.
             crate::arch::x86_64::serial::write_bytes(buf);
+            crate::console::write_bytes(buf);
             Ok(buf.len() as u64)
         }
         dev::NULL => Ok(buf.len() as u64),
@@ -240,7 +292,16 @@ fn device_write(dev: u64, buf: &[u8]) -> SysResult {
 
 fn device_read(dev: u64, buf: &mut [u8]) -> SysResult {
     match dev {
-        dev::CONSOLE | dev::TTY => Ok(crate::console::read_line(buf) as u64),
+        dev::CONSOLE | dev::TTY => {
+            let t = *TERMIOS.lock();
+            let echo = t.c_lflag & types::ECHO != 0;
+            let n = if t.c_lflag & types::ICANON != 0 {
+                crate::console::read_line(buf, echo)
+            } else {
+                crate::console::read_raw(buf, echo)
+            };
+            Ok(n as u64)
+        }
         dev::NULL => Ok(0),
         dev::ZERO => {
             buf.fill(0);

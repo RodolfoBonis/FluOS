@@ -31,6 +31,7 @@ pub const SELECT: u64 = 23;
 pub const SCHED_YIELD: u64 = 24;
 pub const DUP: u64 = 32;
 pub const DUP2: u64 = 33;
+pub const SENDFILE: u64 = 40;
 pub const NANOSLEEP: u64 = 35;
 pub const GETPID: u64 = 39;
 pub const CLONE: u64 = 56;
@@ -118,6 +119,7 @@ pub fn name(nr: u64) -> Option<&'static str> {
         SCHED_YIELD => "sched_yield",
         DUP => "dup",
         DUP2 => "dup2",
+        SENDFILE => "sendfile",
         NANOSLEEP => "nanosleep",
         GETPID => "getpid",
         CLONE => "clone",

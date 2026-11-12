@@ -18,9 +18,24 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+/// Linux's cap on a single read/write length.
+const MAX_RW: usize = 0x7fff_f000;
+/// Bounded bounce-buffer size for streaming user copies (never user-controlled).
+const BOUNCE: usize = 64 * 1024;
+
 /// Entry from the syscall assembly: runs the handler and stores the result.
+/// Temporary syscall trace (first N calls once armed) for shell bring-up.
+pub static TRACE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 pub extern "C" fn dispatch(regs: &mut Regs) {
-    let result = handle(regs.rax, regs.args(), regs);
+    let n = regs.rax;
+    let a = regs.args();
+    if TRACE.load(Ordering::Relaxed) > 0 {
+        TRACE.fetch_sub(1, Ordering::Relaxed);
+        let name = nr::name(n).unwrap_or("?");
+        crate::log::info!("SYS {n} {name}({:#x},{:#x},{:#x})", a[0], a[1], a[2]);
+    }
+    let result = handle(n, a, regs);
     regs.rax = errno::encode(result);
 }
 
@@ -29,7 +44,7 @@ fn proc() -> Result<&'static SpinLock<Process>, Errno> {
     process::current().ok_or(Errno::EFAULT)
 }
 
-fn handle(number: u64, a: [u64; 6], _regs: &mut Regs) -> SysResult {
+fn handle(number: u64, a: [u64; 6], regs: &mut Regs) -> SysResult {
     match number {
         nr::WRITE => sys_write(a[0] as i32, a[1], a[2] as usize),
         nr::READ => sys_read(a[0] as i32, a[1], a[2] as usize),
@@ -55,6 +70,8 @@ fn handle(number: u64, a: [u64; 6], _regs: &mut Regs) -> SysResult {
         nr::CLOCK_GETTIME => sys_clock_gettime(a[0], a[1]),
         nr::FSTAT => sys_fstat(a[0] as i32, a[1]),
         nr::NEWFSTATAT => sys_newfstatat(a[0] as i32, a[1], a[2], a[3] as i32),
+        nr::STAT => sys_stat(a[0], a[1], true),
+        nr::LSTAT => sys_stat(a[0], a[1], false),
         nr::GETDENTS64 => sys_getdents64(a[0] as i32, a[1], a[2] as usize),
         nr::GETCWD => sys_getcwd(a[0], a[1] as usize),
         nr::DUP => dup(a[0] as i32),
@@ -76,9 +93,18 @@ fn handle(number: u64, a: [u64; 6], _regs: &mut Regs) -> SysResult {
             Ok(0)
         }
         nr::FUTEX => Ok(0),
+        nr::SENDFILE => sys_sendfile(a[0] as i32, a[1] as i32, a[2], a[3] as usize),
+        nr::KILL => sys_kill(a[0] as i32, a[1] as i32),
+        nr::WAIT4 => sys_wait4(a[0] as i32, a[1], a[2] as u32),
+        nr::FORK | nr::VFORK => sys_fork(regs),
+        nr::EXECVE => sys_execve(a[0], a[1], a[2]),
         nr::ACCESS => sys_access(types::AT_FDCWD, a[0]),
         nr::FACCESSAT => sys_access(a[0] as i32, a[1]),
-        nr::SETPGID | nr::SETSID | nr::GETPGRP | nr::GETPGID | nr::GETSID => Ok(0),
+        nr::GETPGRP => Ok(proc()?.lock().pgid as u64),
+        nr::GETPGID => sys_getpgid(a[0] as i32),
+        nr::SETPGID => sys_setpgid(a[0] as i32, a[1] as i32),
+        nr::SETSID => sys_setsid(),
+        nr::GETSID => Ok(proc()?.lock().sid as u64),
         _ => {
             log_enosys(number);
             Err(Errno::ENOSYS)
@@ -123,6 +149,28 @@ fn sys_getpid() -> SysResult {
     Ok(cur_pid()? as u64)
 }
 
+fn sys_getpgid(pid: i32) -> SysResult {
+    let p = proc()?.lock();
+    if pid == 0 || pid == p.pid { Ok(p.pgid as u64) } else { Err(Errno::ESRCH) }
+}
+
+fn sys_setpgid(pid: i32, pgid: i32) -> SysResult {
+    let mut p = proc()?.lock();
+    if pid == 0 || pid == p.pid {
+        p.pgid = if pgid == 0 { p.pid } else { pgid };
+        Ok(0)
+    } else {
+        Err(Errno::ESRCH)
+    }
+}
+
+fn sys_setsid() -> SysResult {
+    let mut p = proc()?.lock();
+    p.sid = p.pid;
+    p.pgid = p.pid;
+    Ok(p.pid as u64)
+}
+
 fn cur_pid() -> Result<i32, Errno> {
     Ok(proc()?.lock().pid)
 }
@@ -135,17 +183,28 @@ fn fd(fd: i32) -> Result<Arc<SpinLock<fs::OpenFile>>, Errno> {
 
 fn sys_write(fd_num: i32, buf: u64, len: usize) -> SysResult {
     let file = fd(fd_num)?;
-    let mut data = vec![0u8; len];
-    copy_from_user(buf, &mut data)?;
-    fs::write(&file, &data)
+    let len = len.min(MAX_RW);
+    let mut total = 0usize;
+    while total < len {
+        let n = (len - total).min(BOUNCE);
+        let mut chunk = vec![0u8; n];
+        copy_from_user(buf + total as u64, &mut chunk)?;
+        let w = fs::write(&file, &chunk)? as usize;
+        total += w;
+        if w < n {
+            break; // short write
+        }
+    }
+    Ok(total as u64)
 }
 
 fn sys_read(fd_num: i32, buf: u64, len: usize) -> SysResult {
     let file = fd(fd_num)?;
-    let mut data = vec![0u8; len];
-    let n = fs::read(&file, &mut data)? as usize;
-    copy_to_user(buf, &data[..n])?;
-    Ok(n as u64)
+    let n = len.min(BOUNCE);
+    let mut data = vec![0u8; n];
+    let got = fs::read(&file, &mut data)? as usize;
+    copy_to_user(buf, &data[..got])?;
+    Ok(got as u64)
 }
 
 fn sys_writev(fd_num: i32, iov: u64, count: usize) -> SysResult {
@@ -159,9 +218,19 @@ fn sys_writev(fd_num: i32, iov: u64, count: usize) -> SysResult {
         if ilen == 0 {
             continue;
         }
-        let mut data = vec![0u8; ilen];
-        copy_from_user(base, &mut data)?;
-        total += fs::write(&file, &data)?;
+        let ilen = ilen.min(MAX_RW);
+        let mut written = 0usize;
+        while written < ilen {
+            let n = (ilen - written).min(BOUNCE);
+            let mut chunk = vec![0u8; n];
+            copy_from_user(base + written as u64, &mut chunk)?;
+            let w = fs::write(&file, &chunk)? as usize;
+            written += w;
+            total += w as u64;
+            if w < n {
+                break;
+            }
+        }
     }
     Ok(total)
 }
@@ -177,11 +246,12 @@ fn sys_readv(fd_num: i32, iov: u64, count: usize) -> SysResult {
         if ilen == 0 {
             continue;
         }
-        let mut data = vec![0u8; ilen];
-        let n = fs::read(&file, &mut data)? as usize;
-        copy_to_user(base, &data[..n])?;
-        total += n as u64;
-        if n < ilen {
+        let n = ilen.min(BOUNCE);
+        let mut data = vec![0u8; n];
+        let got = fs::read(&file, &mut data)? as usize;
+        copy_to_user(base, &data[..got])?;
+        total += got as u64;
+        if got < n {
             break;
         }
     }
@@ -199,10 +269,31 @@ fn sys_close(fd_num: i32) -> SysResult {
     Ok(0)
 }
 
-fn sys_lseek(_fd: i32, _off: i64, _whence: u32) -> SysResult {
-    // Offsets for regular files are tracked in the open file; a full lseek lands
-    // with the VFS integration. Report unsupported-on-device for now.
-    Err(Errno::ESPIPE)
+fn sys_lseek(fd_num: i32, off: i64, whence: u32) -> SysResult {
+    const SEEK_SET: u32 = 0;
+    const SEEK_CUR: u32 = 1;
+    const SEEK_END: u32 = 2;
+    let file = fd(fd_num)?;
+    let mut f = file.lock();
+    match &mut f.kind {
+        fs::FileKind::File { ino, offset } => {
+            let size = fs::with_vfs(|v| v.size(*ino))? as i64;
+            let base = match whence {
+                SEEK_SET => 0,
+                SEEK_CUR => *offset as i64,
+                SEEK_END => size,
+                _ => return Err(Errno::EINVAL),
+            };
+            let new = base + off;
+            if new < 0 {
+                return Err(Errno::EINVAL);
+            }
+            *offset = new as u64;
+            Ok(new as u64)
+        }
+        // Devices and directories are not seekable.
+        _ => Err(Errno::ESPIPE),
+    }
 }
 
 fn dup(old: i32) -> SysResult {
@@ -219,8 +310,9 @@ fn sys_fcntl(fd_num: i32, cmd: u64, arg: u64) -> SysResult {
     const F_SETFD: u64 = 2;
     const F_GETFL: u64 = 3;
     const F_SETFL: u64 = 4;
+    const F_DUPFD_CLOEXEC: u64 = 1030;
     match cmd {
-        F_DUPFD => dup(fd_num),
+        F_DUPFD | F_DUPFD_CLOEXEC => proc()?.lock().fds.dup_from(fd_num, arg as i32),
         F_GETFD | F_GETFL => Ok(0),
         F_SETFD | F_SETFL => Ok(0),
         _ => {
@@ -240,12 +332,19 @@ fn sys_brk(addr: u64) -> SysResult {
         g.brk_start = g.brk.max(0x5000_0000);
         g.brk = g.brk_start;
     }
+    // Query, or a request below the heap base: report the current break.
     if addr == 0 || addr < g.brk_start {
+        return Ok(g.brk);
+    }
+    // The new break must stay within the user half; otherwise leave the break
+    // unchanged (Linux returns the old value rather than failing).
+    if addr >= crate::usercopy::USER_MAX {
         return Ok(g.brk);
     }
     let old = g.brk;
     if addr > old {
-        g.space.map_region(old, addr - old, true, false);
+        let grow = addr - old; // addr > old: no underflow
+        g.space.map_region(old, grow, true, false);
         flush_tlb();
     }
     g.brk = addr;
@@ -253,18 +352,36 @@ fn sys_brk(addr: u64) -> SysResult {
 }
 
 fn sys_mmap(addr: u64, len: u64, _prot: u64, flags: u64, _fd: i32, _off: u64) -> SysResult {
-    if len == 0 {
+    if len == 0 || len > MAX_RW as u64 {
         return Err(Errno::EINVAL);
     }
     let p = proc()?;
     let mut g = p.lock();
     let page = 4096u64;
-    let size = (len + page - 1) & !(page - 1);
+    // Page-round the length, rejecting overflow.
+    let size = len
+        .checked_add(page - 1)
+        .map(|v| v & !(page - 1))
+        .ok_or(Errno::EINVAL)?;
+    let user_max = crate::usercopy::USER_MAX;
     let base = if flags & types::MAP_FIXED != 0 && addr != 0 {
+        // Honor a fixed hint only if page-aligned and fully inside the user
+        // half (checked end, no wrap into the kernel range).
+        if addr & (page - 1) != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let end = addr.checked_add(size).ok_or(Errno::EINVAL)?;
+        if end > user_max {
+            return Err(Errno::EINVAL);
+        }
         addr
     } else {
         let b = g.mmap_next;
-        g.mmap_next += size;
+        let next = b.checked_add(size).ok_or(Errno::ENOMEM)?;
+        if next > user_max {
+            return Err(Errno::ENOMEM);
+        }
+        g.mmap_next = next;
         b
     };
     g.space.map_region(base, size, true, false);
@@ -296,8 +413,15 @@ fn sys_arch_prctl(code: u64, addr: u64) -> SysResult {
     const ARCH_GET_GS: u64 = 0x1004;
     match code {
         ARCH_SET_FS => {
-            // SAFETY: setting the user FS base for TLS.
-            FsBase::write(VirtAddr::new(addr));
+            if addr >= crate::usercopy::USER_MAX {
+                return Err(Errno::EINVAL);
+            }
+            let va = VirtAddr::try_new(addr).map_err(|_| Errno::EINVAL)?;
+            // SAFETY: a validated user-range FS base for TLS; recorded in the
+            // thread so the context switch preserves it.
+            FsBase::write(va);
+            let t = crate::percpu::current();
+            unsafe { (*t).fs_base = addr };
             Ok(0)
         }
         ARCH_GET_FS => {
@@ -305,10 +429,13 @@ fn sys_arch_prctl(code: u64, addr: u64) -> SysResult {
             Ok(0)
         }
         ARCH_SET_GS => {
-            // The user GS lives in KERNEL_GS_BASE while in the kernel (swapgs
-            // restores it to GS on sysret); also record it in the thread so the
-            // context switch preserves it.
-            KernelGsBase::write(VirtAddr::new(addr));
+            if addr >= crate::usercopy::USER_MAX {
+                return Err(Errno::EINVAL);
+            }
+            let va = VirtAddr::try_new(addr).map_err(|_| Errno::EINVAL)?;
+            // The user GS lives in KERNEL_GS_BASE while in the kernel; recorded
+            // in the thread for context-switch preservation.
+            KernelGsBase::write(va);
             let t = crate::percpu::current();
             // SAFETY: `t` is this CPU's running thread.
             unsafe { (*t).user_gs = addr };
@@ -335,21 +462,22 @@ fn sys_set_tid_address(ptr: u64) -> SysResult {
 fn sys_ioctl(_fd: i32, request: u64, arg: u64) -> SysResult {
     match request {
         types::TCGETS => {
-            // Report a cooked tty so isatty() succeeds.
-            let mut t = types::Termios::default();
-            t.c_iflag = types::ICRNL;
-            t.c_oflag = types::OPOST | types::ONLCR;
-            t.c_lflag = types::ICANON | types::ECHO | types::ISIG;
-            t.c_cc[types::VERASE] = 0x7f;
-            t.c_cc[types::VINTR] = 3;
-            t.c_cc[types::VEOF] = 4;
+            let t = fs::termios();
             let bytes = unsafe {
                 core::slice::from_raw_parts(core::ptr::from_ref(&t).cast::<u8>(), size_of::<types::Termios>())
             };
             copy_to_user(arg, bytes)?;
             Ok(0)
         }
-        types::TCSETS | types::TCSETSW | types::TCSETSF => Ok(0),
+        types::TCSETS | types::TCSETSW | types::TCSETSF => {
+            let mut t = types::Termios::default();
+            let bytes = unsafe {
+                core::slice::from_raw_parts_mut(core::ptr::from_mut(&mut t).cast::<u8>(), size_of::<types::Termios>())
+            };
+            copy_from_user(arg, bytes)?;
+            fs::set_termios(t);
+            Ok(0)
+        }
         types::TIOCGWINSZ => {
             let ws = types::Winsize { ws_row: 40, ws_col: 128, ws_xpixel: 0, ws_ypixel: 0 };
             let bytes = unsafe {
@@ -359,7 +487,11 @@ fn sys_ioctl(_fd: i32, request: u64, arg: u64) -> SysResult {
             Ok(0)
         }
         types::TIOCGPGRP => {
-            put_user(arg, cur_pid()? as u32)?;
+            // Report the caller's own process group as the terminal foreground
+            // group, so a job-control shell sees itself as foreground and does
+            // not loop signalling itself (single-shell system).
+            let pgid = proc()?.lock().pgid;
+            put_user(arg, pgid as u32)?;
             Ok(0)
         }
         types::TIOCSPGRP => Ok(0),
@@ -387,9 +519,15 @@ fn fill(dst: &mut [u8; 65], src: &[u8]) {
 }
 
 fn sys_getrandom(buf: u64, len: usize) -> SysResult {
-    let mut data = vec![0u8; len];
-    crate::rng::fill(&mut data);
-    copy_to_user(buf, &data)?;
+    let len = len.min(MAX_RW);
+    let mut done = 0usize;
+    while done < len {
+        let n = (len - done).min(BOUNCE);
+        let mut data = vec![0u8; n];
+        crate::rng::fill(&mut data);
+        copy_to_user(buf + done as u64, &data)?;
+        done += n;
+    }
     Ok(len as u64)
 }
 
@@ -423,9 +561,14 @@ fn sys_fstat(fd_num: i32, statbuf: u64) -> SysResult {
 }
 
 fn sys_newfstatat(_dirfd: i32, path: u64, statbuf: u64, _flags: i32) -> SysResult {
+    let follow = true;
+    sys_stat(path, statbuf, follow)
+}
+
+fn sys_stat(path: u64, statbuf: u64, follow: bool) -> SysResult {
     let path = read_path(path)?;
     let st = fs::with_vfs(|v| {
-        let ino = v.resolve(vfs::ROOT, &path, true)?;
+        let ino = v.resolve(vfs::ROOT, &path, follow)?;
         v.stat(ino)
     })?;
     write_stat(statbuf, &st)
@@ -522,6 +665,146 @@ fn sys_getrlimit(old: u64) -> SysResult {
 fn read_path(ptr: u64) -> Result<alloc::string::String, Errno> {
     let bytes = usercopy::read_cstr(ptr, 4096)?;
     alloc::string::String::from_utf8(bytes).map_err(|_| Errno::EINVAL)
+}
+
+/// `kill`: minimal — signal 0 is an existence check (always OK here); real
+/// delivery lands with the signal subsystem. Returns success so job-control
+/// shells proceed.
+/// `sendfile(out, in, offset, count)`: copies up to `count` bytes from `in` to
+/// `out` through a kernel buffer.
+fn sys_sendfile(out_fd: i32, in_fd: i32, offset_ptr: u64, count: usize) -> SysResult {
+    let count = count.min(MAX_RW);
+    let infile = fd(in_fd)?;
+    let outfile = fd(out_fd)?;
+    let mut total = 0u64;
+    let mut buf = vec![0u8; 4096.min(count.max(1))];
+    // Honour an explicit start offset for the input file.
+    if offset_ptr != 0 {
+        let mut off = [0u8; 8];
+        copy_from_user(offset_ptr, &mut off)?;
+        let start = u64::from_le_bytes(off);
+        if let fs::FileKind::File { offset, .. } = &mut infile.lock().kind {
+            *offset = start;
+        }
+    }
+    while (total as usize) < count {
+        let want = buf.len().min(count - total as usize);
+        let n = fs::read(&infile, &mut buf[..want])? as usize;
+        if n == 0 {
+            break;
+        }
+        fs::write(&outfile, &buf[..n])?;
+        total += n as u64;
+    }
+    if offset_ptr != 0 {
+        if let fs::FileKind::File { offset, .. } = &infile.lock().kind {
+            put_user(offset_ptr, *offset)?;
+        }
+    }
+    Ok(total)
+}
+
+fn sys_kill(_pid: i32, _sig: i32) -> SysResult {
+    Ok(0)
+}
+
+/// `wait4`: reap an exited child; block (yielding) until one is available.
+fn sys_wait4(_pid: i32, wstatus: u64, options: u32) -> SysResult {
+    const WNOHANG: u32 = 1;
+    let parent = cur_pid()?;
+    loop {
+        if let Some((child_pid, code)) = process::reap_child(parent) {
+            if wstatus != 0 {
+                // W_EXITCODE(code, 0): low 8 bits signal, next 8 exit code.
+                put_user(wstatus, ((code & 0xff) as u32) << 8)?;
+            }
+            return Ok(child_pid as u64);
+        }
+        if !process::has_children(parent) {
+            return Err(Errno::ECHILD);
+        }
+        if options & WNOHANG != 0 {
+            return Ok(0);
+        }
+        crate::scheduler::yield_now();
+    }
+}
+
+/// `fork`: eager-copy the address space, duplicate the fd table, and spawn a
+/// child thread that resumes at the fork point returning 0. Parent gets the pid.
+fn sys_fork(regs: &Regs) -> SysResult {
+    let parent = proc()?;
+    let child = {
+        let p = parent.lock();
+        Process::fork_from(&p).ok_or(Errno::ENOMEM)?
+    };
+    let child_pid = child.lock().pid;
+    process::register(child.clone());
+    let mut child_regs = *regs;
+    child_regs.rax = 0;
+    crate::userspace::spawn_fork_child(&child, child_regs)?;
+    Ok(child_pid as u64)
+}
+
+/// `execve`: replace the current image with a new ELF, rebuild argv/envp/auxv,
+/// switch to the new address space, and enter it. Never returns on success.
+fn sys_execve(path: u64, argv: u64, envp: u64) -> SysResult {
+    use x86_64::registers::control::{Cr3, Cr3Flags};
+    use x86_64::structures::paging::PhysFrame;
+    use x86_64::PhysAddr;
+
+    let path = read_path(path)?;
+    let argv_strs = read_str_array(argv)?;
+    let envp_strs = read_str_array(envp)?;
+    let image = fs::read_file(&path)?;
+
+    let argv_refs: Vec<&str> = argv_strs.iter().map(alloc::string::String::as_str).collect();
+    let envp_refs: Vec<&str> = envp_strs.iter().map(alloc::string::String::as_str).collect();
+
+    let proc = proc()?;
+    let (entry, user_sp, cr3) = {
+        let mut p = proc.lock();
+        let mut space = crate::process::AddressSpace::new().ok_or(Errno::ENOMEM)?;
+        let loaded = crate::elf::load(&mut space, &image)?;
+        let sp = crate::userspace::build_stack(&mut space, &loaded, &argv_refs, &envp_refs)
+            .map_err(|_| Errno::ENOMEM)?;
+        p.space = space;
+        p.brk = 0;
+        p.brk_start = 0;
+        p.mmap_next = 0x6000_0000;
+        (loaded.entry, sp, p.space.cr3())
+    };
+
+    // Switch this thread to the new address space and enter it.
+    // SAFETY: `cr3` is a valid PML4 with the kernel higher half; `entry`/`user_sp`
+    // are valid in it.
+    unsafe {
+        // Reset the FS/GS user bases: the new image sets up its own TLS; the old
+        // bases point into the discarded address space.
+        use x86_64::registers::model_specific::{FsBase, KernelGsBase};
+        FsBase::write(x86_64::VirtAddr::new(0));
+        KernelGsBase::write(x86_64::VirtAddr::new(0));
+        (*crate::percpu::current()).user_gs = 0;
+        (*crate::percpu::current()).fs_base = 0;
+        (*crate::percpu::current()).cr3 = cr3;
+        let frame = PhysFrame::containing_address(PhysAddr::new(cr3));
+        Cr3::write(frame, Cr3Flags::empty());
+        crate::arch::x86_64::user::enter_user(entry, user_sp);
+    }
+}
+
+/// Reads a NUL-terminated array of user string pointers into owned strings.
+fn read_str_array(uaddr: u64) -> Result<Vec<alloc::string::String>, Errno> {
+    if uaddr == 0 {
+        return Ok(Vec::new());
+    }
+    let ptrs = usercopy::read_ptr_array(uaddr, 1024)?;
+    let mut out = Vec::with_capacity(ptrs.len());
+    for p in ptrs {
+        let bytes = usercopy::read_cstr(p, 4096)?;
+        out.push(alloc::string::String::from_utf8_lossy(&bytes).into_owned());
+    }
+    Ok(out)
 }
 
 // --- ENOSYS logging --------------------------------------------------------

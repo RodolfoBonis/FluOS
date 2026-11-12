@@ -2,7 +2,6 @@
 
 #![no_std]
 #![no_main]
-#![feature(abi_x86_interrupt)]
 
 mod arch;
 mod boot;
@@ -86,14 +85,12 @@ extern "C" fn kmain() -> ! {
         smp::run_selftest();
 
         // Userspace: root filesystem, RNG, and the ring-3 self-test.
-        fs::init(None);
+        fs::init(boot::initramfs());
         // SAFETY: `_rdtsc` reads the timestamp counter for an RNG seed.
         rng::seed(unsafe { core::arch::x86_64::_rdtsc() });
         userspace::run_selftest();
         userspace::run_syscall_bench();
-
-        // Stop preempting the boot CPU so the rest of boot runs to completion.
-        arch::x86_64::apic::stop_timer();
+        userspace::run_security_selftests();
     } else {
         log::warning!("no ACPI MADT; SMP and scheduler timer disabled");
     }
@@ -103,8 +100,13 @@ extern "C" fn kmain() -> ! {
     log::info!("boot complete");
     arch::x86_64::qemu_exit_if_requested(boot::cmdline());
 
-    // Interactive: echo typed keys (APIC/keyboard already initialised).
-    if console::is_ready() {
+    // Interactive: run the busybox shell if an initramfs is present, else echo
+    // typed keys. (Under the test harness we already exited above.)
+    arch::x86_64::apic::drain_ps2();
+    x86_64::instructions::interrupts::enable();
+    if boot::initramfs().is_some() {
+        userspace::run_init();
+    } else if console::is_ready() {
         demo::input_echo_loop();
     }
     arch::x86_64::halt_forever()

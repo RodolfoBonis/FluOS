@@ -173,7 +173,18 @@ pub fn rearm_timer() {
 }
 
 /// Stops this CPU's scheduling timer (used when leaving the scheduler).
+///
+/// Refuses to disarm while this CPU still has sleepers parked on its timer
+/// queue — tearing the timer down then would leave them to sleep forever (L5).
+/// In that case the timer is re-armed instead; only a CPU with no pending
+/// sleepers fully disarms. (Migrating sleepers to another CPU is the eventual
+/// path once CPUs can go offline; keeping the timer live is correct until then.)
+#[allow(dead_code)] // retained for the non-shell boot path
 pub fn stop_timer() {
+    if crate::percpu::try_cpu_id().is_some() && crate::scheduler::has_pending_sleepers() {
+        rearm_timer();
+        return;
+    }
     lapic_write(LVT_TIMER, 1 << 16); // masked
     if USE_TSC_DEADLINE.load(Ordering::Relaxed) {
         // SAFETY: writing 0 disarms the TSC deadline.

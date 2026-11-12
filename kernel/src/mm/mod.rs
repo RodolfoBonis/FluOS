@@ -5,6 +5,7 @@
 //! tables. The heap is a `#[global_allocator]` that lazily pulls frames, so it
 //! needs no explicit init beyond a smoke test once frames and paging are live.
 
+pub mod fault;
 pub mod heap;
 pub mod paging;
 pub mod phys;

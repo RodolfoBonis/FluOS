@@ -84,18 +84,45 @@ pub fn adopt_current_as_idle() -> *mut Thread {
     t
 }
 
-/// Spawns a worker on `cpu_id` running `entry(arg)` at the given nice level.
-/// Returns the new thread's tid, or `EINVAL` if the target CPU is not online
-/// (rather than silently dropping the thread — M6).
+/// User context attached to a thread at creation (all zero for a kernel thread).
+#[derive(Clone, Copy, Default)]
+pub struct UserContext {
+    pub cr3: u64,
+    pub proc_ptr: u64,
+    pub fs_base: u64,
+    pub user_gs: u64,
+}
+
+/// Spawns a kernel worker on `cpu_id`. Returns `EINVAL` if the CPU is offline.
 pub fn spawn(entry: extern "C" fn(usize), arg: usize, nice: i8, cpu_id: u32) -> Result<Tid, abi::Errno> {
+    spawn_user(entry, arg, nice, cpu_id, UserContext::default())
+}
+
+/// Spawns a thread, FULLY initialising it (including the user CR3 / process /
+/// TLS bases) BEFORE it is enqueued, so a steal or tick can never run it with a
+/// zero CR3 / unset state (R-H1).
+pub fn spawn_user(
+    entry: extern "C" fn(usize),
+    arg: usize,
+    nice: i8,
+    cpu_id: u32,
+    ctx: UserContext,
+) -> Result<Tid, abi::Errno> {
     let weight = weight_from_nice(nice);
     let Some(cpu) = percpu::by_id(cpu_id) else {
         return Err(abi::Errno::EINVAL);
     };
     let t: *mut Thread = Box::leak(Thread::new_worker(entry, arg, weight));
-    // SAFETY: `t` was just leaked and is uniquely owned here.
-    let tid = unsafe { (*t).tid() };
+    // SAFETY: `t` was just leaked and is uniquely owned, not yet enqueued.
+    let tid = unsafe {
+        (*t).cr3 = ctx.cr3;
+        (*t).proc_ptr = ctx.proc_ptr;
+        (*t).fs_base = ctx.fs_base;
+        (*t).user_gs = ctx.user_gs;
+        (*t).tid()
+    };
     THREADS.lock().push(tid);
+    // Enqueue LAST — the thread is fully initialised by this point.
     cpu.runqueue.lock().insert_at_v(tid, weight);
     // Poke a remote CPU so it preempts and picks up the new thread promptly.
     // Read our own id with interrupts off so a migration can't make it stale.
@@ -167,6 +194,13 @@ fn finish_switch() {
 /// Picks the next thread and switches to it. Safe to call from thread context
 /// (voluntary yield) or the timer handler.
 pub fn schedule() {
+    // Reentrancy is benign: `schedule` runs with interrupts disabled across the
+    // whole switch, so a tick can neither preempt it nor re-enter it here. The
+    // only re-entry is cooperative — `finish_switch` re-enables interrupts and
+    // `preempt_enable` may call `schedule` again — and by then the previous
+    // switch is fully committed (our context is saved and `prev` is drained),
+    // so a fresh pass starts from consistent per-CPU state.
+    //
     // Disable interrupts BEFORE reading per-CPU state: otherwise a tick could
     // migrate us and leave `cpu` pointing at the previous CPU's runqueue (C2).
     let interrupts_were_on = interrupts::are_enabled();
@@ -226,6 +260,13 @@ pub fn schedule() {
 /// Voluntarily yields the CPU to the scheduler.
 pub fn yield_now() {
     schedule();
+}
+
+/// Whether this CPU still has threads parked on its sleep/timer queue. Used
+/// before disarming the LAPIC timer so sleepers are never stranded (L5).
+#[must_use]
+pub fn has_pending_sleepers() -> bool {
+    !percpu::this().timers.lock().is_empty()
 }
 
 /// Timer-tick entry: ages the running thread and reschedules if allowed.

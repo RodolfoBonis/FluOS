@@ -1,13 +1,15 @@
 //! Leveled kernel logging.
 //!
-//! Every record is fanned out to three sinks: the COM1 serial port (always
-//! available, captured by the test harness), an in-memory ring buffer that will
-//! back `dmesg`, and — once the framebuffer console is up — an optional console
-//! sink registered by M2. A single `writeln!` feeds all of them through a tee
-//! writer so the formatting happens exactly once.
+//! Each record is formatted once into a fixed stack buffer, then emitted to
+//! three sinks — the COM1 serial port, an in-memory ring buffer (for `dmesg`),
+//! and an optional framebuffer console — each under its OWN lock with no
+//! nesting. That matters for two reasons: the locks are IRQ-safe (so logging is
+//! never preempted mid-write, which would let a syscall that spins on the same
+//! lock deadlock the CPU), and the no-nesting discipline means the log and a
+//! user program writing `/dev/console` can never invert lock order under SMP.
 
+use crate::sync::SpinLock;
 use core::fmt::{self, Write};
-use spin::Mutex;
 
 #[derive(Clone, Copy)]
 pub enum Level {
@@ -29,9 +31,7 @@ impl Level {
 /// Fixed-size byte ring that retains the most recent log output for `dmesg`.
 pub struct Ring {
     buf: [u8; Ring::CAP],
-    /// Index of the next byte to write.
     head: usize,
-    /// Number of valid bytes currently stored (<= `CAP`).
     len: usize,
 }
 
@@ -52,9 +52,8 @@ impl Ring {
         }
     }
 
-    /// Copies the retained log into `out` in chronological order, returning the
-    /// number of bytes written (capped at `out.len()`).
-    #[allow(dead_code)] // consumed by `dmesg`, wired up in M2
+    /// Copies the retained log into `out` in chronological order.
+    #[allow(dead_code)] // consumed by `dmesg`
     pub fn snapshot(&self, out: &mut [u8]) -> usize {
         let start = (self.head + Ring::CAP - self.len) % Ring::CAP;
         let n = self.len.min(out.len());
@@ -65,69 +64,81 @@ impl Ring {
     }
 }
 
-static RING: Mutex<Ring> = Mutex::new(Ring::new());
+static RING: SpinLock<Ring> = SpinLock::new(Ring::new());
 
-/// Optional console sink, installed by the framebuffer console in M2. A plain
-/// function pointer keeps `log` free of any console dependency.
-static CONSOLE: Mutex<Option<fn(&str)>> = Mutex::new(None);
+/// Optional console sink, installed by the framebuffer console in M2.
+static CONSOLE: SpinLock<Option<fn(&str)>> = SpinLock::new(None);
 
 /// Registers (or clears) the console sink that mirrors log output to the screen.
-#[allow(dead_code)] // installed by the framebuffer console in M2
+#[allow(dead_code)]
 pub fn set_console_sink(sink: Option<fn(&str)>) {
     *CONSOLE.lock() = sink;
 }
 
 /// Copies the retained log history into `out`, returning the byte count.
-#[allow(dead_code)] // exposed via the `syslog` syscall in a later milestone
+#[allow(dead_code)] // exposed via the `syslog` syscall later
 pub fn dmesg(out: &mut [u8]) -> usize {
     RING.lock().snapshot(out)
 }
 
-/// Writer that fans a single formatting pass out to every sink.
-struct Tee<'a> {
-    serial: &'a mut crate::arch::x86_64::serial::Serial,
-    ring: &'a mut Ring,
-    console: Option<fn(&str)>,
+/// A bounded formatting buffer, so a record is composed before any sink is
+/// locked (short, nesting-free lock holds).
+struct FixedBuf {
+    buf: [u8; 512],
+    len: usize,
 }
 
-impl Write for Tee<'_> {
+impl FixedBuf {
+    fn new() -> Self {
+        Self { buf: [0; 512], len: 0 }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl Write for FixedBuf {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        // Serial writes are infallible; the ring never fails; the console sink,
-        // if any, swallows its own errors.
-        let _ = self.serial.write_str(s);
-        self.ring.push(s.as_bytes());
-        if let Some(sink) = self.console {
-            sink(s);
-        }
+        let room = self.buf.len() - self.len;
+        let n = s.len().min(room);
+        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
         Ok(())
     }
 }
 
 pub fn write(level: Level, args: fmt::Arguments) {
-    let mut serial = crate::arch::x86_64::serial::COM1_PORT.lock();
-    let mut ring = RING.lock();
-    let console = *CONSOLE.lock();
-    // Timestamp (TSC) and CPU id help correlate SMP logs; the CPU id is omitted
-    // (`?`) before per-CPU state is up.
+    // Format once. Timestamp (TSC) + CPU id correlate SMP logs; CPU id is `?`
+    // before per-CPU state exists.
     let tsc = unsafe { core::arch::x86_64::_rdtsc() };
-    let mut tee = Tee { serial: &mut serial, ring: &mut ring, console };
+    let mut fb = FixedBuf::new();
     match crate::percpu::try_cpu_id() {
         Some(cpu) => {
-            let _ = writeln!(tee, "[{tsc:>16} c{cpu} {}] {args}", level.tag());
+            let _ = writeln!(fb, "[{tsc:>16} c{cpu} {}] {args}", level.tag());
         }
         None => {
-            let _ = writeln!(tee, "[{tsc:>16} c? {}] {args}", level.tag());
+            let _ = writeln!(fb, "[{tsc:>16} c? {}] {args}", level.tag());
         }
+    }
+    let bytes = fb.as_bytes();
+
+    // Emit to each sink under its own lock — no nesting, consistent order.
+    crate::arch::x86_64::serial::write_bytes(bytes);
+    RING.lock().push(bytes);
+    let sink = *CONSOLE.lock();
+    if let Some(sink) = sink
+        && let Ok(text) = core::str::from_utf8(bytes)
+    {
+        sink(text);
     }
 }
 
-/// Logs even if the serial lock is held; only for the panic path, where the
-/// code that panicked may own the lock.
+/// Logs even if a sink lock is held; only for the panic path.
 pub fn write_unlocked(args: fmt::Arguments) {
-    let port = &crate::arch::x86_64::serial::COM1_PORT;
-    // SAFETY: we are about to halt; a torn line is preferable to a deadlock.
-    unsafe { port.force_unlock() };
-    let _ = writeln!(port.lock(), "[\x1b[31mPANIC\x1b[0m] {args}");
+    let mut fb = FixedBuf::new();
+    let _ = writeln!(fb, "[\x1b[31mPANIC\x1b[0m] {args}");
+    crate::arch::x86_64::serial::write_bytes_unlocked(fb.as_bytes());
 }
 
 macro_rules! info {

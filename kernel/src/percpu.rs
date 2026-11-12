@@ -58,6 +58,8 @@ pub struct CpuState {
     pub current_proc: AtomicU64,
     /// CR3 currently loaded on this CPU (to skip redundant reloads).
     pub active_cr3: AtomicU64,
+    /// Non-zero while this CPU is inside the page-fault handler (nest guard).
+    pub in_fault: AtomicU32,
 }
 
 static CPUS: [AtomicPtr<CpuState>; MAX_CPUS] = [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
@@ -85,6 +87,7 @@ pub fn init(cpu_id: u32, lapic_id: u32, tss: u64) -> &'static CpuState {
         tss: AtomicU64::new(tss),
         current_proc: AtomicU64::new(0),
         active_cr3: AtomicU64::new(0),
+        in_fault: AtomicU32::new(0),
     }));
 
     // Pre-reserve runqueue capacity so timer-IRQ enqueues don't allocate (C3).

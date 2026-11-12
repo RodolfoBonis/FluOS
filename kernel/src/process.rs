@@ -131,6 +131,87 @@ impl AddressSpace {
         }
     }
 
+    /// Maps a specific physical frame at `vaddr` with the given permissions.
+    pub fn map_page_to(&mut self, vaddr: u64, phys: u64, writable: bool, exec: bool) {
+        let mut flags = Flags::PRESENT | Flags::USER_ACCESSIBLE;
+        if writable {
+            flags |= Flags::WRITABLE;
+        }
+        if !exec {
+            flags |= Flags::NO_EXECUTE;
+        }
+        let mut frames = UserFrames;
+        let mut mapper = self.mapper();
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
+        let frame = PhysFrame::containing_address(PhysAddr::new(phys));
+        // SAFETY: mapping an owned frame into this inactive address space.
+        if let Ok(flush) = unsafe { mapper.map_to(page, frame, flags, &mut frames) } {
+            flush.ignore();
+        }
+    }
+
+    /// Creates a child address space by eagerly copying every mapped user page
+    /// (the lower half). CoW is a future optimisation; eager copy is correct and
+    /// the fork-then-exec path discards the copy immediately anyway.
+    pub fn fork(&self) -> Option<AddressSpace> {
+        let mut child = AddressSpace::new()?;
+        let hhdm = self.hhdm;
+        // SAFETY: the PML4 is HHDM-mapped; we only read present entries.
+        let pml4 = unsafe { &*((hhdm + self.pml4_phys) as *const PageTable) };
+        for i in 0..256 {
+            if !pml4[i].flags().contains(Flags::PRESENT) {
+                continue;
+            }
+            let pdpt = unsafe { &*((hhdm + pml4[i].addr().as_u64()) as *const PageTable) };
+            for j in 0..512 {
+                let e3 = &pdpt[j];
+                if !e3.flags().contains(Flags::PRESENT) || e3.flags().contains(Flags::HUGE_PAGE) {
+                    continue;
+                }
+                let pd = unsafe { &*((hhdm + e3.addr().as_u64()) as *const PageTable) };
+                for k in 0..512 {
+                    let e2 = &pd[k];
+                    if !e2.flags().contains(Flags::PRESENT) || e2.flags().contains(Flags::HUGE_PAGE) {
+                        continue;
+                    }
+                    let pt = unsafe { &*((hhdm + e2.addr().as_u64()) as *const PageTable) };
+                    for (l, pte) in pt.iter().enumerate() {
+                        let f = pte.flags();
+                        if !f.contains(Flags::PRESENT) {
+                            continue;
+                        }
+                        let vaddr = ((i as u64) << 39) | ((j as u64) << 30) | ((k as u64) << 21) | ((l as u64) << 12);
+                        let src = pte.addr().as_u64();
+                        let dst = phys::alloc_frame_zeroed()?;
+                        // SAFETY: both frames are HHDM-mapped and page-sized.
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                (hhdm + src) as *const u8,
+                                (hhdm + dst) as *mut u8,
+                                PAGE as usize,
+                            );
+                        }
+                        let writable = f.contains(Flags::WRITABLE);
+                        let exec = !f.contains(Flags::NO_EXECUTE);
+                        child.map_page_to(vaddr, dst, writable, exec);
+                    }
+                }
+            }
+        }
+        Some(child)
+    }
+
+    /// Resolves a demand-paging fault (not-present) at `vaddr`, if it lies in a
+    /// known region. Stub for now (returns unhandled).
+    pub fn handle_demand(&mut self, _vaddr: u64, _write: bool) -> bool {
+        false
+    }
+
+    /// Resolves a copy-on-write fault at `vaddr`. Stub for now.
+    pub fn handle_cow(&mut self, _vaddr: u64) -> bool {
+        false
+    }
+
     /// Translates a user virtual address to a physical address, if mapped.
     #[allow(dead_code)] // used by fork copy
     pub fn translate(&mut self, vaddr: u64) -> Option<u64> {
@@ -144,6 +225,7 @@ static NEXT_PID: AtomicI32 = AtomicI32::new(1);
 /// A process: an address space plus the state syscalls mutate.
 pub struct Process {
     pub pid: i32,
+    pub ppid: i32,
     pub space: AddressSpace,
     pub fds: FdTable,
     /// Program break (end of the heap), for `brk`.
@@ -154,6 +236,9 @@ pub struct Process {
     pub clear_child_tid: u64,
     /// Next free address for anonymous `mmap` allocations (grows up).
     pub mmap_next: u64,
+    /// Process group and session ids (job control).
+    pub pgid: i32,
+    pub sid: i32,
     /// Exit status once the process has exited.
     pub exit_code: Option<i32>,
 }
@@ -165,12 +250,15 @@ impl Process {
         let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
         Some(Arc::new(SpinLock::new(Process {
             pid,
+            ppid: 1,
             space,
             fds: FdTable::new(),
             brk: 0,
             brk_start: 0,
             clear_child_tid: 0,
             mmap_next: 0x6000_0000,
+            pgid: pid,
+            sid: pid,
             exit_code: None,
         })))
     }
@@ -234,4 +322,43 @@ pub unsafe fn switch_mm(next: *mut crate::thread::Thread) {
         unsafe { Cr3::write(frame, Cr3Flags::empty()) };
         cpu.active_cr3.store(target, Ordering::Relaxed);
     }
+}
+
+impl Process {
+    /// Creates a child of `parent` (eager-copied address space, cloned fds).
+    pub fn fork_from(parent: &Process) -> Option<Arc<SpinLock<Process>>> {
+        let space = parent.space.fork()?;
+        let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+        Some(Arc::new(SpinLock::new(Process {
+            pid,
+            ppid: parent.pid,
+            space,
+            fds: parent.fds.fork_clone(),
+            brk: parent.brk,
+            brk_start: parent.brk_start,
+            clear_child_tid: 0,
+            mmap_next: parent.mmap_next,
+            pgid: parent.pgid,
+            sid: parent.sid,
+            exit_code: None,
+        })))
+    }
+}
+
+/// Reaps an exited child of `parent_pid`: returns `(pid, exit_code)` and removes
+/// it from the table, or `None` if no child has exited.
+pub fn reap_child(parent_pid: i32) -> Option<(i32, i32)> {
+    let mut procs = PROCS.lock();
+    let idx = procs.iter().position(|p| {
+        let g = p.lock();
+        g.ppid == parent_pid && g.exit_code.is_some()
+    })?;
+    let child = procs.remove(idx);
+    let g = child.lock();
+    Some((g.pid, g.exit_code.unwrap_or(0)))
+}
+
+/// Whether `parent_pid` has any live (unreaped) children.
+pub fn has_children(parent_pid: i32) -> bool {
+    PROCS.lock().iter().any(|p| p.lock().ppid == parent_pid)
 }
