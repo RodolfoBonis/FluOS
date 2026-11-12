@@ -201,6 +201,33 @@ extern "C" fn page_fault(frame: &mut TrapFrame) {
         panic!("nested page fault at {cr2:#018x}");
     }
 
+    // Fault-loop guard: if the exact same (cr2, rip, cr3) faults repeatedly, the
+    // handler is "resolving" it without making progress — a page-table bug (e.g.
+    // a read-only intermediate entry defeating a leaf write). Contain it instead
+    // of spinning: a real loop means no progress, so each retry re-faults with an
+    // identical signature; genuine progress changes cr2 or rip and resets it.
+    let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
+    let sig = cr2 ^ frame.rip.rotate_left(13) ^ cr3_frame.start_address().as_u64();
+    let reps = if cpu.last_fault_sig.swap(sig, Ordering::Relaxed) == sig {
+        cpu.fault_repeats.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        cpu.fault_repeats.store(0, Ordering::Relaxed);
+        0
+    };
+    if reps >= 8 {
+        cpu.fault_repeats.store(0, Ordering::Relaxed);
+        cpu.in_fault.store(0, Ordering::Release);
+        crate::log::error!(
+            "page-fault LOOP: cr2={cr2:#018x} rip={:#018x} repeated {reps}x with no progress",
+            frame.rip,
+        );
+        if frame.from_user() {
+            kill_current(abi::types::SIGSEGV, "page fault loop (kernel bug)", frame);
+        }
+        dump("page fault loop", frame);
+        panic!("page-fault loop at {cr2:#018x} (no progress after {reps} retries)");
+    }
+
     let resolved = crate::mm::fault::handle(cr2, frame.error_code, frame.from_user());
     cpu.in_fault.fetch_sub(1, Ordering::AcqRel);
     if resolved {

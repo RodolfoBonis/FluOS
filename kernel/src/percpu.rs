@@ -60,6 +60,11 @@ pub struct CpuState {
     pub active_cr3: AtomicU64,
     /// Non-zero while this CPU is inside the page-fault handler (nest guard).
     pub in_fault: AtomicU32,
+    /// Signature (cr2 ^ rip ^ cr3) of the most recent page fault, with a repeat
+    /// counter, to detect a fault that resolves but never makes progress (a
+    /// page-table bug). See the #PF handler's fault-loop guard.
+    pub last_fault_sig: AtomicU64,
+    pub fault_repeats: AtomicU32,
 }
 
 static CPUS: [AtomicPtr<CpuState>; MAX_CPUS] = [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CPUS];
@@ -88,6 +93,8 @@ pub fn init(cpu_id: u32, lapic_id: u32, tss: u64) -> &'static CpuState {
         current_proc: AtomicU64::new(0),
         active_cr3: AtomicU64::new(0),
         in_fault: AtomicU32::new(0),
+        last_fault_sig: AtomicU64::new(0),
+        fault_repeats: AtomicU32::new(0),
     }));
 
     // Pre-reserve runqueue capacity so timer-IRQ enqueues don't allocate (C3).

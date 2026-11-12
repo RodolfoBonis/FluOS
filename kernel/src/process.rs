@@ -65,10 +65,6 @@ pub struct AddressSpace {
     hhdm: u64,
     /// Lazily-backed regions (brk, anonymous mmap), consulted on a page fault.
     regions: Vec<Region>,
-    /// Pending CoW copies `(page, frame, exec)`: a write fault unmaps the shared
-    /// page and stashes the private writable copy; the retry faults non-present
-    /// and maps it.
-    pending_cow: Vec<(u64, u64, bool)>,
 }
 
 impl AddressSpace {
@@ -87,7 +83,7 @@ impl AddressSpace {
                 dst[i] = src[i].clone();
             }
         }
-        Some(Self { pml4_phys, hhdm, regions: Vec::new(), pending_cow: Vec::new() })
+        Some(Self { pml4_phys, hhdm, regions: Vec::new() })
     }
 
     /// Physical address of this space's PML4 (a CR3 value, PCID 0).
@@ -309,12 +305,6 @@ impl AddressSpace {
     /// reserved region (and the access is permitted), maps a fresh zeroed page.
     pub fn handle_demand(&mut self, vaddr: u64, write: bool) -> bool {
         let page = vaddr & !(PAGE - 1);
-        if let Some(i) = self.pending_cow.iter().position(|&(p, _, _)| p == page) {
-            let (_, frame, exec) = self.pending_cow.swap_remove(i);
-            self.map_page_to(page, frame, true, exec);
-            x86_64::instructions::tlb::flush(VirtAddr::new(page));
-            return true;
-        }
         let Some(r) = self.regions.iter().find(|r| page >= r.start && page < r.end).copied() else {
             return false;
         };
@@ -356,10 +346,10 @@ impl AddressSpace {
             return false;
         }
         let old = unsafe { (*pte).addr().as_u64() };
-        let exec = !f.contains(Flags::NO_EXECUTE);
         let Some(new) = phys::alloc_frame() else {
             return false;
         };
+        // SAFETY: both frames are HHDM-mapped and page-sized.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 (self.hhdm + old) as *const u8,
@@ -367,18 +357,13 @@ impl AddressSpace {
                 PAGE as usize,
             );
         }
-        // Two-phase remap: unmap the shared page (making it non-present) and
-        // stash the private writable copy. The faulting instruction then retries
-        // and faults *non-present*, which `handle_demand` maps in. Going through
-        // the non-present state is deliberate: a protection-fault retry on a page
-        // left present (merely upgraded RO->RW) is not reliably re-checked by the
-        // TCG MMU, whereas a non-present fill always is.
-        let page_obj = Page::<Size4KiB>::containing_address(VirtAddr::new(page));
-        let mut mapper = self.mapper();
-        if let Ok((_f, flush)) = mapper.unmap(page_obj) {
-            flush.flush();
-        }
-        self.pending_cow.push((page, new, exec));
+        // Point the leaf at the private copy and make it writable, clearing the
+        // CoW marker. Now that intermediate entries are always writable/user,
+        // this in-place upgrade + invlpg takes effect on the retry.
+        let new_flags = (f & !PTE_COW) | Flags::WRITABLE;
+        // SAFETY: re-point this leaf at the private copy, now writable.
+        unsafe { (*pte).set_addr(PhysAddr::new(new), new_flags) };
+        x86_64::instructions::tlb::flush(VirtAddr::new(page));
         true
     }
 

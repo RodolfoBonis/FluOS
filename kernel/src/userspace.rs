@@ -684,13 +684,100 @@ fn clone_thread_elf() -> Vec<u8> {
     raw_exec_elf(&code)
 }
 
-/// Runs the memory-management self-tests (CoW fork, anonymous demand paging)./// Runs the memory-management self-tests (CoW fork, anonymous demand paging).
+/// Builds a two-segment program whose RO code page and RW data page share one
+/// page table (V=0x40_0000 code, V+0x1000 data) — the exact shape that broke
+/// CoW: fork maps the RO code leaf first, so the intermediate PML4E/PDPTE/PDE
+/// would be created read-only, making the RW data leaf effectively read-only and
+/// a child write to it fault forever. Writes 'A' to the data page, forks, the
+/// child writes 'B' and exits, the parent checks its byte is still 'A' (exit 0).
+fn cow_regression_elf() -> Vec<u8> {
+    const V: u64 = 0x40_0000;
+    const DATA: u64 = V + 0x1000;
+    let headers: u64 = 64 + 56 * 2;
+    let d = DATA.to_le_bytes();
+
+    let mut code: Vec<u8> = Vec::new();
+    code.push(0x48);
+    code.push(0xB8);
+    code.extend_from_slice(&d); // movabs rax, DATA
+    code.extend_from_slice(&[0xC6, 0x00, 0x41]); // mov byte [rax], 'A'
+    code.extend_from_slice(&[0xB8, 0x39, 0, 0, 0]); // mov eax, 57 (fork)
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    code.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+    code.extend_from_slice(&[0x74, 0x3A]); // jz child (+0x3A)
+    code.extend_from_slice(&[0xB8, 0x3D, 0, 0, 0]); // mov eax, 61 (wait4)
+    code.extend_from_slice(&[0xBF, 0xFF, 0xFF, 0xFF, 0xFF]); // mov edi, -1
+    code.extend_from_slice(&[0x31, 0xF6]); // xor esi, esi
+    code.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+    code.extend_from_slice(&[0x45, 0x31, 0xD2]); // xor r10d, r10d
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall
+    code.push(0x48);
+    code.push(0xB8);
+    code.extend_from_slice(&d); // movabs rax, DATA
+    code.extend_from_slice(&[0x0F, 0xB6, 0x08]); // movzx ecx, byte [rax]
+    code.extend_from_slice(&[0x80, 0xF9, 0x41]); // cmp cl, 'A'
+    code.extend_from_slice(&[0x75, 0x09]); // jne fail (+0x09)
+    code.extend_from_slice(&[0xB8, 0xE7, 0, 0, 0]); // mov eax, 231
+    code.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall (exit 0)
+    code.extend_from_slice(&[0xB8, 0xE7, 0, 0, 0]); // fail: mov eax, 231
+    code.extend_from_slice(&[0xBF, 0x01, 0, 0, 0]); // mov edi, 1
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall (exit 1)
+    code.push(0x48);
+    code.push(0xB8);
+    code.extend_from_slice(&d); // child: movabs rax, DATA
+    code.extend_from_slice(&[0xC6, 0x00, 0x42]); // mov byte [rax], 'B'
+    code.extend_from_slice(&[0xB8, 0xE7, 0, 0, 0]); // mov eax, 231
+    code.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi
+    code.extend_from_slice(&[0x0F, 0x05]); // syscall (exit 0)
+
+    let entry = V + headers;
+    let code_filesz = headers + code.len() as u64;
+
+    let mut elf = Vec::new();
+    elf.extend_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0]);
+    elf.extend_from_slice(&[0; 8]);
+    push_u16(&mut elf, 2);
+    push_u16(&mut elf, 62);
+    push_u32(&mut elf, 1);
+    push_u64(&mut elf, entry);
+    push_u64(&mut elf, 64);
+    push_u64(&mut elf, 0);
+    push_u32(&mut elf, 0);
+    push_u16(&mut elf, 64);
+    push_u16(&mut elf, 56);
+    push_u16(&mut elf, 2);
+    push_u16(&mut elf, 0);
+    push_u16(&mut elf, 0);
+    push_u16(&mut elf, 0);
+    push_u32(&mut elf, 1); // PT_LOAD code
+    push_u32(&mut elf, 5); // R|X
+    push_u64(&mut elf, 0);
+    push_u64(&mut elf, V);
+    push_u64(&mut elf, V);
+    push_u64(&mut elf, code_filesz);
+    push_u64(&mut elf, code_filesz);
+    push_u64(&mut elf, 0x1000);
+    push_u32(&mut elf, 1); // PT_LOAD data
+    push_u32(&mut elf, 6); // R|W
+    push_u64(&mut elf, 0);
+    push_u64(&mut elf, DATA);
+    push_u64(&mut elf, DATA);
+    push_u64(&mut elf, 0);
+    push_u64(&mut elf, 0x1000);
+    push_u64(&mut elf, 0x1000);
+    elf.extend_from_slice(&code);
+    elf
+}
+
+/// Runs the memory-management self-tests (CoW fork, anonymous demand paging).
 /// Each must exit 0; anything else indicates a VM correctness bug.
 pub fn run_vm_selftests() {
     for (name, image) in [
         ("cow fork isolation", cow_fork_elf()),
         ("anon demand paging", demand_mmap_elf()),
         ("clone(CLONE_VM) thread + futex join", clone_thread_elf()),
+        ("cow RO-code + RW-data same PT", cow_regression_elf()),
     ] {
         match spawn(&image, &["/vm-test"], &[]) {
             Ok(proc) => {
