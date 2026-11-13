@@ -831,8 +831,8 @@ fn clone_cow_reader_elf() -> Vec<u8> {
     c.extend_from_slice(&[0x41, 0xC6, 0x07, 0x41]); // mov byte [r15], 'A'
     c.extend_from_slice(&[0xB8, 0x39, 0, 0, 0, 0x0F, 0x05]); // fork
     c.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
-    c.extend_from_slice(&[0x74, 0x00]);
-    let jz_fork = c.len() - 1;
+    c.extend_from_slice(&[0x0F, 0x84, 0, 0, 0, 0]); // jz forkchild (rel32: it is >127 bytes away)
+    let jz_fork = c.len() - 4;
     // parent: wait4(-1,0,0,0)
     c.extend_from_slice(&[
         0xB8, 0x3D, 0, 0, 0, 0xBF, 0xFF, 0xFF, 0xFF, 0xFF, 0x31, 0xF6, 0x31, 0xD2, 0x45, 0x31, 0xD2,
@@ -886,20 +886,19 @@ fn clone_cow_reader_elf() -> Vec<u8> {
     // patch rel8 jumps
     let patch8 = |c: &mut Vec<u8>, pos: usize, target: usize| {
         let rel = target as i64 - (pos as i64 + 1);
-        c[pos] = (rel as i8) as u8;
+        c[pos] = i8::try_from(rel).expect("selftest ELF: rel8 jump out of range") as u8;
     };
-    patch8(&mut c, jz_fork, forkchild);
+    let patch32 = |c: &mut Vec<u8>, pos: usize, target: usize| {
+        let rel = target as i64 - (pos as i64 + 4);
+        let rb = i32::try_from(rel).expect("selftest ELF: rel32 jump out of range").to_le_bytes();
+        c[pos..pos + 4].copy_from_slice(&rb);
+    };
+    patch32(&mut c, jz_fork, forkchild);
     patch8(&mut c, jz_waitcached, wait_cached);
     patch8(&mut c, jz_done, done);
     patch8(&mut c, jmp_join, joinloop);
     patch8(&mut c, je_read, readloop);
-    // patch rel32 (jz reader)
-    let rel = reader as i64 - (jz_reader as i64 + 4);
-    let rb = (rel as i32).to_le_bytes();
-    c[jz_reader] = rb[0];
-    c[jz_reader + 1] = rb[1];
-    c[jz_reader + 2] = rb[2];
-    c[jz_reader + 3] = rb[3];
+    patch32(&mut c, jz_reader, reader);
     raw_exec_elf(&c)
 }
 
@@ -1042,7 +1041,7 @@ fn pipe_selftest_elf() -> Vec<u8> {
     let patch8 = |c: &mut Vec<u8>, pos: usize, target: usize| {
         let rel = target as i64 - (pos as i64 + 1);
         assert!((-128..=127).contains(&rel));
-        c[pos] = (rel as i8) as u8;
+        c[pos] = i8::try_from(rel).expect("selftest ELF: rel8 jump out of range") as u8;
     };
     for &pos in &[jne_n1, jne_p, jne_x, jnz_eof] {
         patch8(&mut c, pos, fail);
