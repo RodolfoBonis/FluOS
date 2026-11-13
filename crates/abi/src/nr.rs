@@ -202,3 +202,11 @@ pub fn name(nr: u64) -> Option<&'static str> {
     };
     Some(n)
 }
+pub const SETREUID: u64 = 113;
+pub const SETREGID: u64 = 114;
+pub const GETGROUPS: u64 = 115;
+pub const SETGROUPS: u64 = 116;
+pub const SETRESUID: u64 = 117;
+pub const GETRESUID: u64 = 118;
+pub const SETRESGID: u64 = 119;
+pub const GETRESGID: u64 = 120;

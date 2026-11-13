@@ -60,8 +60,9 @@ fn proc() -> Result<&'static SpinLock<Process>, Errno> {
 }
 
 /// `strace=` cmdline tracer. `strace=all` traces every process; `strace=<comm>`
-/// traces only processes whose command name (execve basename) matches. Off
-/// unless armed from the kernel cmdline by [`strace_init`].
+/// traces only processes whose command name (execve basename) matches;
+/// `strace=exec` logs only `execve` calls (path + argv). Off unless armed from
+/// the kernel cmdline by [`strace_init`].
 static STRACE_ON: AtomicBool = AtomicBool::new(false);
 static STRACE_TARGET: SpinLock<alloc::string::String> = SpinLock::new(alloc::string::String::new());
 
@@ -89,7 +90,15 @@ fn strace_matches() -> bool {
     if target.as_str() == "all" {
         return true;
     }
+    if target.as_str() == "exec" {
+        return false;
+    }
     process::current().is_some_and(|p| p.lock().comm == *target)
+}
+
+/// Whether `strace=exec` is armed (log every execve, nothing else).
+fn strace_exec_only() -> bool {
+    STRACE_ON.load(Ordering::Relaxed) && STRACE_TARGET.lock().as_str() == "exec"
 }
 
 /// Human-readable name for the common syscall numbers (falls back to the raw nr).
@@ -147,8 +156,18 @@ fn handle(number: u64, a: [u64; 6], regs: &mut Regs) -> SysResult {
         nr::GETPPID => Ok(1),
         nr::GETUID | nr::GETEUID => Ok(u64::from(proc()?.lock().uid)),
         nr::GETGID | nr::GETEGID => Ok(u64::from(proc()?.lock().gid)),
-        nr::SETUID => { proc()?.lock().uid = a[0] as u32; Ok(0) }
-        nr::SETGID => { proc()?.lock().gid = a[0] as u32; Ok(0) }
+        nr::SETUID => set_ids(id_arg(a[0]), None),
+        nr::SETGID => set_ids(None, id_arg(a[0])),
+        nr::SETREUID => set_ids(id_arg(a[1]).or(id_arg(a[0])), None),
+        nr::SETREGID => set_ids(None, id_arg(a[1]).or(id_arg(a[0]))),
+        nr::SETRESUID => set_ids(id_arg(a[1]).or(id_arg(a[0])).or(id_arg(a[2])), None),
+        nr::SETRESGID => set_ids(None, id_arg(a[1]).or(id_arg(a[0])).or(id_arg(a[2]))),
+        nr::GETRESUID => get_res_ids(proc()?.lock().uid, [a[0], a[1], a[2]]),
+        nr::GETRESGID => get_res_ids(proc()?.lock().gid, [a[0], a[1], a[2]]),
+        // One group per process: no supplementary groups.
+        nr::GETGROUPS => Ok(0),
+        nr::SETGROUPS => if proc()?.lock().uid == 0 { Ok(0) } else { Err(Errno::EPERM) },
+        nr::MREMAP => sys_mremap(a[0], a[1], a[2], a[3]),
         nr::ARCH_PRCTL => sys_arch_prctl(a[0], a[1]),
         nr::SET_TID_ADDRESS => sys_set_tid_address(a[0]),
         nr::BRK => sys_brk(a[0]),
@@ -180,7 +199,7 @@ fn handle(number: u64, a: [u64; 6], regs: &mut Regs) -> SysResult {
         nr::UNLINK => sys_unlinkat(types::AT_FDCWD, a[0]),
         nr::UNLINKAT => sys_unlinkat(a[0] as i32, a[1]),
         nr::CHMOD => sys_fchmodat(types::AT_FDCWD, a[0], a[1] as u32),
-        nr::SPLICE => sys_splice(a[0] as i32, a[3] as i32, a[4] as usize),
+        nr::SPLICE => sys_splice(a[0] as i32, a[1], a[2] as i32, a[3], a[4] as usize),
         nr::SETRLIMIT | nr::FADVISE64 => Ok(0),
         nr::FCHMODAT => sys_fchmodat(a[0] as i32, a[1], a[2] as u32),
         nr::READLINK => sys_readlinkat(types::AT_FDCWD, a[0], a[1], a[2] as usize),
@@ -530,6 +549,106 @@ fn sys_munmap(addr: u64, len: u64) -> SysResult {
     }
     for f in frames {
         crate::mm::phys::free_user_frame(f);
+    }
+    Ok(0)
+}
+
+/// `mremap(old, old_size, new_size, flags, new_addr)` for anonymous mappings.
+/// Shrinks in place, grows in place when the following pages are free, or moves
+/// (with `MREMAP_MAYMOVE`) by relocating page-table entries, not data. An
+/// address range that is not fully mapped yields `EFAULT`; a blocked in-place
+/// grow yields `ENOMEM` (musl probes the main-thread stack size this way).
+fn sys_mremap(old: u64, old_size: u64, new_size: u64, flags: u64) -> SysResult {
+    const MREMAP_MAYMOVE: u64 = 1;
+    const PAGE: u64 = 4096;
+    if old & (PAGE - 1) != 0 || new_size == 0 || old_size == 0 || flags & !MREMAP_MAYMOVE != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let round = |v: u64| v.checked_add(PAGE - 1).map(|x| x & !(PAGE - 1)).ok_or(Errno::EINVAL);
+    let (old_size, new_size) = (round(old_size)?, round(new_size)?);
+    let user_max = crate::usercopy::USER_MAX;
+    let old_end = old.checked_add(old_size).ok_or(Errno::EINVAL)?;
+    if old_end > user_max {
+        return Err(Errno::EFAULT);
+    }
+    let p = proc()?;
+    let mut g = p.lock();
+    if !(old..old_end).step_by(PAGE as usize).all(|a| g.space.page_in_use(a)) {
+        return Err(Errno::EFAULT);
+    }
+    if new_size <= old_size {
+        let frames = g.space.unmap_region(old + new_size, old_size - new_size);
+        let shared = g.thread_count > 1;
+        drop(g);
+        x86_64::instructions::tlb::flush_all();
+        if shared {
+            crate::mm::paging::shootdown_all();
+        }
+        for f in frames {
+            crate::mm::phys::free_user_frame(f);
+        }
+        return Ok(old);
+    }
+    let writable = g.space.page_writable(old);
+    let grow_end = old.checked_add(new_size).ok_or(Errno::ENOMEM)?;
+    let tail_free = grow_end <= user_max
+        && (old_end..grow_end).step_by(PAGE as usize).all(|a| !g.space.page_in_use(a));
+    if tail_free {
+        g.space.reserve_region(old_end, new_size - old_size, writable, false);
+        return Ok(old);
+    }
+    if flags & MREMAP_MAYMOVE == 0 {
+        return Err(Errno::ENOMEM);
+    }
+    let base = g.mmap_next;
+    let next = base.checked_add(new_size).ok_or(Errno::ENOMEM)?;
+    if next > user_max {
+        return Err(Errno::ENOMEM);
+    }
+    g.mmap_next = next;
+    g.space.move_range(old, base, old_size);
+    g.space.reserve_region(base + old_size, new_size - old_size, writable, false);
+    let shared = g.thread_count > 1;
+    drop(g);
+    x86_64::instructions::tlb::flush_all();
+    if shared {
+        crate::mm::paging::shootdown_all();
+    }
+    Ok(base)
+}
+
+/// Credential syscalls. FluOS keeps one uid and one gid per process (real ==
+/// effective == saved), so the `res`/`re` variants collapse onto them. Only
+/// root may change identity; anyone may "set" their current ids (what zsh's
+/// `unsetopt privileged` and login shells do).
+fn set_ids(uid: Option<u32>, gid: Option<u32>) -> SysResult {
+    let p = proc()?;
+    let mut g = p.lock();
+    let allowed = |cur: u32, want: Option<u32>| want.is_none_or(|w| w == cur);
+    if g.uid != 0 && !(allowed(g.uid, uid) && allowed(g.gid, gid)) {
+        return Err(Errno::EPERM);
+    }
+    if let Some(u) = uid {
+        g.uid = u;
+    }
+    if let Some(gi) = gid {
+        g.gid = gi;
+    }
+    Ok(0)
+}
+
+/// Maps a `-1` ("unchanged") id argument to `None`.
+fn id_arg(v: u64) -> Option<u32> {
+    let v = v as u32;
+    (v != u32::MAX).then_some(v)
+}
+
+/// `getresuid`/`getresgid`: writes the single id to all three pointers.
+fn get_res_ids(id: u32, ptrs: [u64; 3]) -> SysResult {
+    for ptr in ptrs {
+        if ptr != 0 {
+            put_user(ptr, id)?;
+        }
     }
     Ok(0)
 }
@@ -1646,10 +1765,21 @@ fn read_path(ptr: u64) -> Result<alloc::string::String, Errno> {
 /// bytes between two descriptors through a kernel bounce buffer. Offsets are
 /// ignored (callers splicing to/from pipes pass NULL), which covers the shell
 /// and coreutils uses; it is a straightforward read-then-write, not zero-copy.
-fn sys_splice(fd_in: i32, fd_out: i32, len: usize) -> SysResult {
+fn sys_splice(fd_in: i32, off_in: u64, fd_out: i32, off_out: u64, len: usize) -> SysResult {
+    // `splice(fd_in, off_in*, fd_out, off_out*, len, flags)`, emulated as a
+    // bounded read/write copy. Offsets, when given, position the (regular-file)
+    // ends like pread/pwrite and are advanced in user memory afterwards.
     let len = len.min(MAX_RW);
     let infile = fd(fd_in)?;
     let outfile = fd(fd_out)?;
+    if off_in != 0 {
+        let start = read_user_u64(off_in)?;
+        set_file_offset(&infile, start)?;
+    }
+    if off_out != 0 {
+        let start = read_user_u64(off_out)?;
+        set_file_offset(&outfile, start)?;
+    }
     let mut buf = vec![0u8; len.min(4096).max(1)];
     let mut total = 0u64;
     while (total as usize) < len {
@@ -1670,8 +1800,48 @@ fn sys_splice(fd_in: i32, fd_out: i32, len: usize) -> SysResult {
         if (written as u64) < n {
             break;
         }
+        // With a pipe on either end, move one chunk per call (a partial result,
+        // as Linux returns): callers like cp alternate file->pipe and
+        // pipe->file splices on one thread, so filling the pipe past what it
+        // holds, or waiting on it for more input, would self-deadlock.
+        let is_pipe = |f: &Arc<SpinLock<fs::OpenFile>>| matches!(f.lock().kind, fs::FileKind::Pipe { .. });
+        if is_pipe(&infile) || is_pipe(&outfile) {
+            break;
+        }
+    }
+    if off_in != 0 {
+        put_user(off_in, file_offset(&infile))?;
+    }
+    if off_out != 0 {
+        put_user(off_out, file_offset(&outfile))?;
     }
     Ok(total)
+}
+
+/// Reads a little-endian `u64` from user memory.
+fn read_user_u64(uaddr: u64) -> Result<u64, Errno> {
+    let mut b = [0u8; 8];
+    copy_from_user(uaddr, &mut b)?;
+    Ok(u64::from_le_bytes(b))
+}
+
+/// Sets the position of a regular file (`ESPIPE` for pipes/devices).
+fn set_file_offset(file: &Arc<SpinLock<fs::OpenFile>>, pos: u64) -> Result<(), Errno> {
+    match &mut file.lock().kind {
+        fs::FileKind::File { offset, .. } => {
+            *offset = pos;
+            Ok(())
+        }
+        _ => Err(Errno::ESPIPE),
+    }
+}
+
+/// Current position of a regular file (0 for anything else).
+fn file_offset(file: &Arc<SpinLock<fs::OpenFile>>) -> u64 {
+    match &file.lock().kind {
+        fs::FileKind::File { offset, .. } => *offset,
+        _ => 0,
+    }
 }
 
 /// `sendfile(out, in, offset, count)`: copies up to `count` bytes from `in` to
@@ -1931,6 +2101,11 @@ fn sys_execve(path: u64, argv: u64, envp: u64) -> SysResult {
 
     let argv_refs: Vec<&str> = argv_strs.iter().map(alloc::string::String::as_str).collect();
     let envp_refs: Vec<&str> = envp_strs.iter().map(alloc::string::String::as_str).collect();
+
+    if strace_exec_only() {
+        let pid = process::current().map_or(0, |p| p.lock().pid);
+        crate::log::info!("exec: pid {pid} {path} {argv_refs:?} ({} KiB image)", image.len() / 1024);
+    }
 
     let proc = proc()?;
     let (entry, user_sp, cr3) = {

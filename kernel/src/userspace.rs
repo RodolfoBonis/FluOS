@@ -25,6 +25,11 @@ use alloc::vec::Vec;
 const STACK_TOP: u64 = 0x7fff_ffff_f000;
 /// Initial user stack size.
 const STACK_SIZE: u64 = 0x40000;
+/// Total main-thread stack reservation (Linux's default RLIMIT_STACK). Only
+/// [`STACK_SIZE`] is mapped up front; the rest is demand-paged. musl measures
+/// the main stack by probing this reservation, and Rust's stack-overflow guards
+/// (e.g. starship's parser) rely on that measurement.
+const STACK_RESERVE: u64 = 8 * 1024 * 1024;
 
 /// Entry parameters handed to the user thread's trampoline.
 struct UserEntry {
@@ -142,6 +147,7 @@ extern "C" fn user_thread_start(arg: usize) {
 /// envp/auxv vector below it, 16-byte aligned. Returns the initial `rsp`.
 pub fn build_stack(space: &mut AddressSpace, loaded: &elf::Loaded, argv: &[&str], envp: &[&str]) -> Result<u64, Errno> {
     space.map_region(STACK_TOP - STACK_SIZE, STACK_SIZE, true, false);
+    space.reserve_region(STACK_TOP - STACK_RESERVE, STACK_RESERVE - STACK_SIZE, true, false);
 
     let mut strings: Vec<u8> = Vec::new();
     let mut argv_off: Vec<usize> = Vec::new();

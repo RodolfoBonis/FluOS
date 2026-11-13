@@ -441,6 +441,61 @@ impl AddressSpace {
         }
     }
 
+    /// Whether the page at `page` is part of the address space: either mapped
+    /// (present leaf) or inside a lazily-reserved region.
+    pub fn page_in_use(&self, page: u64) -> bool {
+        if self.regions.iter().any(|r| page >= r.start && page < r.end) {
+            return true;
+        }
+        // SAFETY: walk only reads this space's tables.
+        unsafe { self.walk_pte(page) }.is_some_and(|pte| unsafe { (*pte).flags() }.contains(Flags::PRESENT))
+    }
+
+    /// Whether the reserved region containing `page` (if any) is writable;
+    /// pages outside any region (eagerly mapped) report their PTE permission.
+    pub fn page_writable(&self, page: u64) -> bool {
+        if let Some(r) = self.regions.iter().find(|r| page >= r.start && page < r.end) {
+            return r.writable;
+        }
+        // SAFETY: walk only reads this space's tables.
+        unsafe { self.walk_pte(page) }.is_some_and(|pte| unsafe { (*pte).flags() }.contains(Flags::WRITABLE))
+    }
+
+    /// Moves every mapping in `[old, old+size)` to `[new, new+size)`: present
+    /// leaves keep their frames and flags (no copy), reserved regions are
+    /// re-reserved at the new place. Used by `mremap(MREMAP_MAYMOVE)`. The
+    /// caller flushes the TLB for the old range.
+    pub fn move_range(&mut self, old: u64, new: u64, size: u64) {
+        let end = old + size;
+        let moved: Vec<Region> = self
+            .regions
+            .iter()
+            .filter(|r| r.start < end && r.end > old)
+            .map(|r| {
+                let s = r.start.max(old);
+                let e = r.end.min(end);
+                Region { start: s - old + new, end: e - old + new, writable: r.writable, exec: r.exec }
+            })
+            .collect();
+        self.regions.retain(|r| r.end <= old || r.start >= end);
+        self.regions.extend(moved);
+        let mut a = old;
+        while a < end {
+            // SAFETY: walk reads this space's tables; we hold &mut self.
+            if let Some(pte) = unsafe { self.walk_pte(a) } {
+                let f = unsafe { (*pte).flags() };
+                if f.contains(Flags::PRESENT) {
+                    let frame = unsafe { (*pte).addr().as_u64() };
+                    // SAFETY: the leaf is cleared before the frame is mapped at
+                    // its new address, so it is never mapped twice.
+                    unsafe { (*pte).set_unused() };
+                    self.map_page_raw(a - old + new, frame, f);
+                }
+            }
+            a += PAGE;
+        }
+    }
+
     /// Unmaps `[vaddr, vaddr+size)`, clearing the leaf PTEs and RETURNING the
     /// physical frames that were mapped (without freeing them). The caller frees
     /// them with [`phys::free_user_frame`] only AFTER any required TLB shootdown,
