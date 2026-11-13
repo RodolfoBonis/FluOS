@@ -2243,7 +2243,7 @@ fn sys_execve(path: u64, argv: u64, envp: u64) -> SysResult {
     }
 
     let proc = proc()?;
-    let (entry, user_sp, cr3) = {
+    let (entry, user_sp, cr3, old_tables) = {
         let mut p = proc.lock();
         let mut space = crate::process::AddressSpace::new().ok_or(Errno::ENOMEM)?;
         let loaded = crate::elf::load_file(&mut space, ino)?;
@@ -2252,13 +2252,17 @@ fn sys_execve(path: u64, argv: u64, envp: u64) -> SysResult {
         // Reclaim the old image's user frames before swapping in the new space
         // (shared CoW frames are only freed if this was the last owner).
         p.space.free_leaves();
+        // The old page tables can go once this CPU has left them (below). With
+        // sibling threads still on them (CLONE_VM) they are kept: freeing would
+        // pull the tables out from under a running thread.
+        let old_tables = if p.thread_count <= 1 { p.space.take_page_tables() } else { 0 };
         p.space = space;
         p.brk = 0;
         p.brk_start = 0;
         p.mmap_next = 0x6000_0000;
         p.sig.exec_reset();
         p.comm = path.rsplit('/').next().unwrap_or(&path).into();
-        (loaded.entry, sp, p.space.cr3())
+        (loaded.entry, sp, p.space.cr3(), old_tables)
     };
     // Close FD_CLOEXEC descriptors; dropped outside the process lock because
     // closing a pipe end wakes its peers.
@@ -2279,6 +2283,9 @@ fn sys_execve(path: u64, argv: u64, envp: u64) -> SysResult {
         (*crate::percpu::current()).cr3 = cr3;
         let frame = PhysFrame::containing_address(PhysAddr::new(cr3));
         Cr3::write(frame, Cr3Flags::empty());
+        crate::percpu::this().active_cr3.store(cr3, core::sync::atomic::Ordering::Relaxed);
+        // This CPU now runs on the new tables; release the old ones.
+        crate::process::free_page_tables(old_tables);
         crate::arch::x86_64::user::enter_user(entry, user_sp);
     }
 }

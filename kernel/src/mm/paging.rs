@@ -206,10 +206,78 @@ pub fn kernel_pml4_phys() -> u64 {
 static TLB_ACKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Serialises shootdowns so the single global ack counter stays unambiguous.
-static SHOOTDOWN_LOCK: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
+/// A plain flag rather than an IRQ-disabling lock: a CPU waiting its turn must
+/// keep servicing other CPUs' shootdown IPIs, or two concurrent senders would
+/// each wait forever for the other's acknowledgement.
+static SHOOTDOWN_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Called by the TLB-shootdown IRQ after flushing this CPU's TLB.
-pub fn tlb_ack() {
+/// CR3 of an address space being torn down: CPUs still parked on it (lazy TLB)
+/// switch to the kernel tables in the shootdown IRQ before acknowledging.
+static EVICT_CR3: AtomicU64 = AtomicU64::new(0);
+
+/// Holds [`SHOOTDOWN_BUSY`] for the lifetime of the guard, with interrupts off:
+/// the holder must not be preempted, or a thread scheduled in its place could
+/// spin on the flag forever (fatal with one CPU). Waiters keep making progress
+/// by servicing pending shootdowns themselves, so they don't need interrupts.
+struct ShootdownGuard {
+    irqs_were_on: bool,
+}
+
+impl ShootdownGuard {
+    fn acquire() -> Self {
+        let irqs_were_on = x86_64::instructions::interrupts::are_enabled();
+        x86_64::instructions::interrupts::disable();
+        while SHOOTDOWN_BUSY
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            // Another CPU is shooting down and may be waiting for us.
+            service_shootdown();
+            core::hint::spin_loop();
+        }
+        Self { irqs_were_on }
+    }
+}
+
+impl Drop for ShootdownGuard {
+    fn drop(&mut self) {
+        SHOOTDOWN_BUSY.store(false, Ordering::Release);
+        if self.irqs_were_on {
+            x86_64::instructions::interrupts::enable();
+        }
+    }
+}
+
+/// Steps this CPU off the address space being evicted, if it is parked on it.
+/// Called from the shootdown IRQ (and locally by the evicting CPU).
+pub fn evict_if_parked() {
+    let dying = EVICT_CR3.load(Ordering::Acquire);
+    if dying == 0 {
+        return;
+    }
+    let cpu = crate::percpu::this();
+    if cpu.active_cr3.load(Ordering::Relaxed) == dying {
+        activate();
+        cpu.active_cr3.store(kernel_pml4_phys(), Ordering::Relaxed);
+    }
+}
+
+/// Sequence number of the shootdown in flight (bumped by each sender).
+static SHOOTDOWN_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Services the current shootdown on this CPU exactly once: evicts a dying
+/// address space if parked on it, flushes the TLB and acknowledges. Called from
+/// the shootdown IRQ and, by polling, from CPUs waiting for their own turn to
+/// shoot down — syscalls run with interrupts off, so such a waiter could not
+/// take the IPI and two senders would otherwise wait on each other forever.
+pub fn service_shootdown() {
+    let seq = SHOOTDOWN_SEQ.load(Ordering::Acquire);
+    let cpu = crate::percpu::this();
+    if seq == 0 || cpu.shootdown_seen.swap(seq, Ordering::AcqRel) == seq {
+        return; // nothing pending, or already serviced
+    }
+    evict_if_parked();
+    x86_64::instructions::tlb::flush_all();
     TLB_ACKS.fetch_add(1, Ordering::Release);
 }
 
@@ -223,12 +291,35 @@ pub fn tlb_ack() {
 /// might need, or the peer could fail to service the IPI and the wait would
 /// stall (bounded by a timeout).
 pub fn shootdown_all() {
-    use crate::percpu;
     x86_64::instructions::tlb::flush_all();
-    let _guard = SHOOTDOWN_LOCK.lock();
+    let _guard = ShootdownGuard::acquire();
+    broadcast_and_wait();
+}
+
+/// Makes `cr3`'s address space unreachable from every CPU so its page-table
+/// frames can be freed: CPUs parked on it through the lazy TLB switch to the
+/// kernel tables, and every CPU flushes. Same calling rules as
+/// [`shootdown_all`] (interrupts enabled, no locks a peer might need).
+pub fn evict_address_space(cr3: u64) {
+    let _guard = ShootdownGuard::acquire();
+    EVICT_CR3.store(cr3, Ordering::Release);
+    evict_if_parked();
+    x86_64::instructions::tlb::flush_all();
+    broadcast_and_wait();
+    EVICT_CR3.store(0, Ordering::Release);
+}
+
+/// Sends the shootdown IPI to every other CPU and waits for all acks. Caller
+/// holds the [`ShootdownGuard`].
+fn broadcast_and_wait() {
+    use crate::percpu;
     let me = percpu::cpu_id();
     let n = percpu::count();
     let base = TLB_ACKS.load(Ordering::Acquire);
+    // Publish a new sequence and mark it serviced locally (the caller already
+    // flushed/evicted this CPU), so only peers acknowledge it.
+    let seq = SHOOTDOWN_SEQ.fetch_add(1, Ordering::AcqRel) + 1;
+    percpu::this().shootdown_seen.store(seq, Ordering::Release);
     let mut peers = 0u64;
     for id in 0..n {
         if id == me {

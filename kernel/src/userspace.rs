@@ -1053,11 +1053,9 @@ fn pipe_selftest_elf() -> Vec<u8> {
     raw_exec_elf(&c)
 }
 
-/// Reclamation observability: spawns a batch of tiny processes, waits for each
-/// to exit, reaps it, and logs the free-frame count before and after. With leaf
-/// reclamation working the two counts are close (only a few page-table frames
-/// per process leak, pending the teardown/CR3-eviction step); a large drop would
-/// indicate leaf frames are leaking.
+/// Reclamation check: spawns a batch of tiny processes, waits for each to exit,
+/// reaps it, and compares the free-frame count before and after. Every frame a
+/// process used (data pages and page tables) must come back.
 pub fn run_reclaim_selftest() {
     let (before, _) = crate::mm::phys::stats();
     for _ in 0..4 {
@@ -1067,9 +1065,14 @@ pub fn run_reclaim_selftest() {
         crate::process::reap_orphan_zombies();
     }
     let (after, _) = crate::mm::phys::stats();
-    crate::log::info!(
-        "reclaim selftest: free frames {before} -> {after} after 4 spawn+exit+reap (leaf frames reclaimed; page-table frames leak until teardown lands)"
-    );
+    if after >= before {
+        crate::log::info!("reclaim selftest: OK, free frames {before} -> {after} after 4 spawn+exit+reap");
+    } else {
+        crate::log::error!(
+            "reclaim selftest: FAILED, {} frames leaked across 4 spawn+exit+reap ({before} -> {after})",
+            before - after
+        );
+    }
 }
 
 /// Runs the memory-management self-tests (CoW fork, anonymous demand paging).

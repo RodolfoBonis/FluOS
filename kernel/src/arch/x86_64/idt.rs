@@ -84,8 +84,7 @@ extern "C" fn reschedule_handler() {
 
 extern "C" fn tlb_handler() {
     apic::eoi();
-    x86_64::instructions::tlb::flush_all();
-    crate::mm::paging::tlb_ack();
+    crate::mm::paging::service_shootdown();
 }
 
 irq_stub!(keyboard_stub, keyboard_handler);

@@ -169,9 +169,10 @@ fn drive(con: &mut Console) -> Result<()> {
     // (b) handed the foreground to cat's own process group. Only then will the
     // kernel turn Ctrl-C into a SIGINT aimed at cat (not the shell). A fixed
     // delay would race the shell's fork + tcsetattr + tcsetpgrp under slow TCG.
+    // Both lines often arrive in one chunk, so search for each from the moment
+    // `cat` was typed rather than from after the first match.
     con.wait_for_since(mcat, "ISIG=true", Duration::from_secs(40))?;
-    let mfg = con.mark();
-    con.wait_for_since(mfg, "foreground pgrp ->", Duration::from_secs(40))?;
+    con.wait_for_since(mcat, "foreground pgrp ->", Duration::from_secs(40))?;
     std::thread::sleep(Duration::from_millis(400));
     let mkill = con.mark();
     con.send_raw(b"\x03")?; // Ctrl-C -> SIGINT to cat's foreground group

@@ -506,6 +506,13 @@ impl AddressSpace {
         }
     }
 
+    /// Detaches this space's page tables, returning the PML4 frame for
+    /// [`free_page_tables`]. The space is unusable afterwards; call only once
+    /// no thread runs it and after [`Self::free_leaves`].
+    pub fn take_page_tables(&mut self) -> u64 {
+        core::mem::replace(&mut self.pml4_phys, 0)
+    }
+
     /// Whether the page at `page` is part of the address space: either mapped
     /// (present leaf) or inside a lazily-reserved region.
     pub fn page_in_use(&self, page: u64) -> bool {
@@ -740,6 +747,45 @@ pub fn current() -> Option<&'static SpinLock<Process>> {
     }
 }
 
+/// Frees the user-half page-table frames (PT, PD, PDPT) of a detached address
+/// space and its PML4, after evicting it from every CPU (a CPU parked on it via
+/// the lazy TLB must never run on freed tables). Leaf frames must already have
+/// been released with [`AddressSpace::free_leaves`]. Interrupts must be enabled
+/// and no lock held, since this waits for the other CPUs.
+pub fn free_page_tables(pml4_phys: u64) {
+    if pml4_phys == 0 {
+        return;
+    }
+    paging::evict_address_space(pml4_phys);
+    let hhdm = phys::hhdm_offset();
+    let table = |phys: u64| (hhdm + phys) as *const PageTable;
+    // SAFETY: the space is detached and evicted, so nothing walks these tables;
+    // only present, non-huge user-half entries (0..256) are followed. The upper
+    // half is shared with the kernel and left alone.
+    unsafe {
+        let pml4 = &*table(pml4_phys);
+        for e4 in pml4.iter().take(256).filter(|e| e.flags().contains(Flags::PRESENT)) {
+            let pdpt = &*table(e4.addr().as_u64());
+            for e3 in pdpt.iter() {
+                let f3 = e3.flags();
+                if !f3.contains(Flags::PRESENT) || f3.contains(Flags::HUGE_PAGE) {
+                    continue;
+                }
+                let pd = &*table(e3.addr().as_u64());
+                for e2 in pd.iter() {
+                    let f2 = e2.flags();
+                    if f2.contains(Flags::PRESENT) && !f2.contains(Flags::HUGE_PAGE) {
+                        phys::free_user_frame(e2.addr().as_u64()); // PT
+                    }
+                }
+                phys::free_user_frame(e3.addr().as_u64()); // PD
+            }
+            phys::free_user_frame(e4.addr().as_u64()); // PDPT
+        }
+    }
+    phys::free_user_frame(pml4_phys);
+}
+
 /// Switches this CPU to `next`'s address space and user-context pointers, as
 /// the scheduler hands the CPU to `next`. For kernel-only threads it loads the
 /// kernel page tables. Redundant CR3 reloads are skipped.
@@ -831,7 +877,9 @@ pub fn reap_child(parent_pid: i32) -> Option<(i32, i32)> {
     // Reclaim the child's user memory now that it is reaped. Shared (CoW) frames
     // are only freed when the child held the last reference.
     g.space.free_leaves();
+    let tables = g.space.take_page_tables();
     drop(g);
+    free_page_tables(tables);
     Some(result)
 }
 
@@ -866,7 +914,12 @@ pub fn reap_orphan_zombies() -> usize {
     };
     let n = orphans.len();
     for proc in orphans {
-        proc.lock().space.free_leaves();
+        let tables = {
+            let mut g = proc.lock();
+            g.space.free_leaves();
+            g.space.take_page_tables()
+        };
+        free_page_tables(tables);
     }
     n
 }
