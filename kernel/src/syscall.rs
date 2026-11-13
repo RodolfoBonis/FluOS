@@ -2220,21 +2220,33 @@ fn sys_execve(path: u64, argv: u64, envp: u64) -> SysResult {
     let path = read_path(path)?;
     let argv_strs = read_str_array(argv)?;
     let envp_strs = read_str_array(envp)?;
-    let image = fs::read_file(&path)?;
+    // Resolve relative to the caller's cwd; the image itself is not read here
+    // (the loader pages it in on demand).
+    let cwd = proc()?.lock().cwd;
+    let (ino, st) = fs::with_vfs(|v| {
+        let ino = v.resolve(cwd, &path, true)?;
+        Ok((ino, v.stat(ino)?))
+    })?;
+    if st.st_mode & types::S_IFMT != types::S_IFREG {
+        return Err(Errno::EACCES);
+    }
+    if st.st_mode & 0o111 == 0 {
+        return Err(Errno::EACCES);
+    }
 
     let argv_refs: Vec<&str> = argv_strs.iter().map(alloc::string::String::as_str).collect();
     let envp_refs: Vec<&str> = envp_strs.iter().map(alloc::string::String::as_str).collect();
 
     if strace_exec_only() {
         let pid = process::current().map_or(0, |p| p.lock().pid);
-        crate::log::info!("exec: pid {pid} {path} {argv_refs:?} ({} KiB image)", image.len() / 1024);
+        crate::log::info!("exec: pid {pid} {path} {argv_refs:?} ({} KiB image)", st.st_size / 1024);
     }
 
     let proc = proc()?;
     let (entry, user_sp, cr3) = {
         let mut p = proc.lock();
         let mut space = crate::process::AddressSpace::new().ok_or(Errno::ENOMEM)?;
-        let loaded = crate::elf::load(&mut space, &image)?;
+        let loaded = crate::elf::load_file(&mut space, ino)?;
         let sp = crate::userspace::build_stack(&mut space, &loaded, &argv_refs, &envp_refs)
             .map_err(|_| Errno::ENOMEM)?;
         // Reclaim the old image's user frames before swapping in the new space

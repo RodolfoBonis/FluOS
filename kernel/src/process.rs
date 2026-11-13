@@ -50,15 +50,28 @@ const PTE_COW: Flags = Flags::BIT_9;
 const USER_PARENT_FLAGS: Flags =
     Flags::PRESENT.union(Flags::WRITABLE).union(Flags::USER_ACCESSIBLE);
 
-/// A reserved-but-not-yet-populated user region (anonymous, zero-fill on first
-/// touch). Demand paging backs these lazily; the `kind` is kept minimal now but
-/// is the seam where file-backed MAP_PRIVATE mappings slot in later.
+/// Where a demand-paged region's bytes come from when it is backed by a file:
+/// the bytes `[seg_vaddr, seg_vaddr + file_len)` are the file range starting at
+/// `file_off`; anything else in the region reads as zero (e.g. an ELF `.bss`).
+/// Pages are private copies, so writes never reach the file (MAP_PRIVATE).
+#[derive(Clone, Copy)]
+pub struct FileBacking {
+    pub ino: vfs::Ino,
+    pub seg_vaddr: u64,
+    pub file_off: u64,
+    pub file_len: u64,
+}
+
+/// A reserved-but-not-yet-populated user region. Demand paging backs these
+/// lazily: anonymous regions zero-fill on first touch, file-backed ones copy
+/// the page's bytes from the file (ELF segments loaded by `execve`).
 #[derive(Clone, Copy)]
 struct Region {
     start: u64,
     end: u64,
     writable: bool,
     exec: bool,
+    backing: Option<FileBacking>,
 }
 
 /// Outcome of a copy-on-write write fault.
@@ -205,8 +218,38 @@ impl AddressSpace {
         let start = vaddr & !(PAGE - 1);
         let end = (vaddr + size + PAGE - 1) & !(PAGE - 1);
         if end > start {
-            self.regions.push(Region { start, end, writable, exec });
+            self.regions.push(Region { start, end, writable, exec, backing: None });
         }
+    }
+
+    /// Reserves `[vaddr, vaddr+size)` as a demand-paged region whose contents
+    /// come from a file (see [`FileBacking`]). Used by the lazy ELF loader.
+    pub fn reserve_file_region(&mut self, vaddr: u64, size: u64, writable: bool, exec: bool, backing: FileBacking) {
+        let start = vaddr & !(PAGE - 1);
+        let end = (vaddr + size + PAGE - 1) & !(PAGE - 1);
+        if end > start {
+            self.regions.push(Region { start, end, writable, exec, backing: Some(backing) });
+        }
+    }
+
+    /// Removes `[start, end)` from every reservation, splitting regions that
+    /// straddle the range (a partial `munmap` must not drop the rest of a
+    /// mapping).
+    fn carve(&mut self, start: u64, end: u64) {
+        let mut kept = Vec::with_capacity(self.regions.len() + 1);
+        for r in self.regions.drain(..) {
+            if r.end <= start || r.start >= end {
+                kept.push(r);
+                continue;
+            }
+            if r.start < start {
+                kept.push(Region { end: start, ..r });
+            }
+            if r.end > end {
+                kept.push(Region { start: end, ..r });
+            }
+        }
+        self.regions = kept;
     }
 
     /// Walks this space's tables to the leaf PTE for `vaddr`, returning a mutable
@@ -337,7 +380,29 @@ impl AddressSpace {
         let Some(frame) = phys::alloc_frame_zeroed() else {
             return false;
         };
-        self.map_page_to(page, frame, r.writable, r.exec);
+        // File-backed regions: copy this page's bytes from every segment that
+        // covers it (two ELF segments may share a page), and take the union of
+        // their permissions, as an eager loader overlaying them would.
+        let (mut writable, mut exec) = (r.writable, r.exec);
+        for reg in self.regions.iter().filter(|x| page >= x.start && page < x.end) {
+            writable |= reg.writable;
+            exec |= reg.exec;
+            let Some(b) = reg.backing else { continue };
+            let lo = page.max(b.seg_vaddr);
+            let hi = (page + PAGE).min(b.seg_vaddr + b.file_len);
+            if lo >= hi {
+                continue;
+            }
+            // SAFETY: `frame` is a fresh, exclusively owned frame, HHDM-mapped.
+            let dst = unsafe {
+                core::slice::from_raw_parts_mut((self.hhdm + frame + (lo - page)) as *mut u8, (hi - lo) as usize)
+            };
+            if crate::fs::with_vfs(|v| v.read_at(b.ino, b.file_off + (lo - b.seg_vaddr), dst)).is_err() {
+                phys::free_user_frame(frame);
+                return false;
+            }
+        }
+        self.map_page_to(page, frame, writable, exec);
         x86_64::instructions::tlb::flush(VirtAddr::new(page));
         true
     }
@@ -474,10 +539,16 @@ impl AddressSpace {
             .map(|r| {
                 let s = r.start.max(old);
                 let e = r.end.min(end);
-                Region { start: s - old + new, end: e - old + new, writable: r.writable, exec: r.exec }
+                Region {
+                    start: s - old + new,
+                    end: e - old + new,
+                    writable: r.writable,
+                    exec: r.exec,
+                    backing: r.backing.map(|b| FileBacking { seg_vaddr: b.seg_vaddr - old + new, ..b }),
+                }
             })
             .collect();
-        self.regions.retain(|r| r.end <= old || r.start >= end);
+        self.carve(old, end);
         self.regions.extend(moved);
         let mut a = old;
         while a < end {
@@ -504,7 +575,7 @@ impl AddressSpace {
     pub fn unmap_region(&mut self, vaddr: u64, size: u64) -> Vec<u64> {
         let start = vaddr & !(PAGE - 1);
         let end = (vaddr.saturating_add(size) + PAGE - 1) & !(PAGE - 1);
-        self.regions.retain(|r| r.end <= start || r.start >= end);
+        self.carve(start, end);
         let mut freed = Vec::new();
         let mut a = start;
         while a < end {
