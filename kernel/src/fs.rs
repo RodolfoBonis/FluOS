@@ -110,6 +110,7 @@ pub fn poll_readable(file: &Arc<SpinLock<OpenFile>>) -> bool {
             FileKind::Device(d) if *d == dev::CONSOLE || *d == dev::TTY => {
                 return crate::arch::x86_64::input::available() > 0;
             }
+            FileKind::EventFd(efd) => return *efd.count.lock() > 0,
             _ => return true,
         }
     };
@@ -238,6 +239,64 @@ pub enum FileKind {
     ProcData { data: Arc<Vec<u8>>, offset: usize },
     /// A synthetic procfs directory: its entries `(name, d_type)` and a cursor.
     ProcDir { entries: Arc<Vec<(alloc::string::String, u8)>>, pos: usize },
+    /// An `eventfd` counter (wakeup channel used by Go's runtime, libuv, ...).
+    EventFd(Arc<EventFd>),
+}
+
+/// `eventfd(2)` state: a 64-bit counter. Reads return and reset it (or take one
+/// in semaphore mode); writes add to it; readers block while it is zero.
+pub struct EventFd {
+    count: SpinLock<u64>,
+    semaphore: bool,
+    read_wq: crate::scheduler::WaitQueue,
+}
+
+/// Creates an eventfd open file with initial value `init`.
+pub fn make_eventfd(init: u32, semaphore: bool, flags: u64) -> Arc<SpinLock<OpenFile>> {
+    let efd = Arc::new(EventFd {
+        count: SpinLock::new(u64::from(init)),
+        semaphore,
+        read_wq: crate::scheduler::WaitQueue::new(),
+    });
+    Arc::new(SpinLock::new(OpenFile { kind: FileKind::EventFd(efd), flags, readable: true, writable: true }))
+}
+
+fn eventfd_read(efd: &Arc<EventFd>, buf: &mut [u8], nonblock: bool) -> SysResult {
+    if buf.len() < 8 {
+        return Err(Errno::EINVAL);
+    }
+    loop {
+        let mut count = efd.count.lock();
+        if *count > 0 {
+            let value = if efd.semaphore { 1 } else { *count };
+            *count -= value;
+            buf[..8].copy_from_slice(&value.to_le_bytes());
+            return Ok(8);
+        }
+        if nonblock {
+            return Err(Errno::EAGAIN);
+        }
+        if crate::signal::current_has_deliverable() {
+            return Err(Errno::ERESTARTSYS);
+        }
+        crate::scheduler::block_on(&efd.read_wq, move || drop(count));
+    }
+}
+
+fn eventfd_write(efd: &Arc<EventFd>, buf: &[u8]) -> SysResult {
+    let bytes: [u8; 8] = buf.get(..8).and_then(|b| b.try_into().ok()).ok_or(Errno::EINVAL)?;
+    let add = u64::from_le_bytes(bytes);
+    if add == u64::MAX {
+        return Err(Errno::EINVAL);
+    }
+    {
+        let mut count = efd.count.lock();
+        // The counter saturates at u64::MAX - 1; a real eventfd would block the
+        // writer here, which no supported program relies on.
+        *count = count.saturating_add(add).min(u64::MAX - 1);
+    }
+    crate::scheduler::wake_all(&efd.read_wq);
+    Ok(8)
 }
 
 /// Maximum bytes buffered in a pipe before writers block.
@@ -611,38 +670,61 @@ impl OpenFile {
 /// A per-process descriptor table.
 pub struct FdTable {
     fds: Vec<Option<Arc<SpinLock<OpenFile>>>>,
+    /// Per-descriptor `FD_CLOEXEC` (a descriptor property, not of the open file).
+    cloexec: Vec<bool>,
 }
 
 impl FdTable {
     pub fn new() -> Self {
-        Self { fds: Vec::new() }
+        Self { fds: Vec::new(), cloexec: Vec::new() }
     }
 
     /// Wires fds 0/1/2 to the console (stdin/stdout/stderr).
     pub fn with_stdio() -> Self {
         let mut t = Self::new();
         let con = || OpenFile::device(dev::CONSOLE, true, true);
-        t.fds.push(Some(con()));
-        t.fds.push(Some(con()));
-        t.fds.push(Some(con()));
+        for _ in 0..3 {
+            t.fds.push(Some(con()));
+            t.cloexec.push(false);
+        }
         t
     }
 
     /// Lowest free descriptor >= `min`.
     fn free_slot(&mut self, min: usize) -> usize {
+        if self.fds.len() < min {
+            self.fds.resize(min, None);
+            self.cloexec.resize(min, false);
+        }
         for i in min..self.fds.len() {
             if self.fds[i].is_none() {
                 return i;
             }
         }
         self.fds.push(None);
+        self.cloexec.push(false);
         self.fds.len() - 1
+    }
+
+    /// Installs `file` at `slot` with the given close-on-exec flag.
+    fn install(&mut self, slot: usize, file: Arc<SpinLock<OpenFile>>, cloexec: bool) {
+        if self.fds.len() <= slot {
+            self.fds.resize(slot + 1, None);
+            self.cloexec.resize(slot + 1, false);
+        }
+        self.fds[slot] = Some(file);
+        self.cloexec[slot] = cloexec;
     }
 
     /// Installs `file` at the lowest free descriptor, returning it.
     pub fn alloc(&mut self, file: Arc<SpinLock<OpenFile>>) -> i32 {
+        self.alloc_with(file, false)
+    }
+
+    /// Like [`Self::alloc`], with an explicit `FD_CLOEXEC` (`O_CLOEXEC` opens).
+    pub fn alloc_with(&mut self, file: Arc<SpinLock<OpenFile>>, cloexec: bool) -> i32 {
         let slot = self.free_slot(0);
-        self.fds[slot] = Some(file);
+        self.install(slot, file, cloexec);
         slot as i32
     }
 
@@ -656,43 +738,77 @@ impl FdTable {
             .ok_or(Errno::EBADF)
     }
 
+    /// `F_GETFD`: whether `fd` is close-on-exec.
+    pub fn cloexec(&self, fd: i32) -> Result<bool, Errno> {
+        self.get(fd)?;
+        Ok(self.cloexec[fd as usize])
+    }
+
+    /// `F_SETFD`: sets or clears close-on-exec on `fd`.
+    pub fn set_cloexec(&mut self, fd: i32, on: bool) -> Result<(), Errno> {
+        self.get(fd)?;
+        self.cloexec[fd as usize] = on;
+        Ok(())
+    }
+
     pub fn close(&mut self, fd: i32) -> Result<(), Errno> {
+        if fd < 0 {
+            return Err(Errno::EBADF);
+        }
         let slot = self.fds.get_mut(fd as usize).ok_or(Errno::EBADF)?;
         if slot.take().is_none() {
             return Err(Errno::EBADF);
         }
+        self.cloexec[fd as usize] = false;
         Ok(())
     }
 
-    /// `dup3(old, new)` — duplicate `old` into exactly `new`.
-    pub fn dup3(&mut self, old: i32, new: i32) -> Result<i32, Errno> {
+    /// `dup3(old, new, cloexec)` — duplicate `old` into exactly `new`,
+    /// replacing whatever `new` held.
+    pub fn dup3(&mut self, old: i32, new: i32, cloexec: bool) -> Result<i32, Errno> {
         let file = self.get(old)?;
-        let n = new as usize;
-        if self.fds.len() <= n {
-            self.fds.resize(n + 1, None);
+        if new < 0 {
+            return Err(Errno::EBADF);
         }
-        self.fds[n] = Some(file);
+        self.install(new as usize, file, cloexec);
         Ok(new)
     }
 
-    /// `dup(old)` — duplicate into the lowest free descriptor.
+    /// `dup(old)` — duplicate into the lowest free descriptor (never CLOEXEC).
     pub fn dup(&mut self, old: i32) -> Result<i32, Errno> {
         let file = self.get(old)?;
         Ok(self.alloc(file))
     }
 
-    /// Duplicates `old` into the lowest free descriptor >= `min` (F_DUPFD).
-    pub fn dup_from(&mut self, old: i32, min: i32) -> Result<u64, Errno> {
+    /// Duplicates `old` into the lowest free descriptor >= `min` (F_DUPFD /
+    /// F_DUPFD_CLOEXEC).
+    pub fn dup_from(&mut self, old: i32, min: i32, cloexec: bool) -> Result<u64, Errno> {
         let file = self.get(old)?;
         let slot = self.free_slot(min.max(0) as usize);
-        self.fds[slot] = Some(file);
+        self.install(slot, file, cloexec);
         Ok(slot as u64)
     }
 
-    /// Deep-clones the table for `fork` (shares the underlying open files).
-    #[allow(dead_code)] // used by fork
+    /// Deep-clones the table for `fork` (shares the underlying open files and
+    /// keeps each descriptor's close-on-exec flag).
     pub fn fork_clone(&self) -> FdTable {
-        FdTable { fds: self.fds.clone() }
+        FdTable { fds: self.fds.clone(), cloexec: self.cloexec.clone() }
+    }
+
+    /// Removes every close-on-exec descriptor (for `execve`) and returns the
+    /// files so the caller can drop them outside any lock (closing a pipe end
+    /// wakes its peers).
+    pub fn take_cloexec(&mut self) -> Vec<Arc<SpinLock<OpenFile>>> {
+        let mut closed = Vec::new();
+        for (slot, flag) in self.fds.iter_mut().zip(self.cloexec.iter_mut()) {
+            if *flag {
+                if let Some(f) = slot.take() {
+                    closed.push(f);
+                }
+                *flag = false;
+            }
+        }
+        closed
     }
 
     /// Removes and returns all descriptor slots, leaving the table empty. The
@@ -700,6 +816,7 @@ impl FdTable {
     /// lock, since closing a pipe/pty end wakes blocked peers (so a process exit
     /// delivers EOF/EPIPE immediately, not only when it is later reaped).
     pub fn take_all(&mut self) -> Vec<Option<Arc<SpinLock<OpenFile>>>> {
+        self.cloexec.clear();
         core::mem::take(&mut self.fds)
     }
 
@@ -720,7 +837,7 @@ impl FdTable {
 pub fn read(file: &Arc<SpinLock<OpenFile>>, buf: &mut [u8]) -> SysResult {
     // A pipe read can block, so extract the shared pipe and release the
     // (interrupt-disabling) OpenFile lock before blocking on it.
-    enum Blk { Pipe(Arc<Pipe>), PtyM(Arc<Pty>), PtyS(Arc<Pty>) }
+    enum Blk { Pipe(Arc<Pipe>), PtyM(Arc<Pty>), PtyS(Arc<Pty>), Event(Arc<EventFd>) }
     let (blk, nonblock) = {
         let f = file.lock();
         if !f.readable {
@@ -732,11 +849,13 @@ pub fn read(file: &Arc<SpinLock<OpenFile>>, buf: &mut [u8]) -> SysResult {
             FileKind::Pipe { .. } => return Err(Errno::EBADF),
             FileKind::PtyMaster(pty) => Some(Blk::PtyM(pty.clone())),
             FileKind::PtySlave(pty) => Some(Blk::PtyS(pty.clone())),
+            FileKind::EventFd(efd) => Some(Blk::Event(efd.clone())),
             _ => None,
         };
         (blk, nb)
     };
     match blk {
+        Some(Blk::Event(efd)) => return eventfd_read(&efd, buf, nonblock),
         Some(Blk::Pipe(pipe)) => return pipe_read(&pipe, buf, nonblock),
         Some(Blk::PtyM(pty)) => return pty_read(&pty, true, buf, nonblock),
         Some(Blk::PtyS(pty)) => return pty_read(&pty, false, buf, nonblock),
@@ -758,7 +877,7 @@ pub fn read(file: &Arc<SpinLock<OpenFile>>, buf: &mut [u8]) -> SysResult {
             *offset += n;
             Ok(n as u64)
         }
-        FileKind::Pipe { .. } | FileKind::PtyMaster(_) | FileKind::PtySlave(_) => {
+        FileKind::Pipe { .. } | FileKind::PtyMaster(_) | FileKind::PtySlave(_) | FileKind::EventFd(_) => {
             unreachable!("handled above")
         }
     }
@@ -766,7 +885,7 @@ pub fn read(file: &Arc<SpinLock<OpenFile>>, buf: &mut [u8]) -> SysResult {
 
 /// Writes `buf` to an open file, returning the byte count.
 pub fn write(file: &Arc<SpinLock<OpenFile>>, buf: &[u8]) -> SysResult {
-    enum Blk { Pipe(Arc<Pipe>), PtyM(Arc<Pty>), PtyS(Arc<Pty>) }
+    enum Blk { Pipe(Arc<Pipe>), PtyM(Arc<Pty>), PtyS(Arc<Pty>), Event(Arc<EventFd>) }
     let (blk, nonblock) = {
         let f = file.lock();
         if !f.writable {
@@ -778,11 +897,13 @@ pub fn write(file: &Arc<SpinLock<OpenFile>>, buf: &[u8]) -> SysResult {
             FileKind::Pipe { .. } => return Err(Errno::EBADF),
             FileKind::PtyMaster(pty) => Some(Blk::PtyM(pty.clone())),
             FileKind::PtySlave(pty) => Some(Blk::PtyS(pty.clone())),
+            FileKind::EventFd(efd) => Some(Blk::Event(efd.clone())),
             _ => None,
         };
         (blk, nb)
     };
     match blk {
+        Some(Blk::Event(efd)) => return eventfd_write(&efd, buf),
         Some(Blk::Pipe(pipe)) => return pipe_write(&pipe, buf, nonblock),
         Some(Blk::PtyM(pty)) => return pty_write(&pty, true, buf, nonblock),
         Some(Blk::PtyS(pty)) => return pty_write(&pty, false, buf, nonblock),
@@ -799,7 +920,7 @@ pub fn write(file: &Arc<SpinLock<OpenFile>>, buf: &[u8]) -> SysResult {
         }
         FileKind::Dir { .. } | FileKind::ProcDir { .. } => Err(Errno::EISDIR),
         FileKind::ProcData { .. } => Err(Errno::EBADF),
-        FileKind::Pipe { .. } | FileKind::PtyMaster(_) | FileKind::PtySlave(_) => {
+        FileKind::Pipe { .. } | FileKind::PtyMaster(_) | FileKind::PtySlave(_) | FileKind::EventFd(_) => {
             unreachable!("handled above")
         }
     }

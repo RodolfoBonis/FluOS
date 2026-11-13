@@ -1260,6 +1260,9 @@ pub fn run_selftest() {
 /// (`argv[0] = "/bin/sh"`). The calling (bootstrap) thread then yields forever,
 /// letting the scheduler run the shell. Only reached on a real boot.
 pub fn run_init() {
+    // The user shell owns the screen from here on; keep kernel chatter on
+    // serial and in dmesg.
+    crate::log::quiet_console();
     // Preferred login shell first, then fallbacks. argv[0] starting with '-'
     // makes it a login shell (reads /etc/zprofile, ~/.zprofile, ~/.zshrc).
     const CANDIDATES: &[(&str, &str)] = &[

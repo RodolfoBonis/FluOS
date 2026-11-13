@@ -168,6 +168,17 @@ fn handle(number: u64, a: [u64; 6], regs: &mut Regs) -> SysResult {
         nr::GETGROUPS => Ok(0),
         nr::SETGROUPS => if proc()?.lock().uid == 0 { Ok(0) } else { Err(Errno::EPERM) },
         nr::MREMAP => sys_mremap(a[0], a[1], a[2], a[3]),
+        nr::SETITIMER => sys_setitimer(a[0], a[1], a[2]),
+        nr::GETITIMER => sys_getitimer(a[0], a[1]),
+        nr::ALARM => sys_alarm(a[0]),
+        nr::EVENTFD => sys_eventfd2(a[0], 0),
+        nr::EVENTFD2 => sys_eventfd2(a[0], a[1]),
+        // No network stack until M7: report the address family unsupported (Go
+        // and curl fall back cleanly) rather than ENOSYS.
+        nr::SOCKET => Err(Errno::EAFNOSUPPORT),
+        // tee(2) only works between pipes; callers (uutils tee) fall back to
+        // read/write on EINVAL.
+        nr::TEE => Err(Errno::EINVAL),
         nr::ARCH_PRCTL => sys_arch_prctl(a[0], a[1]),
         nr::SET_TID_ADDRESS => sys_set_tid_address(a[0]),
         nr::BRK => sys_brk(a[0]),
@@ -210,8 +221,8 @@ fn handle(number: u64, a: [u64; 6], regs: &mut Regs) -> SysResult {
         nr::RT_SIGSUSPEND => sys_rt_sigsuspend(a[0], a[1] as usize),
         nr::PRCTL => Ok(0),
         nr::DUP => dup(a[0] as i32),
-        nr::DUP2 => dup3(a[0] as i32, a[1] as i32),
-        nr::DUP3 => dup3(a[0] as i32, a[1] as i32),
+        nr::DUP2 => dup2(a[0] as i32, a[1] as i32),
+        nr::DUP3 => dup3(a[0] as i32, a[1] as i32, a[2]),
         nr::FCNTL => sys_fcntl(a[0] as i32, a[1], a[2]),
         nr::SCHED_YIELD => {
             crate::scheduler::yield_now();
@@ -425,7 +436,7 @@ fn sys_openat(dirfd: i32, path: u64, flags: u64, mode: u32) -> SysResult {
     };
     let mode = if flags & types::O_CREAT != 0 { (mode & !umask) & 0o777 } else { mode };
     let file = fs::open(base, &path, flags, mode)?;
-    Ok(proc()?.lock().fds.alloc(file) as u64)
+    Ok(proc()?.lock().fds.alloc_with(file, flags & types::O_CLOEXEC != 0) as u64)
 }
 
 /// Resolves the directory a `*at` syscall path is relative to: the cwd for an
@@ -478,8 +489,24 @@ fn dup(old: i32) -> SysResult {
     Ok(proc()?.lock().fds.dup(old)? as u64)
 }
 
-fn dup3(old: i32, new: i32) -> SysResult {
-    Ok(proc()?.lock().fds.dup3(old, new)? as u64)
+/// `dup2(old, new)`: like dup3 without flags, and `old == new` is a no-op
+/// that only validates `old`.
+fn dup2(old: i32, new: i32) -> SysResult {
+    let p = proc()?;
+    let mut g = p.lock();
+    if old == new {
+        g.fds.get(old)?;
+        return Ok(new as u64);
+    }
+    Ok(g.fds.dup3(old, new, false)? as u64)
+}
+
+/// `dup3(old, new, flags)`: `O_CLOEXEC` is the only flag; `old == new` is EINVAL.
+fn dup3(old: i32, new: i32, flags: u64) -> SysResult {
+    if old == new || flags & !types::O_CLOEXEC != 0 {
+        return Err(Errno::EINVAL);
+    }
+    Ok(proc()?.lock().fds.dup3(old, new, flags & types::O_CLOEXEC != 0)? as u64)
 }
 
 fn sys_fcntl(fd_num: i32, cmd: u64, arg: u64) -> SysResult {
@@ -489,14 +516,36 @@ fn sys_fcntl(fd_num: i32, cmd: u64, arg: u64) -> SysResult {
     const F_GETFL: u64 = 3;
     const F_SETFL: u64 = 4;
     const F_DUPFD_CLOEXEC: u64 = 1030;
+    const FD_CLOEXEC: u64 = 1;
+    // Status flags F_SETFL may change; the access mode and creation flags stay.
+    const SETFL_MASK: u64 = types::O_NONBLOCK | types::O_APPEND;
     match cmd {
-        F_DUPFD | F_DUPFD_CLOEXEC => proc()?.lock().fds.dup_from(fd_num, arg as i32),
-        F_GETFD | F_GETFL => Ok(0),
-        F_SETFD | F_SETFL => Ok(0),
-        _ => {
-            let _ = arg;
+        F_DUPFD => proc()?.lock().fds.dup_from(fd_num, arg as i32, false),
+        F_DUPFD_CLOEXEC => proc()?.lock().fds.dup_from(fd_num, arg as i32, true),
+        F_GETFD => Ok(u64::from(proc()?.lock().fds.cloexec(fd_num)?)),
+        F_SETFD => {
+            proc()?.lock().fds.set_cloexec(fd_num, arg & FD_CLOEXEC != 0)?;
             Ok(0)
         }
+        F_GETFL => {
+            let file = fd(fd_num)?;
+            let f = file.lock();
+            let access = match (f.readable, f.writable) {
+                (true, true) => types::O_RDWR,
+                (false, true) => types::O_WRONLY,
+                _ => types::O_RDONLY,
+            };
+            Ok(access | (f.flags & SETFL_MASK))
+        }
+        F_SETFL => {
+            let file = fd(fd_num)?;
+            let mut f = file.lock();
+            f.flags = (f.flags & !SETFL_MASK) | (arg & SETFL_MASK);
+            Ok(0)
+        }
+        // Locks (F_GETLK/F_SETLK/F_SETLKW) and the rest: accepted as no-ops;
+        // FluOS has a single user session and no advisory locking yet.
+        _ => Ok(0),
     }
 }
 
@@ -615,6 +664,73 @@ fn sys_mremap(old: u64, old_size: u64, new_size: u64, flags: u64) -> SysResult {
         crate::mm::paging::shootdown_all();
     }
     Ok(base)
+}
+
+/// `struct itimerval` is two `struct timeval {i64 sec; i64 usec}`: interval, value.
+fn read_itimerval(uaddr: u64) -> Result<(u64, u64), Errno> {
+    let mut b = [0u8; 32];
+    copy_from_user(uaddr, &mut b)?;
+    let field = |i: usize| i64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+    let to_ms = |sec: i64, usec: i64| -> Result<u64, Errno> {
+        if sec < 0 || !(0..1_000_000).contains(&usec) {
+            return Err(Errno::EINVAL);
+        }
+        Ok((sec as u64).saturating_mul(1000) + (usec as u64).div_ceil(1000))
+    };
+    Ok((to_ms(field(2), field(3))?, to_ms(field(0), field(1))?))
+}
+
+fn write_itimerval(uaddr: u64, value_ms: u64, interval_ms: u64) -> Result<(), Errno> {
+    let mut b = [0u8; 32];
+    for (i, v) in [interval_ms / 1000, (interval_ms % 1000) * 1000, value_ms / 1000, (value_ms % 1000) * 1000]
+        .into_iter()
+        .enumerate()
+    {
+        b[i * 8..i * 8 + 8].copy_from_slice(&(v as i64).to_le_bytes());
+    }
+    copy_to_user(uaddr, &b)
+}
+
+/// Only `ITIMER_REAL` (0) is supported; the CPU-time timers are EINVAL.
+fn sys_setitimer(which: u64, new: u64, old: u64) -> SysResult {
+    if which != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let (value_ms, interval_ms) = if new == 0 { (0, 0) } else { read_itimerval(new)? };
+    let pid = proc()?.lock().pid;
+    let (old_value, old_interval) = crate::itimer::set(pid, value_ms, interval_ms);
+    if old != 0 {
+        write_itimerval(old, old_value, old_interval)?;
+    }
+    Ok(0)
+}
+
+fn sys_getitimer(which: u64, cur: u64) -> SysResult {
+    if which != 0 {
+        return Err(Errno::EINVAL);
+    }
+    let pid = proc()?.lock().pid;
+    let (value_ms, interval_ms) = crate::itimer::get(pid);
+    write_itimerval(cur, value_ms, interval_ms)?;
+    Ok(0)
+}
+
+/// `alarm(secs)`: one-shot real timer; returns the seconds left on the old one.
+fn sys_alarm(secs: u64) -> SysResult {
+    let pid = proc()?.lock().pid;
+    let (old_ms, _) = crate::itimer::set(pid, secs.saturating_mul(1000), 0);
+    Ok(old_ms.div_ceil(1000))
+}
+
+/// `eventfd2(initval, flags)`: EFD_SEMAPHORE (1), EFD_NONBLOCK, EFD_CLOEXEC.
+fn sys_eventfd2(init: u64, flags: u64) -> SysResult {
+    const EFD_SEMAPHORE: u64 = 1;
+    let allowed = EFD_SEMAPHORE | types::O_NONBLOCK | types::O_CLOEXEC;
+    if flags & !allowed != 0 || init > u64::from(u32::MAX) {
+        return Err(Errno::EINVAL);
+    }
+    let file = fs::make_eventfd(init as u32, flags & EFD_SEMAPHORE != 0, flags & types::O_NONBLOCK);
+    Ok(proc()?.lock().fds.alloc_with(file, flags & types::O_CLOEXEC != 0) as u64)
 }
 
 /// Credential syscalls. FluOS keeps one uid and one gid per process (real ==
@@ -1370,6 +1486,12 @@ fn sys_fstat(fd_num: i32, statbuf: u64) -> SysResult {
                 s.st_nlink = 2;
                 s
             }
+            // Like Linux's anon inodes: no file-type bits.
+            fs::FileKind::EventFd(_) => {
+                let mut s = types::Stat::default();
+                s.st_mode = 0o600;
+                s
+            }
         }
     };
     write_stat(statbuf, &st)
@@ -1888,8 +2010,9 @@ fn sys_pipe2(uaddr: u64, flags: u64) -> SysResult {
     let p = proc()?;
     let (rfd, wfd) = {
         let mut g = p.lock();
-        let rfd = g.fds.alloc(rd);
-        let wfd = g.fds.alloc(wr);
+        let cloexec = flags & types::O_CLOEXEC != 0;
+        let rfd = g.fds.alloc_with(rd, cloexec);
+        let wfd = g.fds.alloc_with(wr, cloexec);
         (rfd, wfd)
     };
     let mut raw = [0u8; 8];
@@ -2125,6 +2248,10 @@ fn sys_execve(path: u64, argv: u64, envp: u64) -> SysResult {
         p.comm = path.rsplit('/').next().unwrap_or(&path).into();
         (loaded.entry, sp, p.space.cr3())
     };
+    // Close FD_CLOEXEC descriptors; dropped outside the process lock because
+    // closing a pipe end wakes its peers.
+    let closed = proc.lock().fds.take_cloexec();
+    drop(closed);
 
     // Switch this thread to the new address space and enter it.
     // SAFETY: `cr3` is a valid PML4 with the kernel higher half; `entry`/`user_sp`

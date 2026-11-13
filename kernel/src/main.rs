@@ -10,6 +10,7 @@ mod demo;
 mod elf;
 mod font;
 mod fs;
+mod itimer;
 mod ksyms;
 mod log;
 mod mm;

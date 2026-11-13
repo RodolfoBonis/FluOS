@@ -69,6 +69,20 @@ static RING: SpinLock<Ring> = SpinLock::new(Ring::new());
 /// Optional console sink, installed by the framebuffer console in M2.
 static CONSOLE: SpinLock<Option<fn(&str)>> = SpinLock::new(None);
 
+/// Once userspace owns the screen, only warnings and errors are mirrored to the
+/// console; everything still goes to serial and the `dmesg` ring. `loglevel=info`
+/// on the kernel cmdline keeps the console verbose for debugging.
+static CONSOLE_QUIET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Stops mirroring `Info` records to the console (called when the user shell
+/// starts), unless the cmdline asks for `loglevel=info`.
+pub fn quiet_console() {
+    let verbose = crate::boot::cmdline().split_ascii_whitespace().any(|t| t == "loglevel=info");
+    if !verbose {
+        CONSOLE_QUIET.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Registers (or clears) the console sink that mirrors log output to the screen.
 #[allow(dead_code)]
 pub fn set_console_sink(sink: Option<fn(&str)>) {
@@ -126,7 +140,8 @@ pub fn write(level: Level, args: fmt::Arguments) {
     // Emit to each sink under its own lock — no nesting, consistent order.
     crate::arch::x86_64::serial::write_bytes(bytes);
     RING.lock().push(bytes);
-    let sink = *CONSOLE.lock();
+    let quiet = CONSOLE_QUIET.load(core::sync::atomic::Ordering::Relaxed) && matches!(level, Level::Info);
+    let sink = if quiet { None } else { *CONSOLE.lock() };
     if let Some(sink) = sink
         && let Ok(text) = core::str::from_utf8(bytes)
     {

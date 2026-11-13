@@ -27,6 +27,7 @@ pub const ENODEV: i64 = 19;
 pub const ENOTDIR: i64 = 20;
 pub const EISDIR: i64 = 21;
 pub const EINVAL: i64 = 22;
+pub const EAFNOSUPPORT: i64 = 97;
 pub const ENFILE: i64 = 23;
 pub const EMFILE: i64 = 24;
 pub const ENOTTY: i64 = 25;
@@ -51,6 +52,7 @@ impl Errno {
     pub const EBADF: Errno = Errno(EBADF);
     pub const EFAULT: Errno = Errno(EFAULT);
     pub const EINVAL: Errno = Errno(EINVAL);
+    pub const EAFNOSUPPORT: Errno = Errno(EAFNOSUPPORT);
     pub const ENOENT: Errno = Errno(ENOENT);
     pub const ENOSYS: Errno = Errno(ENOSYS);
     pub const ENOMEM: Errno = Errno(ENOMEM);
